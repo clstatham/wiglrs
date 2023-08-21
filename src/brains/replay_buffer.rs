@@ -19,14 +19,14 @@ impl SavedStep {
 }
 
 #[derive(Clone, Default)]
-pub struct ReplayBuffer<const MAX_LEN: usize> {
+pub struct ReplayBuffer {
     pub buf: VecDeque<SavedStep>,
 }
 
-impl<const MAX_LEN: usize> ReplayBuffer<MAX_LEN> {
+impl ReplayBuffer {
     pub fn remember(&mut self, step: SavedStep) {
         self.buf.push_back(step);
-        if self.buf.len() >= MAX_LEN {
+        if self.buf.len() >= 10_000 {
             self.buf.pop_front();
         }
     }
@@ -43,5 +43,9 @@ impl<const MAX_LEN: usize> ReplayBuffer<MAX_LEN> {
             .choose_multiple_fill(&mut thread_rng(), &mut batch);
         let (s, a, r, t) = batch.into_iter().map(|b| b.to_owned().unzip()).multiunzip();
         (s, a, r, t)
+    }
+
+    pub fn unzip(&self) -> (Vec<Observation>, Vec<Action>, Vec<f32>, Vec<bool>) {
+        self.buf.iter().map(|b| b.to_owned().unzip()).multiunzip()
     }
 }

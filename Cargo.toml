@@ -9,8 +9,10 @@ edition = "2021"
 bevy = "0.11.2"
 bevy_rapier2d = "0.22.0"
 chrono = "0.4.26"
+dfdx = { path = "./dfdx", features = ["cuda", "cudnn"] }
 itertools = "0.11.0"
 lazy_static = "1.4.0"
+nalgebra = "0.32.3"
 rand = "0.8.5"
 # tch = { version = "0.13.0" }
 tensorboard-rs = "0.5.9"

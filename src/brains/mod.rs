@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     sync::{atomic::AtomicU64, Arc, Mutex},
 };
 
@@ -29,17 +29,17 @@ impl<const NSTACK: usize> FrameStack<NSTACK> {
     }
 }
 
-pub struct Brain<T: Thinker + ?Sized> {
+pub struct Brain {
     pub name: String,
     pub version: u64,
     pub color: Color,
     pub id: u64,
-    pub rb: ReplayBuffer<10_000>,
-    pub thinker: Arc<Mutex<T>>,
+    pub rb: ReplayBuffer,
+    pub thinker: Arc<Mutex<dyn Thinker + 'static>>,
 }
 
-impl<T: Thinker> Brain<T> {
-    pub fn new(thinker: T) -> Self {
+impl Brain {
+    pub fn new(thinker: impl Thinker + 'static) -> Self {
         static BRAIN_IDS: AtomicU64 = AtomicU64::new(0);
         let id = BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let name = crate::names::random_name();
@@ -57,6 +57,10 @@ impl<T: Thinker> Brain<T> {
     pub fn act(&mut self, obs: Observation) -> Action {
         self.thinker.lock().unwrap().act(obs)
     }
+
+    pub fn learn(&mut self) {
+        self.thinker.lock().unwrap().learn(&mut self.rb);
+    }
 }
 
-pub type BrainBank = BTreeMap<Entity, Brain<thinkers::RandomThinker>>;
+pub type BrainBank = BTreeMap<Entity, Brain>;

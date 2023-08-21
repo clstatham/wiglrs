@@ -1,9 +1,6 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::atomic::AtomicU64,
-};
+use std::collections::BTreeMap;
 
 use bevy::{
     core::FrameCount, math::Vec3Swizzles, prelude::*, sprite::MaterialMesh2dBundle,
@@ -12,7 +9,7 @@ use bevy::{
 use bevy_rapier2d::prelude::*;
 use brains::{
     replay_buffer::SavedStep,
-    thinkers::{self, Thinker},
+    thinkers::{self},
     Brain, BrainBank,
 };
 use hparams::{
@@ -31,14 +28,18 @@ pub struct OtherState {
     pub direction: Vec2,
 }
 
+pub const OTHER_STATE_LEN: usize = 6;
+
 #[derive(Default, Clone, Copy)]
 pub struct Observation {
     pub pos: Vec2,
     pub linvel: Vec2,
     pub direction: Vec2,
-    pub dt: f32,
+    // pub dt: f32,
     pub other_states: [OtherState; NUM_AGENTS],
 }
+
+pub const OBS_LEN: usize = OTHER_STATE_LEN * NUM_AGENTS + 6;
 
 impl Observation {
     pub fn as_vec(&self) -> Vec<f32> {
@@ -187,9 +188,7 @@ fn check_respawn_all(
 ) {
     for agent in brains.keys().copied().collect::<Vec<_>>() {
         if commands.get_entity(agent).is_none() {
-            let all_rbs = brains.values().map(|b| b.rb.clone()).collect::<Vec<_>>();
             let mut brain = brains.remove(&agent).unwrap();
-            // for (a, brain) in brains.iter_mut() {
             let mean_reward =
                 brain.rb.buf.iter().map(|s| s.reward).sum::<f32>() / brain.rb.buf.len() as f32;
             println!("{} reward: {mean_reward}", &brain.name);
@@ -198,25 +197,8 @@ fn check_respawn_all(
                 mean_reward,
                 frame_count.0 as usize,
             );
-            let mut total_loss = 0.0;
-            let mut n_losses = 0;
-            // for rb in all_rbs.iter() {
-            //     if let Some((_reward, loss)) = brain.learn(Some(rb.clone())) {
-            //         total_loss += loss;
-            //         // total_reward += reward;
-            //         n_losses += 1;
-            //     }
-            // }
-            // writer.0.add_scalar(
-            //     &format!("Loss/{}", brain.id),
-            //     total_loss / n_losses as f32,
-            //     frame_count.0 as usize,
-            // );
-            // println!("{} loss: {}", &brain.name, total_loss / n_losses as f32);
-            // }
-            // brain transplant
 
-            brain.rb.buf.clear();
+            brain.learn();
             brain.version += 1;
 
             spawn_agent(
@@ -235,7 +217,7 @@ fn check_respawn_all(
 pub struct Wall;
 
 fn spawn_agent(
-    brain: Brain<thinkers::RandomThinker>,
+    brain: Brain,
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
@@ -357,7 +339,7 @@ fn setup(
         .insert(TransformBundle::from(Transform::from_xyz(500.0, 0.0, 0.0)));
 
     for _ in 0..NUM_AGENTS {
-        let brain = Brain::new(thinkers::RandomThinker);
+        let brain = Brain::new(thinkers::ppo::PpoThinker::default());
         spawn_agent(
             brain,
             &mut commands,
@@ -410,7 +392,7 @@ fn update(
             pos: transform.translation.xy(),
             linvel: velocity.linvel,
             direction: transform.local_y().xy(),
-            dt: time.delta_seconds(),
+            // dt: time.delta_seconds(),
             other_states: [OtherState::default(); NUM_AGENTS],
         };
 
