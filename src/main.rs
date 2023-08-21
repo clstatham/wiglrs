@@ -10,124 +10,19 @@ use bevy::{
     winit::WinitSettings,
 };
 use bevy_rapier2d::prelude::*;
-use burn::{
-    module::Module,
-    nn,
-    optim::{Adam, AdamConfig},
-    tensor::{Float, TensorKind},
+use brains::{
+    replay_buffer::SavedStep,
+    thinkers::{self, Thinker},
+    Brain, BrainBank,
 };
-use burn_wgpu::Vulkan;
-use rand::seq::SliceRandom;
+use hparams::{
+    AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_RADIUS,
+    AGENT_SHOOT_DISTANCE, NUM_AGENTS,
+};
 use tensorboard_rs::summary_writer::SummaryWriter;
 
-lazy_static::lazy_static! {
-    pub static ref NAMES: Vec<String> = {
-        let names = "Voli
-Plen
-Autumn
-Rascal
-Kevin
-Morty
-Lumi
-Savannah
-Horton
-Sandi
-McCullough
-Kent
-Key
-Terri
-Rush
-Leo
-Sanders
-Eric
-Bassett
-Beverly
-Curtis
-Deb
-Conley
-Mel
-Potts
-Jodi
-Brady
-Gayle
-Courtney
-Rosemary
-FitzPatrick
-Sandra
-Hansen
-Jeffery
-McCall
-Freddie
-Atkins
-Irma
-Sheridan
-Gloria
-Cantu
-Donna
-Cross
-Santiago
-Combs
-Kari
-Larson
-Carrie
-Stokes
-Hugo
-Day
-Wilma
-Drake
-Lupe
-Fox
-Thomas
-Manning
-Cara
-Briggs
-Lorena
-Clayton
-Carlos
-Fish
-Dwayne
-Cole
-Cummings
-Angelo
-Mathews
-Brittany
-Shelton
-Joshua
-Stuart
-Daryl
-Bradley
-Thelma
-Cahill
-Ryan
-Coffey
-Richard
-Sheldon
-Bob
-Conway
-Helen
-Riggs
-Jim
-Wilson
-Curtis
-Snell
-Laverne
-Walton
-Joyce
-Norton
-Javier
-Martinez
-Van
-Keenan".split_ascii_whitespace();
-        names.into_iter().map(str::trim).map(ToOwned::to_owned).collect()
-    };
-}
-
-pub fn random_name() -> String {
-    NAMES.choose(&mut rand::thread_rng()).unwrap().to_owned()
-}
-
-pub type Backend = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
-pub type Tensor<const D: usize, K: TensorKind<Backend>> = burn::tensor::Tensor<Backend, D, K>;
+pub mod brains;
+pub mod names;
 
 #[derive(Default, Clone, Copy)]
 pub struct OtherState {
@@ -137,7 +32,7 @@ pub struct OtherState {
 }
 
 #[derive(Default, Clone, Copy)]
-pub struct State {
+pub struct Observation {
     pub pos: Vec2,
     pub linvel: Vec2,
     pub direction: Vec2,
@@ -145,7 +40,7 @@ pub struct State {
     pub other_states: [OtherState; NUM_AGENTS],
 }
 
-impl State {
+impl Observation {
     pub fn as_vec(&self) -> Vec<f32> {
         let mut out = vec![
             self.pos.x / 2000.0,
@@ -174,49 +69,7 @@ impl State {
     }
 }
 
-pub const NUM_AGENTS: usize = 8;
-pub const AGENT_EMBED_DIM: usize = 512;
-pub const AGENT_ACTOR_LR: f64 = 1e-5;
-pub const AGENT_CRITIC_LR: f64 = 1e-4;
-// pub const AGENT_OPTIM_EPOCHS: usize = 20;
-pub const AGENT_OPTIM_BATCH_SIZE: usize = 128;
-
-pub const N_FRAME_STACK: usize = 4;
-
-pub const AGENT_RADIUS: f32 = 20.0;
-pub const AGENT_MAX_LIN_VEL: f32 = 300.0;
-// pub const AGENT_MAX_ANG_VEL: f32 = 2.0;
-pub const AGENT_LIN_MOVE_FORCE: f32 = 300.0;
-pub const AGENT_ANG_MOVE_FORCE: f32 = 1.0;
-
-pub const AGENT_MAX_HEALTH: f32 = 100.0;
-pub const AGENT_SHOOT_DISTANCE: f32 = 200.0;
-
-pub struct OuNoise {
-    mu: f64,
-    theta: f64,
-    sigma: f64,
-    state: Tensor<2, Float>,
-}
-
-// impl OuNoise {
-//     fn new(mu: f64, theta: f64, sigma: f64, num_actions: usize) -> Self {
-//         let state = Tensor::ones([num_actions as _], FLOAT_CPU);
-//         Self {
-//             mu,
-//             theta,
-//             sigma,
-//             state,
-//         }
-//     }
-
-//     fn sample(&mut self) -> &Tensor {
-//         let dx = self.theta * (self.mu - &self.state)
-//             + self.sigma * Tensor::randn(self.state.size(), FLOAT_CPU);
-//         self.state += dx;
-//         &self.state
-//     }
-// }
+pub mod hparams;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Action {
@@ -226,8 +79,7 @@ pub struct Action {
 }
 
 impl Action {
-    pub fn from_tensor(action: Tensor<1, Float>) -> Self {
-        let action: Vec<f32> = action.to_data().value.clone();
+    pub fn from_slice(action: &[f32]) -> Self {
         Self {
             lin_force: Vec2::new(
                 action[0] * AGENT_LIN_MOVE_FORCE,
@@ -251,262 +103,6 @@ impl Action {
         Self::default().as_vec().len()
     }
 }
-
-#[derive(Clone)]
-pub struct SavedStep {
-    pub state: State,
-    pub action: Vec<f32>,
-    pub reward: f32,
-    pub terminal: bool,
-}
-
-impl SavedStep {
-    pub fn unzip(self) -> (State, Vec<f32>, f32, bool) {
-        (self.state, self.action, self.reward, self.terminal)
-    }
-}
-
-#[derive(Clone)]
-pub struct FrameStack<const NSTACK: usize>([State; NSTACK]);
-
-impl<const NSTACK: usize> Default for FrameStack<NSTACK> {
-    fn default() -> Self {
-        Self([State::default(); NSTACK])
-    }
-}
-
-impl<const NSTACK: usize> FrameStack<NSTACK> {
-    pub fn as_tensor(&self) -> Tensor<2, Float> {
-        Tensor::cat(
-            self.0
-                .iter()
-                .map(|s| Tensor::from_floats(s.as_vec().as_slice()).unsqueeze())
-                .collect::<Vec<_>>(),
-            0,
-        )
-
-        // .concat()
-    }
-
-    pub fn push(&mut self, s: State) {
-        for i in 0..NSTACK - 1 {
-            self.0[i] = self.0[i + 1];
-        }
-        self.0[NSTACK - 1] = s;
-    }
-}
-
-#[derive(Module, Debug, Clone)]
-pub struct Mlp {
-    pub layers: Vec<nn::Linear<Backend>>,
-}
-
-impl Mlp {
-    pub fn new(dims: &[usize]) -> Self {
-        let mut layers = vec![];
-        for i in 0..dims.len() - 1 {
-            layers.push(nn::LinearConfig::new(dims[i], dims[i + 1]).init());
-        }
-        layers.push(nn::LinearConfig::new(dims[dims.len() - 2], dims[dims.len() - 1]).init());
-        Self { layers }
-    }
-    pub fn forward(
-        &self,
-        mut item: Tensor<1, Float>,
-        activation: impl Fn(Tensor<1, Float>) -> Tensor<1, Float>,
-        output_activation: Option<impl Fn(Tensor<1, Float>) -> Tensor<1, Float>>,
-    ) -> Tensor<1, Float> {
-        for layer in self.layers.iter().take(self.layers.len() - 1) {
-            item = layer.forward(item);
-            item = (activation)(item);
-        }
-        item = self.layers.last().unwrap().forward(item);
-        if let Some(out_act) = output_activation {
-            item = (out_act)(item);
-        }
-        item
-    }
-}
-
-static BRAIN_IDS: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Module, Debug, Clone)]
-pub struct Actor {
-    // pub rnn: nn::gru::Gru<Backend>,
-    pub model: Mlp,
-    pub mu_head: Mlp,
-    pub var_head: Mlp,
-}
-
-impl Default for Actor {
-    fn default() -> Self {
-        Self {
-            // rnn: nn::gru::GruConfig::new(State::dim() as i64, AGENT_EMBED_DIM, true, ),
-            model: Mlp::new(&[AGENT_EMBED_DIM, AGENT_EMBED_DIM]),
-            mu_head: Mlp::new(&[AGENT_EMBED_DIM, Action::dim()]),
-            var_head: Mlp::new(&[AGENT_EMBED_DIM, Action::dim()]),
-        }
-    }
-}
-
-impl Actor {
-    pub fn forward(&self, state: Tensor<1, Float>) -> Tensor<1, Float> {
-        todo!();
-    }
-}
-
-#[derive(Module, Clone, Debug)]
-pub struct Critic {
-    // pub rnn: nn::gru::Gru<Backend>,
-    pub model: Mlp,
-}
-
-impl Default for Critic {
-    fn default() -> Self {
-        Self {
-            // rnn: nn::gru::GruConfig::new(State::dim() as i64, AGENT_EMBED_DIM, true, ),
-            model: Mlp::new(&[AGENT_EMBED_DIM, AGENT_EMBED_DIM, 1]),
-        }
-    }
-}
-
-impl Critic {
-    pub fn forward(&self, state: Tensor<1, Float>, actions: Tensor<1, Float>) -> Tensor<1, Float> {
-        todo!();
-    }
-}
-
-pub struct Brain {
-    pub name: String,
-    pub version: u64,
-    pub color: Color,
-    pub id: u64,
-    pub actor: Actor,
-    pub critic: Critic,
-    pub target_actor: Actor,
-    pub target_critic: Critic,
-    pub rb: VecDeque<SavedStep>,
-    pub frame_stack: FrameStack<N_FRAME_STACK>,
-    // pub ou_noise: OuNoise,
-}
-
-impl Brain {
-    pub fn new() -> Self {
-        let id = BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let name = random_name();
-
-        let actor = Actor::default();
-        let critic = Critic::default();
-        Self {
-            name,
-            color: Color::rgb(rand::random(), rand::random(), rand::random()),
-            id,
-            version: 0,
-            target_actor: actor.clone(),
-            target_critic: critic.clone(),
-            actor,
-            critic,
-            rb: VecDeque::new(),
-            frame_stack: FrameStack::default(),
-            // ou_noise: OuNoise::new(0.0, 0.15, 0.1, Action::dim()),
-        }
-    }
-
-    pub fn act(&mut self, state: Tensor<1, Float>) -> Tensor<1, Float> {
-        let actions = self.actor.forward(state);
-        // actions += self.ou_noise.sample().to(self.actor.device);
-        // let actions = Tensor::random(mu.shape(), Dis)
-        actions
-    }
-
-    pub fn learn(&mut self, rb: Option<VecDeque<SavedStep>>) -> Option<(f32, f32)> {
-        let device = self.actor.devices()[0];
-
-        let mut total_reward = 0.0f32;
-        let rb = rb.unwrap_or(self.rb.clone());
-        let nsteps = rb.len() as i64;
-        if nsteps <= 1 {
-            return None; // sometimes bevy is slow to despawn things
-        }
-        let (states, actions, rewards, terminals): (
-            Vec<Tensor<1, Float>>,
-            Vec<Tensor<1, Float>>,
-            Vec<Tensor<1, Float>>,
-            Vec<Tensor<1, Float>>,
-        ) = itertools::multiunzip(rb.into_iter().map(|s| s.unzip()).map(|(s, a, r, t)| {
-            total_reward += r;
-            (
-                Tensor::from_floats(s.as_vec().as_slice()),
-                Tensor::from_floats(a.as_slice()),
-                Tensor::from_floats([r]),
-                Tensor::from_floats([if t { 0.0f32 } else { 1.0f32 }]),
-            )
-        }));
-
-        let mut total_loss = 0.0f32;
-        for (s, a, r, t, ns) in itertools::izip!(
-            states[..(nsteps as usize - 1)]
-                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
-                .map(|t| Tensor::cat(t.to_vec(), 0).to(device)),
-            actions[..(nsteps as usize - 1)]
-                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
-                .map(|t| Tensor::stack(t, 0).to(device)),
-            rewards[..(nsteps as usize - 1)]
-                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
-                .map(|t| Tensor::stack(t, 0).to(device)),
-            terminals[..(nsteps as usize - 1)]
-                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
-                .map(|t| Tensor::stack(t, 0).to(device)),
-            states[1..(nsteps as usize)]
-                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
-                .map(|t| Tensor::stack(t, 0).to(device))
-        ) {
-            let mut q_target = {
-                let ta = self.target_actor.forward(ns.clone());
-                self.target_critic.forward(ns, ta)
-            };
-            q_target = r + (0.99f32 * q_target * t).detach();
-            // q_target = (q_target.clone() - q_target.mean()) / (q_target.std(false) + 1e-7);
-
-            let q = self.critic.forward(&s, &a);
-
-            let diff = q_target - q;
-            let critic_loss = (&diff * &diff).mean(Kind::Float);
-
-            self.critic.opt.zero_grad();
-            critic_loss.backward();
-            self.critic.opt.step();
-
-            let actor_loss = -self
-                .critic
-                .forward(&s, &self.actor.forward(&s))
-                .mean(tch::Kind::Float);
-
-            self.actor.opt.zero_grad();
-            actor_loss.backward();
-            self.actor.opt.step();
-
-            track(&mut self.target_actor.vs, &self.actor.vs, 0.005);
-            track(&mut self.target_critic.vs, &self.critic.vs, 0.005);
-
-            let actor_loss: f32 = actor_loss.try_into().unwrap();
-            let critic_loss: f32 = critic_loss.try_into().unwrap();
-            let loss = actor_loss + critic_loss;
-
-            total_loss += loss;
-        }
-
-        Some((total_reward, total_loss))
-    }
-}
-
-impl Default for Brain {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-type BrainBank = BTreeMap<Entity, Brain>;
 
 #[derive(Component)]
 pub struct NameText {
@@ -582,7 +178,7 @@ impl AgentBundle {
 
 fn check_respawn_all(
     mut commands: Commands,
-    mut brains: NonSendMut<BrainBank>,
+    mut brains: NonSendMut<brains::BrainBank>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut writer: NonSendMut<TbWriter>,
@@ -595,7 +191,7 @@ fn check_respawn_all(
             let mut brain = brains.remove(&agent).unwrap();
             // for (a, brain) in brains.iter_mut() {
             let mean_reward =
-                brain.rb.iter().map(|s| s.reward).sum::<f32>() / brain.rb.len() as f32;
+                brain.rb.buf.iter().map(|s| s.reward).sum::<f32>() / brain.rb.buf.len() as f32;
             println!("{} reward: {mean_reward}", &brain.name);
             writer.0.add_scalar(
                 &format!("Reward/{}", brain.id),
@@ -604,24 +200,23 @@ fn check_respawn_all(
             );
             let mut total_loss = 0.0;
             let mut n_losses = 0;
-            for rb in all_rbs.iter() {
-                if let Some((_reward, loss)) = brain.learn(Some(rb.clone())) {
-                    total_loss += loss;
-                    // total_reward += reward;
-                    n_losses += 1;
-                }
-            }
-            writer.0.add_scalar(
-                &format!("Loss/{}", brain.id),
-                total_loss / n_losses as f32,
-                frame_count.0 as usize,
-            );
-            println!("{} loss: {}", &brain.name, total_loss / n_losses as f32);
+            // for rb in all_rbs.iter() {
+            //     if let Some((_reward, loss)) = brain.learn(Some(rb.clone())) {
+            //         total_loss += loss;
+            //         // total_reward += reward;
+            //         n_losses += 1;
+            //     }
+            // }
+            // writer.0.add_scalar(
+            //     &format!("Loss/{}", brain.id),
+            //     total_loss / n_losses as f32,
+            //     frame_count.0 as usize,
+            // );
+            // println!("{} loss: {}", &brain.name, total_loss / n_losses as f32);
             // }
             // brain transplant
 
-            brain.frame_stack = FrameStack::default();
-            brain.rb.clear();
+            brain.rb.buf.clear();
             brain.version += 1;
 
             spawn_agent(
@@ -640,7 +235,7 @@ fn check_respawn_all(
 pub struct Wall;
 
 fn spawn_agent(
-    brain: Brain,
+    brain: Brain<thinkers::RandomThinker>,
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
@@ -762,7 +357,7 @@ fn setup(
         .insert(TransformBundle::from(Transform::from_xyz(500.0, 0.0, 0.0)));
 
     for _ in 0..NUM_AGENTS {
-        let brain = Brain::new();
+        let brain = Brain::new(thinkers::RandomThinker);
         spawn_agent(
             brain,
             &mut commands,
@@ -797,6 +392,7 @@ fn update(
     _keys: Res<Input<KeyCode>>,
     time: Res<Time>,
 ) {
+    let mut all_states = BTreeMap::new();
     let mut all_actions = BTreeMap::new();
     let mut all_rewards = BTreeMap::new();
     let mut all_terminals = BTreeMap::new();
@@ -810,7 +406,7 @@ fn update(
     }
 
     for (agent, _, velocity, transform) in agents.iter() {
-        let mut my_state = State {
+        let mut my_state = Observation {
             pos: transform.translation.xy(),
             linvel: velocity.linvel,
             direction: transform.local_y().xy(),
@@ -827,12 +423,13 @@ fn update(
             my_state.other_states[brains[&other].id as usize] = other_state;
         }
 
-        brains.get_mut(&agent).unwrap().frame_stack.push(my_state);
+        // brains.get_mut(&agent).unwrap().frame_stack.push(my_state);
 
-        let state = brains.get(&agent).unwrap().frame_stack.as_tensor();
-        let action = brains.get_mut(&agent).unwrap().act(&state);
+        // let state = brains.get(&agent).unwrap().frame_stack.as_tensor();
+        all_states.insert(agent, my_state);
+        let action = brains.get_mut(&agent).unwrap().act(my_state);
 
-        all_actions.insert(agent, Action::from_tensor(&action));
+        all_actions.insert(agent, action);
         all_rewards.insert(agent, 0.0);
         all_terminals.insert(agent, false);
     }
@@ -947,16 +544,12 @@ fn update(
     }
 
     for (agent, _, _, _) in agents.iter() {
-        let stack = brains[&agent].frame_stack.clone();
-        brains.get_mut(&agent).unwrap().rb.push_back(SavedStep {
-            state: stack,
-            action: all_actions.remove(&agent).unwrap().as_vec(),
+        brains.get_mut(&agent).unwrap().rb.remember(SavedStep {
+            obs: all_states.remove(&agent).unwrap(),
+            action: all_actions.remove(&agent).unwrap(),
             reward: all_rewards.remove(&agent).unwrap(),
             terminal: all_terminals.remove(&agent).unwrap(),
         });
-        if brains.get_mut(&agent).unwrap().rb.len() >= 10000 {
-            brains.get_mut(&agent).unwrap().rb.pop_front();
-        }
     }
 
     for agent in dead_agents {
