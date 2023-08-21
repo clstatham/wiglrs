@@ -1,15 +1,24 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
-use std::{collections::BTreeMap, f32::consts::PI, sync::atomic::AtomicU64};
-
-use bevy::{core::FrameCount, math::Vec3Swizzles, prelude::*, sprite::MaterialMesh2dBundle};
-use bevy_rapier2d::prelude::*;
-use rand::seq::SliceRandom;
-use tch::{
-    kind::INT64_CPU,
-    nn::{self, OptimizerConfig},
-    Tensor,
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::atomic::AtomicU64,
 };
+
+use bevy::{
+    core::FrameCount, math::Vec3Swizzles, prelude::*, sprite::MaterialMesh2dBundle,
+    winit::WinitSettings,
+};
+use bevy_rapier2d::prelude::*;
+use burn::{
+    module::Module,
+    nn,
+    optim::{Adam, AdamConfig},
+    tensor::{Float, TensorKind},
+};
+use burn_wgpu::Vulkan;
+use rand::seq::SliceRandom;
+use tensorboard_rs::summary_writer::SummaryWriter;
 
 lazy_static::lazy_static! {
     pub static ref NAMES: Vec<String> = {
@@ -117,24 +126,47 @@ pub fn random_name() -> String {
     NAMES.choose(&mut rand::thread_rng()).unwrap().to_owned()
 }
 
+pub type Backend = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
+pub type Tensor<const D: usize, K: TensorKind<Backend>> = burn::tensor::Tensor<Backend, D, K>;
+
+#[derive(Default, Clone, Copy)]
+pub struct OtherState {
+    pub rel_pos: Vec2,
+    pub linvel: Vec2,
+    pub direction: Vec2,
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct State {
-    pub position: Vec2,
+    pub pos: Vec2,
     pub linvel: Vec2,
-    pub angle: f32,
-    pub angvel: f32,
+    pub direction: Vec2,
+    pub dt: f32,
+    pub other_states: [OtherState; NUM_AGENTS],
 }
 
 impl State {
     pub fn as_vec(&self) -> Vec<f32> {
-        vec![
-            self.position.x / 1000.0,
-            self.position.y / 1000.0,
-            self.linvel.x / AGENT_MAX_LIN_VEL,
-            self.linvel.y / AGENT_MAX_LIN_VEL,
-            self.angle / PI,
-            self.angvel / PI,
-        ]
+        let mut out = vec![
+            self.pos.x / 2000.0,
+            self.pos.y / 2000.0,
+            self.linvel.x / 2000.0,
+            self.linvel.y / 2000.0,
+            self.direction.x,
+            self.direction.y,
+            // self.dt,
+        ];
+        for other in &self.other_states {
+            out.extend_from_slice(&[
+                other.rel_pos.x / 2000.0,
+                other.rel_pos.y / 2000.0,
+                other.linvel.x / 2000.0,
+                other.linvel.y / 2000.0,
+                other.direction.x,
+                other.direction.y,
+            ]);
+        }
+        out
     }
 
     pub fn dim() -> usize {
@@ -142,20 +174,49 @@ impl State {
     }
 }
 
-pub const NUM_AGENTS: usize = 10;
-pub const AGENT_EMBED_DIM: i64 = 512;
-pub const AGENT_LR: f64 = 1e-4;
-pub const AGENT_OPTIM_EPOCHS: usize = 100;
-pub const AGENT_OPTIM_BATCH_SIZE: i64 = 64;
+pub const NUM_AGENTS: usize = 8;
+pub const AGENT_EMBED_DIM: usize = 512;
+pub const AGENT_ACTOR_LR: f64 = 1e-5;
+pub const AGENT_CRITIC_LR: f64 = 1e-4;
+// pub const AGENT_OPTIM_EPOCHS: usize = 20;
+pub const AGENT_OPTIM_BATCH_SIZE: usize = 128;
+
+pub const N_FRAME_STACK: usize = 4;
 
 pub const AGENT_RADIUS: f32 = 20.0;
 pub const AGENT_MAX_LIN_VEL: f32 = 300.0;
-pub const AGENT_MAX_ANG_VEL: f32 = 2.0;
+// pub const AGENT_MAX_ANG_VEL: f32 = 2.0;
 pub const AGENT_LIN_MOVE_FORCE: f32 = 300.0;
 pub const AGENT_ANG_MOVE_FORCE: f32 = 1.0;
 
 pub const AGENT_MAX_HEALTH: f32 = 100.0;
 pub const AGENT_SHOOT_DISTANCE: f32 = 200.0;
+
+pub struct OuNoise {
+    mu: f64,
+    theta: f64,
+    sigma: f64,
+    state: Tensor<2, Float>,
+}
+
+// impl OuNoise {
+//     fn new(mu: f64, theta: f64, sigma: f64, num_actions: usize) -> Self {
+//         let state = Tensor::ones([num_actions as _], FLOAT_CPU);
+//         Self {
+//             mu,
+//             theta,
+//             sigma,
+//             state,
+//         }
+//     }
+
+//     fn sample(&mut self) -> &Tensor {
+//         let dx = self.theta * (self.mu - &self.state)
+//             + self.sigma * Tensor::randn(self.state.size(), FLOAT_CPU);
+//         self.state += dx;
+//         &self.state
+//     }
+// }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Action {
@@ -165,7 +226,8 @@ pub struct Action {
 }
 
 impl Action {
-    pub fn from_slice(action: &[f32]) -> Self {
+    pub fn from_tensor(action: Tensor<1, Float>) -> Self {
+        let action: Vec<f32> = action.to_data().value.clone();
         Self {
             lin_force: Vec2::new(
                 action[0] * AGENT_LIN_MOVE_FORCE,
@@ -190,153 +252,142 @@ impl Action {
     }
 }
 
+#[derive(Clone)]
 pub struct SavedStep {
-    pub state: Vec<f32>,
+    pub state: State,
     pub action: Vec<f32>,
     pub reward: f32,
     pub terminal: bool,
 }
 
 impl SavedStep {
-    pub fn unzip(self) -> (Vec<f32>, Vec<f32>, f32, bool) {
+    pub fn unzip(self) -> (State, Vec<f32>, f32, bool) {
         (self.state, self.action, self.reward, self.terminal)
+    }
+}
+
+#[derive(Clone)]
+pub struct FrameStack<const NSTACK: usize>([State; NSTACK]);
+
+impl<const NSTACK: usize> Default for FrameStack<NSTACK> {
+    fn default() -> Self {
+        Self([State::default(); NSTACK])
+    }
+}
+
+impl<const NSTACK: usize> FrameStack<NSTACK> {
+    pub fn as_tensor(&self) -> Tensor<2, Float> {
+        Tensor::cat(
+            self.0
+                .iter()
+                .map(|s| Tensor::from_floats(s.as_vec().as_slice()).unsqueeze())
+                .collect::<Vec<_>>(),
+            0,
+        )
+
+        // .concat()
+    }
+
+    pub fn push(&mut self, s: State) {
+        for i in 0..NSTACK - 1 {
+            self.0[i] = self.0[i + 1];
+        }
+        self.0[NSTACK - 1] = s;
+    }
+}
+
+#[derive(Module, Debug, Clone)]
+pub struct Mlp {
+    pub layers: Vec<nn::Linear<Backend>>,
+}
+
+impl Mlp {
+    pub fn new(dims: &[usize]) -> Self {
+        let mut layers = vec![];
+        for i in 0..dims.len() - 1 {
+            layers.push(nn::LinearConfig::new(dims[i], dims[i + 1]).init());
+        }
+        layers.push(nn::LinearConfig::new(dims[dims.len() - 2], dims[dims.len() - 1]).init());
+        Self { layers }
+    }
+    pub fn forward(
+        &self,
+        mut item: Tensor<1, Float>,
+        activation: impl Fn(Tensor<1, Float>) -> Tensor<1, Float>,
+        output_activation: Option<impl Fn(Tensor<1, Float>) -> Tensor<1, Float>>,
+    ) -> Tensor<1, Float> {
+        for layer in self.layers.iter().take(self.layers.len() - 1) {
+            item = layer.forward(item);
+            item = (activation)(item);
+        }
+        item = self.layers.last().unwrap().forward(item);
+        if let Some(out_act) = output_activation {
+            item = (out_act)(item);
+        }
+        item
     }
 }
 
 static BRAIN_IDS: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Module, Debug, Clone)]
 pub struct Actor {
-    pub vs: nn::VarStore,
-    pub model: nn::Sequential,
-    pub opt: nn::Optimizer,
-    pub device: tch::Device,
+    // pub rnn: nn::gru::Gru<Backend>,
+    pub model: Mlp,
+    pub mu_head: Mlp,
+    pub var_head: Mlp,
 }
 
 impl Default for Actor {
     fn default() -> Self {
-        let dev = tch::Device::cuda_if_available();
-        let vs = nn::VarStore::new(dev);
-        let p = &vs.root();
         Self {
-            model: nn::seq()
-                .add(nn::linear(
-                    p / "al1",
-                    (State::dim() * NUM_AGENTS) as i64,
-                    AGENT_EMBED_DIM,
-                    Default::default(),
-                ))
-                .add_fn(|xs| xs.relu())
-                .add(nn::linear(
-                    p / "al2",
-                    AGENT_EMBED_DIM,
-                    AGENT_EMBED_DIM,
-                    Default::default(),
-                ))
-                .add_fn(|xs| xs.relu())
-                .add(nn::linear(
-                    p / "al3",
-                    AGENT_EMBED_DIM,
-                    Action::dim() as i64,
-                    Default::default(),
-                ))
-                .add_fn(|xs| xs.tanh()),
-            opt: nn::Adam::default().build(&vs, AGENT_LR).unwrap(),
-            vs,
-            device: dev,
+            // rnn: nn::gru::GruConfig::new(State::dim() as i64, AGENT_EMBED_DIM, true, ),
+            model: Mlp::new(&[AGENT_EMBED_DIM, AGENT_EMBED_DIM]),
+            mu_head: Mlp::new(&[AGENT_EMBED_DIM, Action::dim()]),
+            var_head: Mlp::new(&[AGENT_EMBED_DIM, Action::dim()]),
         }
     }
 }
 
 impl Actor {
-    pub fn forward(&self, state: &Tensor) -> Tensor {
-        state.to(self.device).apply(&self.model)
+    pub fn forward(&self, state: Tensor<1, Float>) -> Tensor<1, Float> {
+        todo!();
     }
 }
 
-impl Clone for Actor {
-    fn clone(&self) -> Self {
-        let mut new = Self::default();
-        new.vs.copy(&self.vs).unwrap();
-        new
-    }
-}
-
+#[derive(Module, Clone, Debug)]
 pub struct Critic {
-    pub vs: nn::VarStore,
-    pub model: nn::Sequential,
-    pub opt: nn::Optimizer,
-    pub device: tch::Device,
+    // pub rnn: nn::gru::Gru<Backend>,
+    pub model: Mlp,
 }
 
 impl Default for Critic {
     fn default() -> Self {
-        let dev = tch::Device::cuda_if_available();
-        let vs = nn::VarStore::new(dev);
-        let p = &vs.root();
         Self {
-            model: nn::seq()
-                .add(nn::linear(
-                    p / "cl1",
-                    (State::dim() * NUM_AGENTS) as i64 + (Action::dim() as i64),
-                    AGENT_EMBED_DIM,
-                    Default::default(),
-                ))
-                .add_fn(|xs| xs.relu())
-                .add(nn::linear(
-                    p / "cl2",
-                    AGENT_EMBED_DIM,
-                    AGENT_EMBED_DIM,
-                    Default::default(),
-                ))
-                .add_fn(|xs| xs.relu())
-                .add(nn::linear(
-                    p / "cl3",
-                    AGENT_EMBED_DIM,
-                    1,
-                    Default::default(),
-                )),
-            opt: nn::Adam::default().build(&vs, AGENT_LR).unwrap(),
-            vs,
-            device: dev,
+            // rnn: nn::gru::GruConfig::new(State::dim() as i64, AGENT_EMBED_DIM, true, ),
+            model: Mlp::new(&[AGENT_EMBED_DIM, AGENT_EMBED_DIM, 1]),
         }
     }
 }
+
 impl Critic {
-    pub fn forward(&self, state: &Tensor, action: &Tensor) -> Tensor {
-        let xs = Tensor::cat(&[action.copy(), state.copy()], 1);
-        xs.to(self.device).apply(&self.model)
+    pub fn forward(&self, state: Tensor<1, Float>, actions: Tensor<1, Float>) -> Tensor<1, Float> {
+        todo!();
     }
-}
-
-impl Clone for Critic {
-    fn clone(&self) -> Self {
-        let mut new = Self::default();
-        new.vs.copy(&self.vs).unwrap();
-        new
-    }
-}
-
-fn track(dest: &mut nn::VarStore, src: &nn::VarStore, tau: f64) {
-    tch::no_grad(|| {
-        for (dest, src) in dest
-            .trainable_variables()
-            .iter_mut()
-            .zip(src.trainable_variables().iter())
-        {
-            dest.copy_(&(tau * src + (1.0 - tau) * &*dest));
-        }
-    })
 }
 
 pub struct Brain {
     pub name: String,
+    pub version: u64,
     pub color: Color,
     pub id: u64,
     pub actor: Actor,
     pub critic: Critic,
     pub target_actor: Actor,
     pub target_critic: Critic,
-    pub rb: Vec<SavedStep>,
+    pub rb: VecDeque<SavedStep>,
+    pub frame_stack: FrameStack<N_FRAME_STACK>,
+    // pub ou_noise: OuNoise,
 }
 
 impl Brain {
@@ -350,61 +401,77 @@ impl Brain {
             name,
             color: Color::rgb(rand::random(), rand::random(), rand::random()),
             id,
+            version: 0,
             target_actor: actor.clone(),
             target_critic: critic.clone(),
             actor,
             critic,
-            rb: Vec::new(),
+            rb: VecDeque::new(),
+            frame_stack: FrameStack::default(),
+            // ou_noise: OuNoise::new(0.0, 0.15, 0.1, Action::dim()),
         }
     }
 
-    pub fn act(&mut self, state: &Tensor) -> Tensor {
-        tch::no_grad(|| self.actor.forward(state))
+    pub fn act(&mut self, state: Tensor<1, Float>) -> Tensor<1, Float> {
+        let actions = self.actor.forward(state);
+        // actions += self.ou_noise.sample().to(self.actor.device);
+        // let actions = Tensor::random(mu.shape(), Dis)
+        actions
     }
 
-    pub fn learn(&mut self) {
-        let device = self.actor.device;
-        let nsteps = self.rb.len() as i64;
+    pub fn learn(&mut self, rb: Option<VecDeque<SavedStep>>) -> Option<(f32, f32)> {
+        let device = self.actor.devices()[0];
+
+        let mut total_reward = 0.0f32;
+        let rb = rb.unwrap_or(self.rb.clone());
+        let nsteps = rb.len() as i64;
         if nsteps <= 1 {
-            return; // sometimes bevy is slow to despawn things
+            return None; // sometimes bevy is slow to despawn things
         }
         let (states, actions, rewards, terminals): (
-            Vec<Tensor>,
-            Vec<Tensor>,
-            Vec<Tensor>,
-            Vec<Tensor>,
-        ) = itertools::multiunzip(self.rb.drain(..).map(|s| s.unzip()).map(|(s, a, r, t)| {
+            Vec<Tensor<1, Float>>,
+            Vec<Tensor<1, Float>>,
+            Vec<Tensor<1, Float>>,
+            Vec<Tensor<1, Float>>,
+        ) = itertools::multiunzip(rb.into_iter().map(|s| s.unzip()).map(|(s, a, r, t)| {
+            total_reward += r;
             (
-                Tensor::from_slice(&s),
-                Tensor::from_slice(&a),
-                Tensor::from_slice(&[r]),
-                Tensor::from_slice(&[if t { 1.0 } else { 0.0 }]),
+                Tensor::from_floats(s.as_vec().as_slice()),
+                Tensor::from_floats(a.as_slice()),
+                Tensor::from_floats([r]),
+                Tensor::from_floats([if t { 0.0f32 } else { 1.0f32 }]),
             )
         }));
-        let (states, actions, rewards, terminals) = (
-            Tensor::stack(&states, 0).to(device),
-            Tensor::stack(&actions, 0).to(device),
-            Tensor::stack(&rewards, 0).to(device),
-            Tensor::stack(&terminals, 0).to(device),
-        );
 
         let mut total_loss = 0.0f32;
-        for _ in 0..AGENT_OPTIM_EPOCHS {
-            let batch_idxs =
-                Tensor::randint(nsteps - 1, [AGENT_OPTIM_BATCH_SIZE], INT64_CPU).to(device);
-            let state = states.index_select(0, &batch_idxs);
-            let actions = actions.index_select(0, &batch_idxs);
-            let rewards = rewards.index_select(0, &batch_idxs);
-            let next_state = states.index_select(0, &(batch_idxs + 1));
+        for (s, a, r, t, ns) in itertools::izip!(
+            states[..(nsteps as usize - 1)]
+                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
+                .map(|t| Tensor::cat(t.to_vec(), 0).to(device)),
+            actions[..(nsteps as usize - 1)]
+                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
+                .map(|t| Tensor::stack(t, 0).to(device)),
+            rewards[..(nsteps as usize - 1)]
+                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
+                .map(|t| Tensor::stack(t, 0).to(device)),
+            terminals[..(nsteps as usize - 1)]
+                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
+                .map(|t| Tensor::stack(t, 0).to(device)),
+            states[1..(nsteps as usize)]
+                .chunks(AGENT_OPTIM_BATCH_SIZE as usize)
+                .map(|t| Tensor::stack(t, 0).to(device))
+        ) {
+            let mut q_target = {
+                let ta = self.target_actor.forward(ns.clone());
+                self.target_critic.forward(ns, ta)
+            };
+            q_target = r + (0.99f32 * q_target * t).detach();
+            // q_target = (q_target.clone() - q_target.mean()) / (q_target.std(false) + 1e-7);
 
-            let mut q_target = self
-                .target_critic
-                .forward(&next_state, &self.target_actor.forward(&next_state));
-            q_target = rewards + (0.99f32 * q_target).detach();
+            let q = self.critic.forward(&s, &a);
 
-            let q = self.critic.forward(&state, &actions);
-
-            let critic_loss = q.mse_loss(&q_target, tch::Reduction::Mean);
+            let diff = q_target - q;
+            let critic_loss = (&diff * &diff).mean(Kind::Float);
 
             self.critic.opt.zero_grad();
             critic_loss.backward();
@@ -412,7 +479,7 @@ impl Brain {
 
             let actor_loss = -self
                 .critic
-                .forward(&state, &self.actor.forward(&state))
+                .forward(&s, &self.actor.forward(&s))
                 .mean(tch::Kind::Float);
 
             self.actor.opt.zero_grad();
@@ -428,7 +495,8 @@ impl Brain {
 
             total_loss += loss;
         }
-        println!("{} loss: {total_loss}", self.name);
+
+        Some((total_reward, total_loss))
     }
 }
 
@@ -468,6 +536,7 @@ pub struct AgentBundle {
     friction: Friction,
     gravity: GravityScale,
     velocity: Velocity,
+    damping: Damping,
     force: ExternalForce,
     impulse: ExternalImpulse,
     mesh: MaterialMesh2dBundle<ColorMaterial>,
@@ -491,6 +560,10 @@ impl AgentBundle {
             },
             gravity: GravityScale(0.0),
             velocity: Velocity::default(),
+            damping: Damping {
+                angular_damping: 30.0,
+                linear_damping: 10.0,
+            },
             force: ExternalForce::default(),
             impulse: ExternalImpulse::default(),
 
@@ -507,23 +580,49 @@ impl AgentBundle {
     }
 }
 
-fn setup_brains(world: &mut World) {
-    let bank = BrainBank::default();
-    world.insert_non_send_resource(bank);
-}
-
 fn check_respawn_all(
     mut commands: Commands,
     mut brains: NonSendMut<BrainBank>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut writer: NonSendMut<TbWriter>,
     asset_server: Res<AssetServer>,
+    frame_count: Res<FrameCount>,
 ) {
     for agent in brains.keys().copied().collect::<Vec<_>>() {
         if commands.get_entity(agent).is_none() {
-            // brain transplant
+            let all_rbs = brains.values().map(|b| b.rb.clone()).collect::<Vec<_>>();
             let mut brain = brains.remove(&agent).unwrap();
+            // for (a, brain) in brains.iter_mut() {
+            let mean_reward =
+                brain.rb.iter().map(|s| s.reward).sum::<f32>() / brain.rb.len() as f32;
+            println!("{} reward: {mean_reward}", &brain.name);
+            writer.0.add_scalar(
+                &format!("Reward/{}", brain.id),
+                mean_reward,
+                frame_count.0 as usize,
+            );
+            let mut total_loss = 0.0;
+            let mut n_losses = 0;
+            for rb in all_rbs.iter() {
+                if let Some((_reward, loss)) = brain.learn(Some(rb.clone())) {
+                    total_loss += loss;
+                    // total_reward += reward;
+                    n_losses += 1;
+                }
+            }
+            writer.0.add_scalar(
+                &format!("Loss/{}", brain.id),
+                total_loss / n_losses as f32,
+                frame_count.0 as usize,
+            );
+            println!("{} loss: {}", &brain.name, total_loss / n_losses as f32);
+            // }
+            // brain transplant
+
+            brain.frame_stack = FrameStack::default();
             brain.rb.clear();
+            brain.version += 1;
 
             spawn_agent(
                 brain,
@@ -536,6 +635,9 @@ fn check_respawn_all(
         }
     }
 }
+
+#[derive(Component)]
+pub struct Wall;
 
 fn spawn_agent(
     brain: Brain,
@@ -557,6 +659,7 @@ fn spawn_agent(
             meshes,
             materials,
         ))
+        .insert(ActiveEvents::all())
         .with_children(|parent| {
             parent.spawn(ShootyLineBundle {
                 mesh: MaterialMesh2dBundle {
@@ -575,14 +678,14 @@ fn spawn_agent(
     commands.spawn((
         Text2dBundle {
             text: Text::from_section(
-                &brain.name,
+                format!("{} {}.0", &brain.name, brain.version),
                 TextStyle {
                     font: asset_server.load("fonts/FiraSans-Bold.ttf"),
                     font_size: 20.0,
-                    color: Color::BLACK,
+                    color: Color::WHITE,
                 },
             ),
-            transform: Transform::from_translation(agent_pos),
+            transform: Transform::from_translation(agent_pos + Vec3::new(0.0, 0.0, 2.0)),
             ..Default::default()
         },
         NameText {
@@ -604,18 +707,6 @@ fn setup(
         ..Default::default()
     });
 
-    for _ in 0..NUM_AGENTS {
-        let brain = Brain::new();
-        spawn_agent(
-            brain,
-            &mut commands,
-            &mut meshes,
-            &mut materials,
-            &mut brains,
-            &asset_server,
-        );
-    }
-
     commands
         .spawn(Collider::cuboid(500.0, 10.0))
         .insert(SpriteBundle {
@@ -626,6 +717,8 @@ fn setup(
             },
             ..default()
         })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
         .insert(TransformBundle::from(Transform::from_xyz(0.0, -300.0, 0.0)));
 
     commands
@@ -638,6 +731,8 @@ fn setup(
             },
             ..default()
         })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
         .insert(TransformBundle::from(Transform::from_xyz(0.0, 300.0, 0.0)));
     commands
         .spawn(Collider::cuboid(10.0, 300.0))
@@ -649,6 +744,8 @@ fn setup(
             },
             ..default()
         })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
         .insert(TransformBundle::from(Transform::from_xyz(-500.0, 0.0, 0.0)));
     commands
         .spawn(Collider::cuboid(10.0, 300.0))
@@ -660,7 +757,21 @@ fn setup(
             },
             ..default()
         })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
         .insert(TransformBundle::from(Transform::from_xyz(500.0, 0.0, 0.0)));
+
+    for _ in 0..NUM_AGENTS {
+        let brain = Brain::new();
+        spawn_agent(
+            brain,
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut brains,
+            &asset_server,
+        );
+    }
 }
 
 fn update(
@@ -681,8 +792,11 @@ fn update(
         (Without<Agent>, Without<ShootyLine>),
     >,
     cx: Res<RapierContext>,
+    _collision_events: EventReader<ContactForceEvent>,
+    _walls: Query<&Collider, (Without<Agent>, With<Wall>)>,
+    _keys: Res<Input<KeyCode>>,
+    time: Res<Time>,
 ) {
-    let mut all_states = BTreeMap::new(); // you're in good hands...?
     let mut all_actions = BTreeMap::new();
     let mut all_rewards = BTreeMap::new();
     let mut all_terminals = BTreeMap::new();
@@ -696,43 +810,46 @@ fn update(
     }
 
     for (agent, _, velocity, transform) in agents.iter() {
-        let mut state = vec![State::default(); NUM_AGENTS];
-        let my_state = State {
-            position: transform.translation.xy(),
+        let mut my_state = State {
+            pos: transform.translation.xy(),
             linvel: velocity.linvel,
-            angle: transform.rotation.to_euler(EulerRot::XYZ).2,
-            angvel: velocity.angvel,
+            direction: transform.local_y().xy(),
+            dt: time.delta_seconds(),
+            other_states: [OtherState::default(); NUM_AGENTS],
         };
-        state[brains[&agent].id as usize] = my_state;
 
-        for (other, _, other_vel, other_transform) in agents.iter().filter(|a| a.0 != agent) {
-            let other_state = State {
-                position: other_transform.translation.xy() - transform.translation.xy(),
+        for (other, _, other_vel, other_transform) in agents.iter() {
+            let other_state = OtherState {
+                rel_pos: transform.translation.xy() - other_transform.translation.xy(),
                 linvel: other_vel.linvel,
-                angle: other_transform.rotation.to_euler(EulerRot::XYZ).2,
-                angvel: other_vel.angvel,
+                direction: other_transform.local_y().xy(),
             };
-            state[brains[&other].id as usize] = other_state;
+            my_state.other_states[brains[&other].id as usize] = other_state;
         }
 
-        let state = state
-            .into_iter()
-            .map(|s| s.as_vec())
-            .collect::<Vec<_>>()
-            .concat();
-        let action = brains
-            .get_mut(&agent)
-            .unwrap()
-            .act(&Tensor::from_slice(&state));
+        brains.get_mut(&agent).unwrap().frame_stack.push(my_state);
 
-        let action: Vec<f32> = action.try_into().unwrap();
-        all_states.insert(agent, state);
-        all_actions.insert(agent, Action::from_slice(&action));
-        all_rewards.insert(agent, 0.0f32);
+        let state = brains.get(&agent).unwrap().frame_stack.as_tensor();
+        let action = brains.get_mut(&agent).unwrap().act(&state);
+
+        all_actions.insert(agent, Action::from_tensor(&action));
+        all_rewards.insert(agent, 0.0);
         all_terminals.insert(agent, false);
     }
-    for (agent, mut force, mut velocity, _) in agents.iter_mut() {
-        if all_actions[&agent].shoot {
+    let mut dead_agents = vec![];
+    for (agent, mut force, _velocity, transform) in agents.iter_mut() {
+        let distance_to_center = transform.translation.distance(Vec3::splat(0.0));
+        if distance_to_center >= 100.0 {
+            let mut hp = health.get_mut(agent).unwrap();
+            hp.0 -= distance_to_center / 10000.0;
+            *all_rewards.get_mut(&agent).unwrap() -= distance_to_center / 1000.0;
+            if hp.0 <= 0.0 {
+                dead_agents.push(agent);
+                *all_terminals.get_mut(&agent).unwrap() = true;
+            }
+        }
+
+        if all_actions[&agent].shoot && !dead_agents.contains(&agent) {
             let (ray_dir, ray_pos) = {
                 let (transform, childs) = agents_shootin.get(agent).unwrap();
                 let ray_dir = transform.local_y().xy();
@@ -761,13 +878,13 @@ fn update(
                 }
                 if let Ok(mut health) = health.get_mut(hit_entity) {
                     health.0 -= 1.0;
-                    *all_rewards.get_mut(&agent).unwrap() += 1.0;
+                    *all_rewards.get_mut(&agent).unwrap() += 2.0;
                     *all_rewards.get_mut(&hit_entity).unwrap() -= 1.0;
                     if health.0 <= 0.0 {
-                        commands.entity(hit_entity).despawn_recursive();
+                        dead_agents.push(hit_entity);
                         *all_terminals.get_mut(&hit_entity).unwrap() = true;
-                        *all_rewards.get_mut(&agent).unwrap() += 100.0;
-                        *all_rewards.get_mut(&hit_entity).unwrap() -= 100.0;
+                        *all_rewards.get_mut(&agent).unwrap() += 1000.0;
+                        *all_rewards.get_mut(&hit_entity).unwrap() -= 1000.0;
                         println!(
                             "{} killed {}! Nice!",
                             &brains[&agent].name, &brains[&hit_entity].name
@@ -782,6 +899,7 @@ fn update(
                         *t = t.with_translation(Vec3::new(0.0, AGENT_SHOOT_DISTANCE / 2.0, 0.0));
                     }
                 }
+                *all_rewards.get_mut(&agent).unwrap() -= 1.0;
             }
         } else {
             let (_, childs) = agents_shootin.get(agent).unwrap();
@@ -795,44 +913,91 @@ fn update(
         force.force = all_actions[&agent].lin_force;
         force.torque = all_actions[&agent].ang_force;
 
+        // let mut applied_force = Vec2::default();
+        // let mut applied_torque = 0.0;
+
+        // if keys.pressed(KeyCode::A) {
+        //     applied_force += Vec2::NEG_X * AGENT_LIN_MOVE_FORCE;
+        // }
+        // if keys.pressed(KeyCode::D) {
+        //     applied_force += Vec2::X * AGENT_LIN_MOVE_FORCE;
+        // }
+        // if keys.pressed(KeyCode::W) {
+        //     applied_force += Vec2::Y * AGENT_LIN_MOVE_FORCE;
+        // }
+        // if keys.pressed(KeyCode::S) {
+        //     applied_force += Vec2::NEG_Y * AGENT_LIN_MOVE_FORCE;
+        // }
+
+        // if keys.pressed(KeyCode::Q) {
+        //     applied_torque += AGENT_ANG_MOVE_FORCE;
+        // }
+        // if keys.pressed(KeyCode::E) {
+        //     applied_torque -= AGENT_ANG_MOVE_FORCE;
+        // }
+        // force.force = applied_force;
+        // force.torque = applied_torque;
+
         // clamp velocity
-        velocity.linvel = velocity.linvel.clamp(
-            Vec2::new(-AGENT_MAX_LIN_VEL, -AGENT_MAX_LIN_VEL),
-            Vec2::new(AGENT_MAX_LIN_VEL, AGENT_MAX_LIN_VEL),
-        );
-        velocity.angvel = velocity.angvel.clamp(-AGENT_MAX_ANG_VEL, AGENT_MAX_ANG_VEL);
+        // velocity.linvel = velocity.linvel.clamp(
+        //     Vec2::new(-AGENT_MAX_LIN_VEL, -AGENT_MAX_LIN_VEL),
+        //     Vec2::new(AGENT_MAX_LIN_VEL, AGENT_MAX_LIN_VEL),
+        // );
+        // velocity.angvel = velocity.angvel.clamp(-AGENT_MAX_ANG_VEL, AGENT_MAX_ANG_VEL);
     }
 
     for (agent, _, _, _) in agents.iter() {
-        brains.get_mut(&agent).unwrap().rb.push(SavedStep {
-            state: all_states.remove(&agent).unwrap(),
+        let stack = brains[&agent].frame_stack.clone();
+        brains.get_mut(&agent).unwrap().rb.push_back(SavedStep {
+            state: stack,
             action: all_actions.remove(&agent).unwrap().as_vec(),
             reward: all_rewards.remove(&agent).unwrap(),
             terminal: all_terminals.remove(&agent).unwrap(),
-        })
+        });
+        if brains.get_mut(&agent).unwrap().rb.len() >= 10000 {
+            brains.get_mut(&agent).unwrap().rb.pop_front();
+        }
+    }
+
+    for agent in dead_agents {
+        commands.entity(agent).despawn_recursive();
     }
 }
 
-fn learn(mut commands: Commands, mut brains: NonSendMut<BrainBank>, frame_count: Res<FrameCount>) {
-    if frame_count.0 % 5000 == 0 {
-        for (ent, brain) in brains.iter_mut() {
-            if commands.get_entity(*ent).is_some() {
-                brain.learn();
-            }
-        }
+pub struct TbWriter(SummaryWriter);
+
+impl Default for TbWriter {
+    fn default() -> Self {
+        use chrono::prelude::*;
+        let timestamp = Local::now().format("%Y%m%d%H%M%S");
+        Self(tensorboard_rs::summary_writer::SummaryWriter::new(format!(
+            "training/{timestamp}"
+        )))
     }
 }
 
 fn main() {
     App::new()
         .insert_resource(Msaa::default())
-        .add_plugins(DefaultPlugins)
+        .insert_resource(WinitSettings {
+            focused_mode: bevy::winit::UpdateMode::Continuous,
+            ..default()
+        })
+        .insert_resource(ClearColor(Color::DARK_GRAY))
+        .insert_non_send_resource(TbWriter::default())
+        .insert_non_send_resource(BrainBank::default())
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                present_mode: bevy::window::PresentMode::AutoVsync,
+                title: "wiglrs".to_owned(),
+                ..default()
+            }),
+            ..Default::default()
+        }))
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
         .add_plugins(RapierDebugRenderPlugin::default())
-        .add_systems(Startup, setup_brains)
         .add_systems(Startup, setup)
         .add_systems(Update, update)
         .add_systems(Update, check_respawn_all)
-        .add_systems(Update, learn)
         .run();
 }
