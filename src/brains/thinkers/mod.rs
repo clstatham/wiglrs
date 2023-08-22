@@ -2,7 +2,7 @@ use bevy::prelude::Vec2;
 
 use crate::{Action, Observation};
 
-use super::{replay_buffer::ReplayBuffer, Brain};
+use super::replay_buffer::ReplayBuffer;
 
 pub mod ppo;
 

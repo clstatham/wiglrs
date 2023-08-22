@@ -79,6 +79,8 @@ pub struct Action {
     shoot: bool,
 }
 
+pub const ACTION_LEN: usize = 4;
+
 impl Action {
     pub fn from_slice(action: &[f32]) -> Self {
         Self {

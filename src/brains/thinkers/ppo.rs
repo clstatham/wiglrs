@@ -1,40 +1,38 @@
 use dfdx::optim::Adam;
 use dfdx::prelude::*;
+use std::collections::VecDeque;
 use std::f32::consts::PI;
-use std::marker::PhantomData;
-use std::ops::{Add, Mul, Sub};
+use std::ops::{Add, Mul};
 
 use crate::brains::replay_buffer::ReplayBuffer;
-use crate::brains::Brain;
 use crate::hparams::{AGENT_ACTOR_LR, AGENT_EMBED_DIM, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS};
-use crate::{Action, Observation, OBS_LEN};
+use crate::{Action, Observation, ACTION_LEN, OBS_LEN};
 
 use super::Thinker;
 
-pub type Tensor<S, T = NoneTape> = dfdx::tensor::Tensor<S, f32, Cuda, T>;
+pub type Device = AutoDevice;
 
-// todo: this is hacky, super hacky
-const ACTION_LEN: usize = std::mem::size_of::<Action>() / std::mem::size_of::<f32>();
+pub type Tensor<S, T = NoneTape> = dfdx::tensor::Tensor<S, f32, Device, T>;
 
-pub struct MvNormal<const K: usize, T: Tape<f32, Cuda> + Merge<NoneTape>> {
+pub struct MvNormal<const K: usize, T: Tape<f32, Device> + Merge<NoneTape>> {
     pub mu: Tensor<Rank1<K>, T>,
     pub cov_diag: Tensor<Rank1<K>, T>,
 }
 
-impl<const K: usize, T: Tape<f32, Cuda>> MvNormal<K, T>
+impl<const K: usize, T: Tape<f32, Device>> MvNormal<K, T>
 where
     T: Merge<NoneTape>,
 {
-    pub fn sample(self, device: &Cuda) -> Tensor<Rank1<K>, T> {
+    pub fn sample(self) -> Tensor<Rank1<K>, T> {
         let cov_mat = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
             K,
             self.cov_diag.as_vec().into_iter(),
         ));
         let a = cov_mat.cholesky().unwrap().unpack();
-        let z = device.sample_normal::<Rank1<K>>();
+        let z = self.mu.device().sample_normal::<Rank1<K>>();
         let z = nalgebra::DVector::from_iterator(K, z.as_vec().into_iter());
         let x = a.mul(&z);
-        let x = device.tensor(x.data.as_vec().clone());
+        let x = self.mu.device().tensor(x.data.as_vec().clone());
         self.mu + x
     }
 
@@ -60,16 +58,46 @@ where
     }
 }
 
+pub struct BatchMvNormal<const K: usize, T: Tape<f32, Device> + Merge<NoneTape>> {
+    batches: VecDeque<MvNormal<K, T>>,
+}
+
+impl<const K: usize, T: Tape<f32, Device> + Merge<NoneTape>> BatchMvNormal<K, T> {
+    pub fn new(mu: Tensor<(usize, Const<K>), T>, var: Tensor<(usize, Const<K>), T>) -> Self {
+        let cpu = Cpu::default();
+        let mu = mu.to_device(&cpu);
+        let var = var.to_device(&cpu);
+        let mut batches = VecDeque::new();
+
+        for i in 0..mu.shape().0 {}
+
+        Self { batches }
+    }
+
+    pub fn batch_log_prob(mut self, x: Tensor<(usize, Const<K>)>) -> Tensor<(usize, Const<1>), T> {
+        // let mut out = cpu.zeros();
+        let mut out = vec![];
+        for i in 0..x.shape().0 {
+            let action = x.clone().select(x.device().tensor(i));
+            let lp = self.batches.pop_front().unwrap().log_prob(action);
+            out.push(lp);
+        }
+        out.stack()
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct Softplus;
 
 impl ZeroSizedModule for Softplus {}
-impl<S: Shape, T: Tape<f32, Cuda>> Module<dfdx::tensor::Tensor<S, f32, Cuda, T>> for Softplus {
-    type Error = CudaError;
-    type Output = dfdx::tensor::Tensor<S, f32, Cuda, T>;
+impl<S: Shape, D: dfdx::tensor_ops::Device<f32>, T: Tape<f32, D>>
+    Module<dfdx::tensor::Tensor<S, f32, D, T>> for Softplus
+{
+    type Error = D::Err;
+    type Output = dfdx::tensor::Tensor<S, f32, D, T>;
     fn try_forward(
         &self,
-        input: dfdx::tensor::Tensor<S, f32, Cuda, T>,
+        input: dfdx::tensor::Tensor<S, f32, D, T>,
     ) -> Result<Self::Output, Self::Error> {
         Ok(input.exp().add(1.0).ln())
     }
@@ -92,20 +120,20 @@ type Value = (
 
 type PpoNet = SplitInto<(Policy, Value)>;
 
-type BuiltPpoNet = <PpoNet as BuildOnDevice<Cuda, f32>>::Built;
+type BuiltPpoNet = <PpoNet as BuildOnDevice<Device, f32>>::Built;
 
 pub struct PpoThinker {
     net: BuiltPpoNet,
     target_net: BuiltPpoNet,
-    net_grads: Gradients<f32, Cuda>,
-    optim: Adam<BuiltPpoNet, f32, Cuda>,
-    device: Cuda,
+    net_grads: Gradients<f32, Device>,
+    optim: Adam<BuiltPpoNet, f32, Device>,
+    device: Device,
     cpu: Cpu,
 }
 
 impl PpoThinker {
     pub fn new() -> Self {
-        let device = Cuda::seed_from_u64(rand::random());
+        let device = Device::seed_from_u64(rand::random());
         let net = device.build_module::<PpoNet, f32>();
         let target_net = net.clone();
         let net_grads = net.alloc_grads();
@@ -137,7 +165,7 @@ impl Thinker for PpoThinker {
         let obs: Tensor<Rank1<OBS_LEN>> = self.device.tensor(obs.as_vec());
         let ((mu, var), _) = self.net.forward(obs);
         let dist = MvNormal { mu, cov_diag: var };
-        let action = dist.sample(&self.device);
+        let action = dist.sample();
 
         Action::from_slice(action.as_vec().as_slice())
     }
@@ -173,18 +201,19 @@ impl Thinker for PpoThinker {
 
                 let ((mu, var), val) = self.net.forward(s.trace(self.net_grads.to_owned()));
                 let dist = MvNormal { mu, cov_diag: var };
-                let lp = dist.log_prob(a.log_softmax());
+                let lp = dist.log_prob(a);
                 let ratio = (lp - old_lp).exp();
                 let surr1 = ratio.with_empty_tape() * advantage.clone();
                 let surr2 = ratio.clamp(0.8, 1.2) * advantage;
                 let policy_loss = -surr2.minimum(surr1).mean();
                 let value_loss = (val.square() - reward * reward).mean();
                 let loss = policy_loss + value_loss;
-                total_loss += loss.as_vec()[0] / nstep as f32;
+                total_loss += loss.array() / nstep as f32;
                 self.net_grads = loss.backward();
                 self.optim.update(&mut self.net, &self.net_grads).unwrap();
                 self.net.zero_grads(&mut self.net_grads);
             }
+            self.target_net.clone_from(&self.net);
         }
         println!("Loss: {total_loss}");
         rb.buf.clear();
