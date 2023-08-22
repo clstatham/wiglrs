@@ -395,7 +395,7 @@ fn update(
         (With<ShootyLine>, Without<Agent>, Without<NameText>),
     >,
     mut name_text_t: Query<
-        (Entity, &mut Transform, &NameText),
+        (Entity, &mut Transform, &mut Text, &NameText),
         (Without<Agent>, Without<ShootyLine>),
     >,
     mut health_bar_t: Query<
@@ -412,9 +412,14 @@ fn update(
     let mut all_rewards = BTreeMap::new();
     let mut all_terminals = BTreeMap::new();
 
-    for (t_ent, mut t, text) in name_text_t.iter_mut() {
-        if let Ok(agent) = agents.get_component::<Transform>(text.entity_following) {
+    for (t_ent, mut t, mut text, text_comp) in name_text_t.iter_mut() {
+        if let Ok(agent) = agents.get_component::<Transform>(text_comp.entity_following) {
             t.translation = agent.translation + Vec3::new(0.0, 40.0, 2.0);
+            let brain = &brains[&text_comp.entity_following];
+            text.sections[0].value = format!(
+                "{} {} {}-{}",
+                brain.id, &brain.name, brain.kills, brain.version
+            );
         } else {
             commands.entity(t_ent).despawn();
         }
@@ -473,23 +478,23 @@ fn update(
         let action = brains.get_mut(&agent).unwrap().act(my_state);
 
         all_actions.insert(agent, action);
-        all_rewards.insert(agent, 0.0);
+        all_rewards.insert(agent, -1.0);
         all_terminals.insert(agent, false);
     }
     let mut dead_agents = BTreeSet::default();
     for (agent, mut force, _velocity, transform) in agents.iter_mut() {
         if !dead_agents.contains(&agent) {
-            let distance_to_center = transform.translation.distance(Vec3::splat(0.0));
-            if distance_to_center >= 100.0 {
-                let mut hp = health.get_mut(agent).unwrap();
-                hp.0 -= distance_to_center / 2000.0;
-                // *all_rewards.get_mut(&agent).unwrap() -= distance_to_center / 2000.0;
-                if hp.0 <= 0.0 {
-                    dead_agents.insert(agent);
-                    *all_terminals.get_mut(&agent).unwrap() = true;
-                    println!("{} expired.", &brains[&agent].name);
-                }
-            }
+            // let distance_to_center = transform.translation.distance(Vec3::splat(0.0));
+            // if distance_to_center >= 200.0 {
+            //     let mut hp = health.get_mut(agent).unwrap();
+            //     hp.0 -= distance_to_center / 10000.0;
+            //     // *all_rewards.get_mut(&agent).unwrap() -= distance_to_center / 2000.0;
+            //     if hp.0 <= 0.0 {
+            //         dead_agents.insert(agent);
+            //         *all_terminals.get_mut(&agent).unwrap() = true;
+            //         println!("{} expired.", &brains[&agent].name);
+            //     }
+            // }
 
             if all_actions[&agent].shoot > 0.0 && !dead_agents.contains(&agent) {
                 let (ray_dir, ray_pos) = {
