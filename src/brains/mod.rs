@@ -4,38 +4,45 @@ use std::{
     sync::{atomic::AtomicU64, Arc, Mutex},
 };
 
-use crate::{Action, Observation};
+use crate::{hparams::N_FRAME_STACK, Action, Observation};
 
 use self::{replay_buffer::ReplayBuffer, thinkers::Thinker};
 
 pub mod replay_buffer;
 pub mod thinkers;
 
-#[derive(Clone)]
-pub struct FrameStack<const NSTACK: usize>([Observation; NSTACK]);
+#[derive(Clone, Copy)]
+pub struct FrameStack([Observation; N_FRAME_STACK]);
 
-impl<const NSTACK: usize> Default for FrameStack<NSTACK> {
+impl Default for FrameStack {
     fn default() -> Self {
-        Self([Observation::default(); NSTACK])
+        Self([Observation::default(); N_FRAME_STACK])
     }
 }
 
-impl<const NSTACK: usize> FrameStack<NSTACK> {
+impl FrameStack {
     pub fn push(&mut self, s: Observation) {
-        for i in 0..NSTACK - 1 {
+        #[allow(clippy::reversed_empty_ranges)]
+        for i in 0..N_FRAME_STACK - 1 {
             self.0[i] = self.0[i + 1];
         }
-        self.0[NSTACK - 1] = s;
+        self.0[N_FRAME_STACK - 1] = s;
+    }
+
+    pub fn as_vec(&self) -> Vec<Observation> {
+        self.0.to_vec()
     }
 }
 
 pub struct Brain {
     pub name: String,
     pub version: u64,
+    pub kills: usize,
     pub color: Color,
     pub id: u64,
     pub rb: ReplayBuffer,
-    pub thinker: Arc<Mutex<dyn Thinker + 'static>>,
+    pub fs: FrameStack,
+    pub thinker: Box<dyn Thinker + 'static>,
 }
 
 impl Brain {
@@ -48,18 +55,21 @@ impl Brain {
             name,
             color: Color::rgb(rand::random(), rand::random(), rand::random()),
             id,
+            kills: 0,
             version: 0,
             rb: ReplayBuffer::default(),
-            thinker: Arc::new(Mutex::new(thinker)),
+            fs: FrameStack::default(),
+            thinker: Box::new(thinker),
         }
     }
 
     pub fn act(&mut self, obs: Observation) -> Action {
-        self.thinker.lock().unwrap().act(obs)
+        self.fs.push(obs);
+        self.thinker.act(self.fs)
     }
 
-    pub fn learn(&mut self) {
-        self.thinker.lock().unwrap().learn(&mut self.rb);
+    pub fn learn(&mut self) -> f32 {
+        self.thinker.learn(&mut self.rb)
     }
 }
 

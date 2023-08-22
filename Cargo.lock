@@ -4119,7 +4119,9 @@ dependencies = [
  "itertools",
  "lazy_static",
  "nalgebra",
+ "num-traits",
  "rand",
+ "rand_distr",
  "tensorboard-rs",
 ]
 

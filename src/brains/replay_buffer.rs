@@ -2,18 +2,20 @@ use std::collections::VecDeque;
 
 use itertools::Itertools;
 
-use crate::{Action, Observation};
+use crate::{hparams::AGENT_RB_MAX_LEN, Action, Observation};
+
+use super::FrameStack;
 
 #[derive(Clone, Default)]
 pub struct SavedStep {
-    pub obs: Observation,
+    pub obs: FrameStack,
     pub action: Action,
     pub reward: f32,
     pub terminal: bool,
 }
 
 impl SavedStep {
-    pub fn unzip(self) -> (Observation, Action, f32, bool) {
+    pub fn unzip(self) -> (FrameStack, Action, f32, bool) {
         (self.obs, self.action, self.reward, self.terminal)
     }
 }
@@ -25,16 +27,16 @@ pub struct ReplayBuffer {
 
 impl ReplayBuffer {
     pub fn remember(&mut self, step: SavedStep) {
-        self.buf.push_back(step);
-        if self.buf.len() >= 10_000 {
+        if self.buf.len() >= AGENT_RB_MAX_LEN {
             self.buf.pop_front();
         }
+        self.buf.push_back(step);
     }
 
     pub fn sample_batch(
         &self,
         batch_size: usize,
-    ) -> (Vec<Observation>, Vec<Action>, Vec<f32>, Vec<bool>) {
+    ) -> (Vec<FrameStack>, Vec<Action>, Vec<f32>, Vec<bool>) {
         use rand::prelude::*;
         let mut batch = vec![SavedStep::default(); batch_size];
         self.buf
@@ -45,7 +47,7 @@ impl ReplayBuffer {
         (s, a, r, t)
     }
 
-    pub fn unzip(&self) -> (Vec<Observation>, Vec<Action>, Vec<f32>, Vec<bool>) {
+    pub fn unzip(&self) -> (Vec<FrameStack>, Vec<Action>, Vec<f32>, Vec<bool>) {
         self.buf.iter().map(|b| b.to_owned().unzip()).multiunzip()
     }
 }

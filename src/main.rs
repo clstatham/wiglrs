@@ -1,6 +1,6 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::{
     core::FrameCount, math::Vec3Swizzles, prelude::*, sprite::MaterialMesh2dBundle,
@@ -16,6 +16,7 @@ use hparams::{
     AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_RADIUS,
     AGENT_SHOOT_DISTANCE, NUM_AGENTS,
 };
+use itertools::Itertools;
 use tensorboard_rs::summary_writer::SummaryWriter;
 
 pub mod brains;
@@ -25,7 +26,8 @@ pub mod names;
 pub struct OtherState {
     pub rel_pos: Vec2,
     pub linvel: Vec2,
-    pub direction: Vec2,
+    pub direction_dotprod: f32,
+    pub other_direction_dotprod: f32,
 }
 
 pub const OTHER_STATE_LEN: usize = 6;
@@ -36,10 +38,11 @@ pub struct Observation {
     pub linvel: Vec2,
     pub direction: Vec2,
     // pub dt: f32,
-    pub other_states: [OtherState; NUM_AGENTS],
+    pub health: f32,
+    pub other_states: [OtherState; NUM_AGENTS - 1],
 }
 
-pub const OBS_LEN: usize = OTHER_STATE_LEN * NUM_AGENTS + 6;
+pub const OBS_LEN: usize = OTHER_STATE_LEN * (NUM_AGENTS - 1) + 7;
 
 impl Observation {
     pub fn as_vec(&self) -> Vec<f32> {
@@ -50,6 +53,7 @@ impl Observation {
             self.linvel.y / 2000.0,
             self.direction.x,
             self.direction.y,
+            self.health / AGENT_MAX_HEALTH,
             // self.dt,
         ];
         for other in &self.other_states {
@@ -58,8 +62,8 @@ impl Observation {
                 other.rel_pos.y / 2000.0,
                 other.linvel.x / 2000.0,
                 other.linvel.y / 2000.0,
-                other.direction.x,
-                other.direction.y,
+                other.direction_dotprod,
+                other.other_direction_dotprod,
             ]);
         }
         out
@@ -76,7 +80,7 @@ pub mod hparams;
 pub struct Action {
     lin_force: Vec2,
     ang_force: f32,
-    shoot: bool,
+    shoot: f32,
 }
 
 pub const ACTION_LEN: usize = 4;
@@ -84,21 +88,18 @@ pub const ACTION_LEN: usize = 4;
 impl Action {
     pub fn from_slice(action: &[f32]) -> Self {
         Self {
-            lin_force: Vec2::new(
-                action[0] * AGENT_LIN_MOVE_FORCE,
-                action[1] * AGENT_LIN_MOVE_FORCE,
-            ),
-            ang_force: action[2] * AGENT_ANG_MOVE_FORCE,
-            shoot: action[3] > 0.0,
+            lin_force: Vec2::new(action[0], action[1]),
+            ang_force: action[2],
+            shoot: action[3],
         }
     }
 
     pub fn as_vec(&self) -> Vec<f32> {
         vec![
-            self.lin_force.x / AGENT_LIN_MOVE_FORCE,
-            self.lin_force.y / AGENT_LIN_MOVE_FORCE,
-            self.ang_force / AGENT_ANG_MOVE_FORCE,
-            if self.shoot { 1.0 } else { 0.0 },
+            self.lin_force.x,
+            self.lin_force.y,
+            self.ang_force,
+            self.shoot,
         ]
     }
 
@@ -114,6 +115,11 @@ pub struct NameText {
 
 #[derive(Component)]
 pub struct Health(pub f32);
+
+#[derive(Component)]
+pub struct HealthBar {
+    entity_following: Entity,
+}
 
 #[derive(Component)]
 pub struct Agent;
@@ -187,20 +193,27 @@ fn check_respawn_all(
     mut writer: NonSendMut<TbWriter>,
     asset_server: Res<AssetServer>,
     frame_count: Res<FrameCount>,
+    mut avg_kills: ResMut<AvgAgentKills>,
 ) {
     for agent in brains.keys().copied().collect::<Vec<_>>() {
         if commands.get_entity(agent).is_none() {
             let mut brain = brains.remove(&agent).unwrap();
             let mean_reward =
                 brain.rb.buf.iter().map(|s| s.reward).sum::<f32>() / brain.rb.buf.len() as f32;
-            println!("{} reward: {mean_reward}", &brain.name);
+            println!("{} {} reward: {mean_reward}", brain.id, &brain.name);
             writer.0.add_scalar(
                 &format!("Reward/{}", brain.id),
                 mean_reward,
                 frame_count.0 as usize,
             );
 
-            brain.learn();
+            let total_loss = brain.learn();
+            println!("{} {} loss: {total_loss}", brain.id, &brain.name);
+            writer.0.add_scalar(
+                &format!("Loss/{}", brain.id),
+                total_loss,
+                frame_count.0 as usize,
+            );
             brain.version += 1;
 
             spawn_agent(
@@ -211,6 +224,10 @@ fn check_respawn_all(
                 &mut brains,
                 &asset_server,
             );
+            avg_kills.0 = brains.values().map(|b| b.kills as f32).sum::<f32>() / NUM_AGENTS as f32;
+            writer
+                .0
+                .add_scalar("Avg Kills", avg_kills.0, frame_count.0 as usize);
         }
     }
 }
@@ -257,7 +274,7 @@ fn spawn_agent(
     commands.spawn((
         Text2dBundle {
             text: Text::from_section(
-                format!("{} {}.0", &brain.name, brain.version),
+                format!("{} {} {}.0", brain.id, &brain.name, brain.version),
                 TextStyle {
                     font: asset_server.load("fonts/FiraSans-Bold.ttf"),
                     font_size: 20.0,
@@ -269,6 +286,17 @@ fn spawn_agent(
         },
         NameText {
             entity_following: id,
+        },
+    ));
+    commands.spawn((
+        HealthBar {
+            entity_following: id,
+        },
+        MaterialMesh2dBundle {
+            mesh: meshes.add(shape::Box::new(1.0, 6.0, 0.0).into()).into(),
+            material: materials.add(ColorMaterial::from(Color::RED)),
+            transform: Transform::from_translation(agent_pos + Vec3::new(0.0, -AGENT_RADIUS, 2.0)),
+            ..Default::default()
         },
     ));
     brains.insert(id, brain);
@@ -370,11 +398,14 @@ fn update(
         (Entity, &mut Transform, &NameText),
         (Without<Agent>, Without<ShootyLine>),
     >,
+    mut health_bar_t: Query<
+        (Entity, &mut Transform, &HealthBar),
+        (Without<Agent>, Without<ShootyLine>, Without<NameText>),
+    >,
     cx: Res<RapierContext>,
     _collision_events: EventReader<ContactForceEvent>,
     _walls: Query<&Collider, (Without<Agent>, With<Wall>)>,
     _keys: Res<Input<KeyCode>>,
-    time: Res<Time>,
 ) {
     let mut all_states = BTreeMap::new();
     let mut all_actions = BTreeMap::new();
@@ -383,7 +414,16 @@ fn update(
 
     for (t_ent, mut t, text) in name_text_t.iter_mut() {
         if let Ok(agent) = agents.get_component::<Transform>(text.entity_following) {
-            t.translation = agent.translation + Vec3::new(0.0, 40.0, 0.0);
+            t.translation = agent.translation + Vec3::new(0.0, 40.0, 2.0);
+        } else {
+            commands.entity(t_ent).despawn();
+        }
+    }
+    for (t_ent, mut t, hb) in health_bar_t.iter_mut() {
+        if let Ok(agent) = agents.get_component::<Transform>(hb.entity_following) {
+            t.translation = agent.translation + Vec3::new(0.0, 25.0, 2.0);
+            let health = health.get_component::<Health>(hb.entity_following).unwrap();
+            t.scale = Vec3::new(health.0 / AGENT_MAX_HEALTH * 100.0, 1.0, 1.0);
         } else {
             commands.entity(t_ent).despawn();
         }
@@ -394,18 +434,37 @@ fn update(
             pos: transform.translation.xy(),
             linvel: velocity.linvel,
             direction: transform.local_y().xy(),
-            // dt: time.delta_seconds(),
-            other_states: [OtherState::default(); NUM_AGENTS],
+            health: health.get_component::<Health>(agent).unwrap().0,
+            other_states: [OtherState::default(); NUM_AGENTS - 1],
         };
 
-        for (other, _, other_vel, other_transform) in agents.iter() {
+        for (i, (_, _, other_vel, other_transform)) in agents
+            .iter()
+            .filter(|a| a.0 != agent)
+            .sorted_by_key(|a| a.3.translation.distance(transform.translation) as i64)
+            .enumerate()
+        {
             let other_state = OtherState {
                 rel_pos: transform.translation.xy() - other_transform.translation.xy(),
                 linvel: other_vel.linvel,
-                direction: other_transform.local_y().xy(),
+                direction_dotprod: transform.local_y().xy().dot(
+                    (transform.translation.xy() - other_transform.translation.xy()).normalize(),
+                ),
+                other_direction_dotprod: other_transform.local_y().xy().dot(
+                    (transform.translation.xy() - other_transform.translation.xy()).normalize(),
+                ),
             };
-            my_state.other_states[brains[&other].id as usize] = other_state;
+            my_state.other_states[i] = other_state;
         }
+
+        // for (other, _, other_vel, other_transform) in agents.iter() {
+        //     let other_state = OtherState {
+        //         rel_pos: transform.translation.xy() - other_transform.translation.xy(),
+        //         linvel: other_vel.linvel,
+        //         direction: other_transform.local_y().xy(),
+        //     };
+        //     my_state.other_states[brains[&other].id as usize] = other_state;
+        // }
 
         // brains.get_mut(&agent).unwrap().frame_stack.push(my_state);
 
@@ -417,119 +476,97 @@ fn update(
         all_rewards.insert(agent, 0.0);
         all_terminals.insert(agent, false);
     }
-    let mut dead_agents = vec![];
+    let mut dead_agents = BTreeSet::default();
     for (agent, mut force, _velocity, transform) in agents.iter_mut() {
-        let distance_to_center = transform.translation.distance(Vec3::splat(0.0));
-        if distance_to_center >= 100.0 {
-            let mut hp = health.get_mut(agent).unwrap();
-            hp.0 -= distance_to_center / 10000.0;
-            *all_rewards.get_mut(&agent).unwrap() -= distance_to_center / 1000.0;
-            if hp.0 <= 0.0 {
-                dead_agents.push(agent);
-                *all_terminals.get_mut(&agent).unwrap() = true;
+        if !dead_agents.contains(&agent) {
+            let distance_to_center = transform.translation.distance(Vec3::splat(0.0));
+            if distance_to_center >= 100.0 {
+                let mut hp = health.get_mut(agent).unwrap();
+                hp.0 -= distance_to_center / 2000.0;
+                // *all_rewards.get_mut(&agent).unwrap() -= distance_to_center / 2000.0;
+                if hp.0 <= 0.0 {
+                    dead_agents.insert(agent);
+                    *all_terminals.get_mut(&agent).unwrap() = true;
+                    println!("{} expired.", &brains[&agent].name);
+                }
             }
-        }
 
-        if all_actions[&agent].shoot && !dead_agents.contains(&agent) {
-            let (ray_dir, ray_pos) = {
-                let (transform, childs) = agents_shootin.get(agent).unwrap();
-                let ray_dir = transform.local_y().xy();
-                let ray_pos = transform.translation.xy() + ray_dir * (AGENT_RADIUS + 2.0);
-                for child in childs.iter() {
-                    if let Ok(mut line) = line_vis.get_mut(*child) {
-                        *line.0 = Visibility::Visible;
+            if all_actions[&agent].shoot > 0.0 && !dead_agents.contains(&agent) {
+                let (ray_dir, ray_pos) = {
+                    let (transform, childs) = agents_shootin.get(agent).unwrap();
+                    let ray_dir = transform.local_y().xy();
+                    let ray_pos = transform.translation.xy() + ray_dir * (AGENT_RADIUS + 2.0);
+                    for child in childs.iter() {
+                        if let Ok(mut line) = line_vis.get_mut(*child) {
+                            *line.0 = Visibility::Visible;
+                        }
                     }
-                }
-                (ray_dir, ray_pos)
-            };
+                    (ray_dir, ray_pos)
+                };
 
-            if let Some((hit_entity, toi)) = cx.cast_ray(
-                ray_pos,
-                ray_dir,
-                AGENT_SHOOT_DISTANCE,
-                false,
-                QueryFilter::default().exclude_collider(agent),
-            ) {
-                let (_, childs) = agents_shootin.get(agent).unwrap();
-                for child in childs.iter() {
-                    if let Ok((_, mut t)) = line_vis.get_mut(*child) {
-                        t.scale = Vec3::new(1.0, toi, 1.0);
-                        *t = t.with_translation(Vec3::new(0.0, toi / 2.0, 0.0));
-                    }
+                let mut filter = QueryFilter::default().exclude_collider(agent);
+                for dead in dead_agents.iter() {
+                    filter = filter.exclude_collider(*dead);
                 }
-                if let Ok(mut health) = health.get_mut(hit_entity) {
-                    health.0 -= 1.0;
-                    *all_rewards.get_mut(&agent).unwrap() += 2.0;
-                    *all_rewards.get_mut(&hit_entity).unwrap() -= 1.0;
-                    if health.0 <= 0.0 {
-                        dead_agents.push(hit_entity);
-                        *all_terminals.get_mut(&hit_entity).unwrap() = true;
-                        *all_rewards.get_mut(&agent).unwrap() += 1000.0;
-                        *all_rewards.get_mut(&hit_entity).unwrap() -= 1000.0;
-                        println!(
-                            "{} killed {}! Nice!",
-                            &brains[&agent].name, &brains[&hit_entity].name
-                        );
+
+                if let Some((hit_entity, toi)) =
+                    cx.cast_ray(ray_pos, ray_dir, AGENT_SHOOT_DISTANCE, false, filter)
+                {
+                    let (_, childs) = agents_shootin.get(agent).unwrap();
+                    for child in childs.iter() {
+                        if let Ok((_, mut t)) = line_vis.get_mut(*child) {
+                            t.scale = Vec3::new(1.0, toi, 1.0);
+                            *t = t.with_translation(Vec3::new(0.0, toi / 2.0, 0.0));
+                        }
                     }
+                    if let Ok(mut health) = health.get_mut(hit_entity) {
+                        health.0 -= 5.0;
+                        *all_rewards.get_mut(&agent).unwrap() += 1.0;
+                        *all_rewards.get_mut(&hit_entity).unwrap() -= 1.0;
+                        if health.0 <= 0.0 {
+                            dead_agents.insert(hit_entity);
+                            *all_terminals.get_mut(&hit_entity).unwrap() = true;
+                            *all_rewards.get_mut(&agent).unwrap() += 100.0;
+                            *all_rewards.get_mut(&hit_entity).unwrap() -= 100.0;
+                            brains.get_mut(&agent).unwrap().kills += 1;
+                            println!(
+                                "{} killed {}! Nice!",
+                                &brains[&agent].name, &brains[&hit_entity].name
+                            );
+                        }
+                    }
+                } else {
+                    let (_, childs) = agents_shootin.get(agent).unwrap();
+                    for child in childs.iter() {
+                        if let Ok((_, mut t)) = line_vis.get_mut(*child) {
+                            t.scale = Vec3::new(1.0, AGENT_SHOOT_DISTANCE, 1.0);
+                            *t =
+                                t.with_translation(Vec3::new(0.0, AGENT_SHOOT_DISTANCE / 2.0, 0.0));
+                        }
+                    }
+                    *all_rewards.get_mut(&agent).unwrap() -= 1.0;
                 }
             } else {
                 let (_, childs) = agents_shootin.get(agent).unwrap();
                 for child in childs.iter() {
-                    if let Ok((_, mut t)) = line_vis.get_mut(*child) {
-                        t.scale = Vec3::new(1.0, AGENT_SHOOT_DISTANCE, 1.0);
-                        *t = t.with_translation(Vec3::new(0.0, AGENT_SHOOT_DISTANCE / 2.0, 0.0));
+                    if let Ok(mut line) = line_vis.get_mut(*child) {
+                        *line.0 = Visibility::Hidden;
                     }
                 }
-                *all_rewards.get_mut(&agent).unwrap() -= 1.0;
             }
-        } else {
-            let (_, childs) = agents_shootin.get(agent).unwrap();
-            for child in childs.iter() {
-                if let Ok(mut line) = line_vis.get_mut(*child) {
-                    *line.0 = Visibility::Hidden;
-                }
-            }
+
+            force.force = all_actions[&agent]
+                .lin_force
+                .clamp(Vec2::splat(-1.0), Vec2::splat(1.0))
+                * AGENT_LIN_MOVE_FORCE;
+            force.torque = all_actions[&agent].ang_force.clamp(-1.0, 1.0) * AGENT_ANG_MOVE_FORCE;
         }
-
-        force.force = all_actions[&agent].lin_force;
-        force.torque = all_actions[&agent].ang_force;
-
-        // let mut applied_force = Vec2::default();
-        // let mut applied_torque = 0.0;
-
-        // if keys.pressed(KeyCode::A) {
-        //     applied_force += Vec2::NEG_X * AGENT_LIN_MOVE_FORCE;
-        // }
-        // if keys.pressed(KeyCode::D) {
-        //     applied_force += Vec2::X * AGENT_LIN_MOVE_FORCE;
-        // }
-        // if keys.pressed(KeyCode::W) {
-        //     applied_force += Vec2::Y * AGENT_LIN_MOVE_FORCE;
-        // }
-        // if keys.pressed(KeyCode::S) {
-        //     applied_force += Vec2::NEG_Y * AGENT_LIN_MOVE_FORCE;
-        // }
-
-        // if keys.pressed(KeyCode::Q) {
-        //     applied_torque += AGENT_ANG_MOVE_FORCE;
-        // }
-        // if keys.pressed(KeyCode::E) {
-        //     applied_torque -= AGENT_ANG_MOVE_FORCE;
-        // }
-        // force.force = applied_force;
-        // force.torque = applied_torque;
-
-        // clamp velocity
-        // velocity.linvel = velocity.linvel.clamp(
-        //     Vec2::new(-AGENT_MAX_LIN_VEL, -AGENT_MAX_LIN_VEL),
-        //     Vec2::new(AGENT_MAX_LIN_VEL, AGENT_MAX_LIN_VEL),
-        // );
-        // velocity.angvel = velocity.angvel.clamp(-AGENT_MAX_ANG_VEL, AGENT_MAX_ANG_VEL);
     }
 
     for (agent, _, _, _) in agents.iter() {
+        let fs = brains.get(&agent).unwrap().fs;
         brains.get_mut(&agent).unwrap().rb.remember(SavedStep {
-            obs: all_states.remove(&agent).unwrap(),
+            obs: fs,
             action: all_actions.remove(&agent).unwrap(),
             reward: all_rewards.remove(&agent).unwrap(),
             terminal: all_terminals.remove(&agent).unwrap(),
@@ -553,6 +590,9 @@ impl Default for TbWriter {
     }
 }
 
+#[derive(Resource, Default)]
+pub struct AvgAgentKills(f32);
+
 fn main() {
     App::new()
         .insert_resource(Msaa::default())
@@ -560,6 +600,7 @@ fn main() {
             focused_mode: bevy::winit::UpdateMode::Continuous,
             ..default()
         })
+        .insert_resource(AvgAgentKills::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
         .insert_non_send_resource(TbWriter::default())
         .insert_non_send_resource(BrainBank::default())
