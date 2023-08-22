@@ -1,4 +1,4 @@
-pub const NUM_AGENTS: usize = 4;
+pub const NUM_AGENTS: usize = 5;
 pub const AGENT_HIDDEN_DIM: usize = 256;
 pub const AGENT_LR: f64 = 1e-3;
 pub const AGENT_OPTIM_EPOCHS: usize = 1;

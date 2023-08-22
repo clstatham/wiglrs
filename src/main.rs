@@ -6,10 +6,11 @@ use bevy::{
     core::FrameCount, math::Vec3Swizzles, prelude::*, sprite::MaterialMesh2dBundle,
     winit::WinitSettings,
 };
+use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 use brains::{
     replay_buffer::SavedStep,
-    thinkers::{self},
+    thinkers::{self, ppo::PpoThinker},
     Brain, BrainBank,
 };
 use hparams::{
@@ -18,9 +19,11 @@ use hparams::{
 };
 use itertools::Itertools;
 use tensorboard_rs::summary_writer::SummaryWriter;
+use ui::{ui, LogText};
 
 pub mod brains;
 pub mod names;
+pub mod ui;
 
 #[derive(Default, Clone, Copy)]
 pub struct OtherState {
@@ -194,13 +197,17 @@ fn check_respawn_all(
     asset_server: Res<AssetServer>,
     frame_count: Res<FrameCount>,
     mut avg_kills: ResMut<AvgAgentKills>,
+    mut log: ResMut<LogText>,
 ) {
     for agent in brains.keys().copied().collect::<Vec<_>>() {
         if commands.get_entity(agent).is_none() {
             let mut brain = brains.remove(&agent).unwrap();
             let mean_reward =
                 brain.rb.buf.iter().map(|s| s.reward).sum::<f32>() / brain.rb.buf.len() as f32;
-            println!("{} {} reward: {mean_reward}", brain.id, &brain.name);
+            log.push(format!(
+                "{} {} reward: {mean_reward}",
+                brain.id, &brain.name
+            ));
             writer.0.add_scalar(
                 &format!("Reward/{}", brain.id),
                 mean_reward,
@@ -208,7 +215,7 @@ fn check_respawn_all(
             );
 
             let total_loss = brain.learn();
-            println!("{} {} loss: {total_loss}", brain.id, &brain.name);
+            log.push(format!("{} {} loss: {total_loss}", brain.id, &brain.name));
             writer.0.add_scalar(
                 &format!("Loss/{}", brain.id),
                 total_loss,
@@ -236,7 +243,7 @@ fn check_respawn_all(
 pub struct Wall;
 
 fn spawn_agent(
-    brain: Brain,
+    brain: Brain<PpoThinker>,
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
@@ -406,6 +413,7 @@ fn update(
     _collision_events: EventReader<ContactForceEvent>,
     _walls: Query<&Collider, (Without<Agent>, With<Wall>)>,
     _keys: Res<Input<KeyCode>>,
+    mut log: ResMut<LogText>,
 ) {
     let mut all_states = BTreeMap::new();
     let mut all_actions = BTreeMap::new();
@@ -534,10 +542,11 @@ fn update(
                             *all_rewards.get_mut(&agent).unwrap() += 100.0;
                             *all_rewards.get_mut(&hit_entity).unwrap() -= 100.0;
                             brains.get_mut(&agent).unwrap().kills += 1;
-                            println!(
+                            let msg = format!(
                                 "{} killed {}! Nice!",
                                 &brains[&agent].name, &brains[&hit_entity].name
                             );
+                            log.push(msg);
                         }
                     }
                 } else {
@@ -606,6 +615,7 @@ fn main() {
             ..default()
         })
         .insert_resource(AvgAgentKills::default())
+        .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
         .insert_non_send_resource(TbWriter::default())
         .insert_non_send_resource(BrainBank::default())
@@ -619,8 +629,10 @@ fn main() {
         }))
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
         .add_plugins(RapierDebugRenderPlugin::default())
+        .add_plugins(EguiPlugin)
         .add_systems(Startup, setup)
         .add_systems(Update, update)
         .add_systems(Update, check_respawn_all)
+        .add_systems(Update, ui)
         .run();
 }

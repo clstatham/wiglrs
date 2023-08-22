@@ -34,7 +34,7 @@ impl FrameStack {
     }
 }
 
-pub struct Brain {
+pub struct Brain<T: Thinker> {
     pub name: String,
     pub version: u64,
     pub kills: usize,
@@ -42,11 +42,11 @@ pub struct Brain {
     pub id: u64,
     pub rb: ReplayBuffer,
     pub fs: FrameStack,
-    pub thinker: Box<dyn Thinker + 'static>,
+    pub thinker: T,
 }
 
-impl Brain {
-    pub fn new(thinker: impl Thinker + 'static) -> Self {
+impl<T: Thinker> Brain<T> {
+    pub fn new(thinker: T) -> Self {
         static BRAIN_IDS: AtomicU64 = AtomicU64::new(0);
         let id = BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let name = crate::names::random_name();
@@ -59,7 +59,7 @@ impl Brain {
             version: 0,
             rb: ReplayBuffer::default(),
             fs: FrameStack::default(),
-            thinker: Box::new(thinker),
+            thinker,
         }
     }
 
@@ -73,4 +73,4 @@ impl Brain {
     }
 }
 
-pub type BrainBank = BTreeMap<Entity, Brain>;
+pub type BrainBank = BTreeMap<Entity, Brain<thinkers::ppo::PpoThinker>>;

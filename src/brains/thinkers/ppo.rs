@@ -40,7 +40,7 @@ where
         self.mu + x
     }
 
-    pub fn log_prob(self, x: FTensor<Rank1<K>>) -> FTensor<Rank1<1>, T> {
+    pub fn log_prob(self, x: FTensor<Rank1<K>>) -> (FTensor<Rank1<1>, T>, Float) {
         let cov_mat = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
             K,
             self.cov_diag.as_vec().into_iter(),
@@ -60,7 +60,9 @@ where
         let f = (2.0 * PI).powf(K as Float);
         let denom = (f * g).sqrt();
         let pdf = numer / denom;
-        pdf.ln().reshape()
+        let logpdf = pdf.ln().reshape();
+        let entropy = (K as Float / 2.0) + ((K as Float / 2.0) * (2.0 * PI).ln()) + (g.ln() / 2.0);
+        (logpdf, entropy)
     }
 }
 
@@ -68,28 +70,32 @@ fn mvn_batch_log_prob<const K: usize, T: Tape<Float, Device> + Merge<NoneTape>>(
     mu: FTensor<(usize, Const<K>), T>,
     var: FTensor<(usize, Const<K>), T>,
     x: FTensor<(usize, Const<K>)>,
-) -> FTensor<(usize, Const<1>), T> {
+) -> (FTensor<(usize, Const<1>), T>, FTensor<(usize, Const<1>)>) {
     let nbatch = x.shape().0;
     assert_eq!(mu.shape().0, nbatch);
     assert_eq!(var.shape().0, nbatch);
-    let mut out = vec![];
+    let mut out_lp = vec![];
+    let mut out_e = vec![];
     for i in 0..nbatch - 1 {
         let idx = mu.device().tensor(i);
         let mu = mu.with_empty_tape().select(idx.clone());
         let var = var.with_empty_tape().select(idx.clone());
         let x = x.with_empty_tape().select(idx.clone());
         let dist = MvNormal { mu, cov_diag: var };
-        let lp = dist.log_prob(x);
-        out.push(lp);
+        let (lp, e) = dist.log_prob(x);
+        out_lp.push(lp);
+        out_e.push(e);
     }
+    let dev = mu.device().clone();
     let idx = mu.device().tensor(nbatch - 1);
     let mu = mu.select(idx.clone());
     let var = var.select(idx.clone());
     let x = x.select(idx.clone());
     let dist = MvNormal { mu, cov_diag: var };
-    let lp = dist.log_prob(x);
-    out.push(lp);
-    out.stack()
+    let (lp, e) = dist.log_prob(x);
+    out_lp.push(lp);
+    out_e.push(e);
+    (out_lp.stack(), dev.tensor_from_vec(out_e, (nbatch, Const)))
 }
 
 fn softplus<
@@ -99,8 +105,8 @@ fn softplus<
     T: Tape<E, D>,
 >(
     input: Tensor<S, E, D, T>,
-) -> Result<Tensor<S, E, D, T>, D::Err> {
-    Ok(input.exp().add(E::from(1.0).unwrap()).ln())
+) -> Tensor<S, E, D, T> {
+    input.exp().add(E::from(1.0).unwrap()).ln()
 }
 
 #[derive(Clone)]
@@ -111,8 +117,15 @@ struct PpoNet<
     E: Dtype,
     D: dfdx::tensor_ops::Device<E>,
 > {
-    common: Linear<OBS_LEN, HIDDEN_DIM, E, D>,
-    mu_head: Linear<HIDDEN_DIM, ACTION_LEN, E, D>,
+    common: (
+        Linear<OBS_LEN, HIDDEN_DIM, E, D>,
+        ReLU,
+        Linear<HIDDEN_DIM, HIDDEN_DIM, E, D>,
+        ReLU,
+        Linear<HIDDEN_DIM, HIDDEN_DIM, E, D>,
+        ReLU,
+    ),
+    mu_head: (Linear<HIDDEN_DIM, ACTION_LEN, E, D>, Tanh),
     var_head: Linear<HIDDEN_DIM, ACTION_LEN, E, D>,
     val_head: Linear<HIDDEN_DIM, 1, E, D>,
 }
@@ -169,13 +182,13 @@ impl<
         input: Tensor<(usize, Const<OBS_LEN>), E, D, T>,
     ) -> Result<Self::Output, Self::Error> {
         let nstack = input.shape().concrete()[0];
-        let x = self.common.try_forward(input)?.relu();
+        let x = self.common.try_forward(input)?;
         let idx = x.device().tensor(nstack - 1);
         let x = x.try_select(idx)?;
         let val = self.val_head.try_forward(x.with_empty_tape())?;
         let var = self.var_head.try_forward(x.with_empty_tape())?;
-        let var = softplus(var)?;
-        let mu = self.mu_head.try_forward(x)?.tanh();
+        let var = softplus(var);
+        let mu = self.mu_head.try_forward(x)?;
         Ok((mu, var, val))
     }
 }
@@ -208,7 +221,7 @@ impl<
             .reshape_like(&(nbatch, Const::<HIDDEN_DIM>));
         let val = self.val_head.try_forward(x.with_empty_tape())?;
         let var = self.var_head.try_forward(x.with_empty_tape())?;
-        let var = softplus(var)?;
+        let var = softplus(var);
         let mu = self.mu_head.try_forward(x)?.tanh();
         Ok((mu, var, val))
     }
@@ -222,6 +235,8 @@ pub struct PpoThinker {
     net_grads: Option<Gradients<Float, Device>>,
     optim: Adam<Ppo, Float, Device>,
     device: Device,
+    pub recent_mu: Vec<f32>,
+    pub recent_std: Vec<f32>,
 }
 
 impl PpoThinker {
@@ -242,6 +257,8 @@ impl PpoThinker {
             net_grads: Some(net_grads),
             target_net,
             device,
+            recent_mu: Vec::new(),
+            recent_std: Vec::new(),
         }
     }
 }
@@ -253,7 +270,7 @@ impl Default for PpoThinker {
 }
 
 impl Thinker for PpoThinker {
-    fn act(&self, obs: FrameStack) -> Action {
+    fn act(&mut self, obs: FrameStack) -> Action {
         let obs: FTensor<(usize, Const<OBS_LEN>)> = (obs
             .as_vec()
             .into_iter()
@@ -261,6 +278,8 @@ impl Thinker for PpoThinker {
             .collect::<Vec<FTensor<Rank1<OBS_LEN>>>>())
         .stack();
         let (mu, std, _) = self.net.forward(obs);
+        self.recent_mu = mu.as_vec();
+        self.recent_std = std.as_vec();
         let dist = MvNormal {
             mu,
             cov_diag: std.square(),
@@ -330,20 +349,22 @@ impl Thinker for PpoThinker {
                     .stack();
                 let (old_mu, old_std, old_val) = self.target_net.forward(s.clone());
 
-                let old_lp = mvn_batch_log_prob(old_mu, old_std.square(), a.clone());
+                let (old_lp, _old_entropy) =
+                    mvn_batch_log_prob(old_mu, old_std.square(), a.clone());
                 let advantage = (-old_val) + reward.clone();
 
                 let (mu, std, val) = self.net.forward(s.trace(net_grads));
 
-                let lp = mvn_batch_log_prob(mu, std.square(), a);
+                let (lp, entropy) = mvn_batch_log_prob(mu, std.square(), a);
                 let ratio = (lp - old_lp).exp();
                 let surr1 = ratio.with_empty_tape() * advantage.clone();
                 let surr2 = ratio.clamp(0.8, 1.2) * advantage;
                 let policy_loss = -(surr2.minimum(surr1).mean());
 
                 let value_loss = (val - reward).square().mean();
-
-                let loss = policy_loss + value_loss;
+                let loss = policy_loss + value_loss + entropy.clone().mean() * 0.01;
+                // let e = entropy.as_vec();
+                // dbg!(e.iter().sum::<f32>() / e.len() as f32);
 
                 total_loss += loss.array();
 
