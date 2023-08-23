@@ -3,12 +3,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::Duration,
 };
 
 use bevy::{
-    app::ScheduleRunnerPlugin, core::FrameCount, ecs::schedule::ScheduleLabel, math::Vec3Swizzles,
-    prelude::*, sprite::MaterialMesh2dBundle, winit::WinitSettings,
+    app::ScheduleRunnerPlugin, core::FrameCount, math::Vec3Swizzles, prelude::*,
+    sprite::MaterialMesh2dBundle, window::PresentMode, winit::WinitSettings,
 };
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
@@ -22,6 +21,7 @@ use hparams::{
     AGENT_SHOOT_DISTANCE, NUM_AGENTS,
 };
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 use tensorboard_rs::summary_writer::SummaryWriter;
 use ui::{ui, LogText};
 
@@ -29,7 +29,7 @@ pub mod brains;
 pub mod names;
 pub mod ui;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct OtherState {
     pub rel_pos: Vec2,
     pub linvel: Vec2,
@@ -39,7 +39,7 @@ pub struct OtherState {
 
 pub const OTHER_STATE_LEN: usize = 6;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Observation {
     pub pos: Vec2,
     pub linvel: Vec2,
@@ -83,13 +83,13 @@ impl Observation {
 
 pub mod hparams;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct ActionMetadata {
     pub val: f32,
     pub logp: f32,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Action {
     lin_force: Vec2,
     ang_force: f32,
@@ -205,7 +205,6 @@ fn check_respawn_all(
     mut brains: NonSendMut<brains::BrainBank>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    mut writer: NonSendMut<TbWriter>,
     asset_server: Res<AssetServer>,
     frame_count: Res<FrameCount>,
     mut avg_kills: ResMut<AvgAgentKills>,
@@ -214,37 +213,17 @@ fn check_respawn_all(
     for agent in brains.keys().copied().collect::<Vec<_>>() {
         if commands.get_entity(agent).is_none() {
             let mut brain = brains.remove(&agent).unwrap();
-            let mean_reward =
-                brain.rb.buf.iter().map(|s| s.reward).sum::<f32>() / brain.rb.buf.len() as f32;
-            log.push(format!(
-                "{} {} reward: {mean_reward}",
-                brain.id, &brain.name
-            ));
-            writer.add_scalar(
-                &format!("{}/Reward", brain.id),
-                mean_reward,
-                frame_count.0 as usize,
-            );
 
-            brain.learn();
+            brain.learn(frame_count.0 as usize);
             log.push(format!(
                 "{} {} Policy Loss: {}",
                 brain.id, &brain.name, brain.thinker.recent_policy_loss
             ));
-            writer.add_scalar(
-                &format!("{}/PolicyLoss", brain.id),
-                brain.thinker.recent_policy_loss,
-                frame_count.0 as usize,
-            );
+
             log.push(format!(
                 "{} {} Value Loss: {}",
                 brain.id, &brain.name, brain.thinker.recent_value_loss
             ));
-            writer.add_scalar(
-                &format!("{}/ValueLoss", brain.id),
-                brain.thinker.recent_value_loss,
-                frame_count.0 as usize,
-            );
             brain.version += 1;
 
             spawn_agent(
@@ -256,7 +235,6 @@ fn check_respawn_all(
                 &asset_server,
             );
             avg_kills.0 = brains.values().map(|b| b.kills as f32).sum::<f32>() / NUM_AGENTS as f32;
-            writer.add_scalar("Avg Kills", avg_kills.0, frame_count.0 as usize);
         }
     }
 }
@@ -337,10 +315,9 @@ fn setup(
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut brains: NonSendMut<BrainBank>,
     asset_server: Res<AssetServer>,
-    mut writer: NonSendMut<TbWriter>,
     timestamp: Res<Timestamp>,
 ) {
-    writer.init(None, &timestamp);
+    // writer.init(None, &timestamp);
 
     commands.spawn(Camera2dBundle {
         transform: Transform::from_xyz(0.0, 0.0, 500.0),
@@ -402,7 +379,7 @@ fn setup(
         .insert(TransformBundle::from(Transform::from_xyz(500.0, 0.0, 0.0)));
 
     for _ in 0..NUM_AGENTS {
-        let brain = Brain::new(thinkers::ppo::PpoThinker::default(), timestamp.to_string());
+        let brain = Brain::new(thinkers::ppo::PpoThinker::default(), &timestamp);
         spawn_agent(
             brain,
             &mut commands,
@@ -440,7 +417,6 @@ fn update(
     _walls: Query<&Collider, (Without<Agent>, With<Wall>)>,
     _keys: Res<Input<KeyCode>>,
     mut log: ResMut<LogText>,
-    mut writer: NonSendMut<TbWriter>,
     frame_count: Res<FrameCount>,
 ) {
     let mut all_states = BTreeMap::new();
@@ -499,12 +475,10 @@ fn update(
         }
 
         all_states.insert(agent, my_state);
-        let action = brains.get_mut(&agent).unwrap().act(my_state);
-        writer.add_scalar(
-            &format!("{}/Entropy", brains[&agent].id),
-            brains[&agent].thinker.recent_entropy,
-            frame_count.0 as usize,
-        );
+        let action = brains
+            .get_mut(&agent)
+            .unwrap()
+            .act(my_state, frame_count.0 as usize);
 
         all_actions.insert(agent, action);
         all_rewards.insert(agent, 0.0);
@@ -587,7 +561,7 @@ fn update(
     }
 
     for (agent, _, _, _) in agents.iter() {
-        let fs = brains.get(&agent).unwrap().fs;
+        let fs = brains.get(&agent).unwrap().fs.clone();
         brains.get_mut(&agent).unwrap().rb.remember(SavedStep {
             obs: fs,
             action: all_actions.remove(&agent).unwrap(),
@@ -659,6 +633,23 @@ impl<T: Thinker> Drop for Brain<T> {
 #[derive(Resource, Default)]
 pub struct AvgAgentKills(f32);
 
+fn handle_input(
+    mut window: Query<&mut Window>,
+    keys: Res<Input<KeyCode>>,
+    mut log_text: ResMut<LogText>,
+) {
+    let mut window = window.get_single_mut().unwrap();
+    if keys.just_pressed(KeyCode::Space) {
+        if window.present_mode == PresentMode::AutoNoVsync {
+            log_text.push("VSync On".into());
+            window.present_mode = PresentMode::AutoVsync;
+        } else if window.present_mode == PresentMode::AutoVsync {
+            log_text.push("VSync Off".into());
+            window.present_mode = PresentMode::AutoNoVsync;
+        }
+    }
+}
+
 fn main() {
     App::new()
         .insert_resource(Msaa::default())
@@ -670,7 +661,6 @@ fn main() {
         .insert_resource(AvgAgentKills::default())
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
-        .insert_non_send_resource(TbWriter::default())
         .insert_non_send_resource(BrainBank::default())
         .add_plugins(ScheduleRunnerPlugin {
             run_mode: bevy::app::RunMode::Loop {
@@ -701,5 +691,6 @@ fn main() {
         .add_systems(Update, update)
         .add_systems(Update, check_respawn_all)
         .add_systems(Update, ui)
+        .add_systems(Update, handle_input)
         .run();
 }

@@ -19,6 +19,8 @@ rand = "0.8.5"
 rand_distr = "0.4.3"
 # tch = { version = "0.13.0" }
 tensorboard-rs = "0.5.9"
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.0.6", features = ["alloc"] }
 
 [profile.dev.package."*"]
 opt-level = 3

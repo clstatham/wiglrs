@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 
-use crate::{hparams::AGENT_RB_MAX_LEN, Action};
+use crate::Action;
 
 use super::FrameStack;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SavedStep {
     pub obs: FrameStack,
     pub action: Action,
@@ -20,14 +21,14 @@ impl SavedStep {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct ReplayBuffer {
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct ReplayBuffer<const MAX_LEN: usize> {
     pub buf: VecDeque<SavedStep>,
 }
 
-impl ReplayBuffer {
+impl<const MAX_LEN: usize> ReplayBuffer<MAX_LEN> {
     pub fn remember(&mut self, step: SavedStep) {
-        if self.buf.len() >= AGENT_RB_MAX_LEN {
+        if self.buf.len() >= MAX_LEN {
             self.buf.pop_front();
         }
         self.buf.push_back(step);

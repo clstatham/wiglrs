@@ -8,7 +8,7 @@ use crate::brains::replay_buffer::ReplayBuffer;
 use crate::brains::FrameStack;
 use crate::hparams::{
     AGENT_ACTOR_LR, AGENT_CRITIC_LR, AGENT_HIDDEN_DIM, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS,
-    AGENT_RB_MAX_LEN, N_FRAME_STACK,
+    N_FRAME_STACK,
 };
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
@@ -145,11 +145,18 @@ struct PpoActor<
         ReLU,
         ModLinear<HIDDEN_DIM, HIDDEN_DIM, E, D>,
         ReLU,
+    ),
+    mu_head: (
         ModLinear<HIDDEN_DIM, HIDDEN_DIM, E, D>,
         ReLU,
+        ModLinear<HIDDEN_DIM, ACTION_LEN, E, D>,
+        Tanh,
     ),
-    mu_head: (ModLinear<HIDDEN_DIM, ACTION_LEN, E, D>, Tanh),
-    std_head: ModLinear<HIDDEN_DIM, ACTION_LEN, E, D>,
+    std_head: (
+        ModLinear<HIDDEN_DIM, HIDDEN_DIM, E, D>,
+        ReLU,
+        ModLinear<HIDDEN_DIM, ACTION_LEN, E, D>,
+    ),
 }
 
 impl<
@@ -269,6 +276,7 @@ pub struct PpoThinker {
     pub recent_entropy: f32,
     pub recent_policy_loss: f32,
     pub recent_value_loss: f32,
+    pub recent_entropy_loss: f32,
 }
 
 impl PpoThinker {
@@ -307,6 +315,7 @@ impl PpoThinker {
             recent_entropy: 0.0,
             recent_policy_loss: 0.0,
             recent_value_loss: 0.0,
+            recent_entropy_loss: 0.0,
         }
     }
 }
@@ -350,7 +359,7 @@ impl Thinker for PpoThinker {
         )
     }
 
-    fn learn(&mut self, rb: &mut ReplayBuffer) {
+    fn learn<const MAX_LEN: usize>(&mut self, rb: &mut ReplayBuffer<MAX_LEN>) {
         let nstep = rb.buf.len();
         // if nstep < AGENT_RB_MAX_LEN {
         //     return; // not enough data to train yet
@@ -370,6 +379,7 @@ impl Thinker for PpoThinker {
 
         let mut total_pi_loss = 0.0;
         let mut total_val_loss = 0.0;
+        let mut total_entropy_loss = 0.0;
         let mut actor_grads = self.actor_grads.take().unwrap();
         let mut critic_grads = self.critic_grads.take().unwrap();
         let rb: Vec<_> = rb.buf.clone().into();
@@ -448,9 +458,11 @@ impl Thinker for PpoThinker {
                 let surr2 = ratio.clamp(0.8, 1.2) * advantage;
                 let policy_loss = -(surr2.minimum(surr1).mean());
                 let value_loss = (val - reward).square().mean();
-                total_pi_loss += policy_loss.array();
                 total_val_loss += value_loss.array();
-                let policy_loss = policy_loss - entropy.mean() * 0.001;
+                total_pi_loss += policy_loss.array();
+                let entropy_loss = entropy.mean() * 1e-5;
+                total_entropy_loss += entropy_loss.array();
+                let policy_loss = policy_loss - entropy_loss;
 
                 actor_grads = policy_loss.backward();
                 self.actor_optim
@@ -464,14 +476,10 @@ impl Thinker for PpoThinker {
                     .unwrap();
                 self.critic.zero_grads(&mut critic_grads);
             }
-
-            // self.net.std = self.net.std.clone() * self.device.tensor(0.99).broadcast();
-
-            // self.target_actor.clone_from(&self.actor);
-            // self.target_critic.clone_from(&self.critic);
         }
         self.recent_policy_loss = total_pi_loss / nstep as f32;
         self.recent_value_loss = total_val_loss / nstep as f32;
+        self.recent_entropy_loss = total_entropy_loss / nstep as f32;
         self.actor_grads = Some(actor_grads);
         self.critic_grads = Some(critic_grads);
         // rb.buf.clear();
