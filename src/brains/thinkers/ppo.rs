@@ -6,9 +6,7 @@ use std::ops::{Add, Mul};
 
 use crate::brains::replay_buffer::ReplayBuffer;
 use crate::brains::FrameStack;
-use crate::hparams::{
-    AGENT_HIDDEN_DIM, AGENT_LR, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS, N_FRAME_STACK,
-};
+use crate::hparams::{AGENT_HIDDEN_DIM, AGENT_LR, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS};
 use crate::{Action, ACTION_LEN, OBS_LEN};
 
 use super::Thinker;
@@ -20,7 +18,7 @@ pub type FTensor<S, T = NoneTape> = Tensor<S, Float, Device, T>;
 
 pub struct MvNormal<const K: usize, T: Tape<Float, Device> + Merge<NoneTape>> {
     pub mu: FTensor<Rank1<K>, T>,
-    pub cov_diag: FTensor<Rank1<K>, T>,
+    pub cov_diag: FTensor<Rank1<K>>,
 }
 
 impl<const K: usize, T: Tape<Float, Device>> MvNormal<K, T>
@@ -68,7 +66,7 @@ where
 
 fn mvn_batch_log_prob<const K: usize, T: Tape<Float, Device> + Merge<NoneTape>>(
     mu: FTensor<(usize, Const<K>), T>,
-    var: FTensor<(usize, Const<K>), T>,
+    var: FTensor<(usize, Const<K>)>,
     x: FTensor<(usize, Const<K>)>,
 ) -> (FTensor<(usize, Const<1>), T>, FTensor<(usize, Const<1>)>) {
     let nbatch = x.shape().0;
@@ -126,7 +124,7 @@ struct PpoNet<
         ReLU,
     ),
     mu_head: (Linear<HIDDEN_DIM, ACTION_LEN, E, D>, Tanh),
-    var_head: Linear<HIDDEN_DIM, ACTION_LEN, E, D>,
+    std: Tensor<Rank1<ACTION_LEN>, E, D>,
     val_head: Linear<HIDDEN_DIM, 1, E, D>,
 }
 
@@ -148,13 +146,25 @@ impl<
             (
                 Self::module("common", |s| &s.common, |s| &mut s.common),
                 Self::module("mu_head", |s| &s.mu_head, |s| &mut s.mu_head),
-                Self::module("var_head", |s| &s.var_head, |s| &mut s.var_head),
+                // Self::module("std_head", |s| &s.std_head, |s| &mut s.std_head),
+                Self::tensor(
+                    "std",
+                    |s| &s.std,
+                    |s| &mut s.std,
+                    TensorOptions::detached(|t| {
+                        t.try_fill_with_ones()?;
+                        *t = t.with_empty_tape()
+                            * t.device().tensor(E::from(0.5).unwrap()).broadcast();
+                        Ok(())
+                    }),
+                ),
                 Self::module("val_head", |s| &s.val_head, |s| &mut s.val_head),
             ),
-            |(c, mu, var, val)| Self::To {
+            |(c, mu, std, val)| Self::To {
                 common: c,
                 mu_head: mu,
-                var_head: var,
+                // std_head: std,
+                std,
                 val_head: val,
             },
         )
@@ -174,7 +184,7 @@ impl<
     type Error = D::Err;
     type Output = (
         Tensor<(Const<ACTION_LEN>,), E, D, T>,
-        Tensor<(Const<ACTION_LEN>,), E, D, T>,
+        Tensor<(Const<ACTION_LEN>,), E, D>,
         Tensor<(Const<1>,), E, D, T>,
     );
     fn try_forward(
@@ -186,10 +196,9 @@ impl<
         let idx = x.device().tensor(nstack - 1);
         let x = x.try_select(idx)?;
         let val = self.val_head.try_forward(x.with_empty_tape())?;
-        let var = self.var_head.try_forward(x.with_empty_tape())?;
-        let var = softplus(var);
+        let std = self.std.clone();
         let mu = self.mu_head.try_forward(x)?;
-        Ok((mu, var, val))
+        Ok((mu, std, val))
     }
 }
 
@@ -206,7 +215,7 @@ impl<
     type Error = D::Err;
     type Output = (
         Tensor<(usize, Const<ACTION_LEN>), E, D, T>,
-        Tensor<(usize, Const<ACTION_LEN>), E, D, T>,
+        Tensor<(usize, Const<ACTION_LEN>), E, D>,
         Tensor<(usize, Const<1>), E, D, T>,
     );
     fn try_forward(
@@ -215,15 +224,14 @@ impl<
     ) -> Result<Self::Output, Self::Error> {
         let nbatch = input.shape().0;
         let nstack = input.shape().1;
-        let x = self.common.try_forward(input)?.relu();
+        let x = self.common.try_forward(input)?;
         let x = x
             .slice((0..nbatch, nstack - 1..nstack, 0..HIDDEN_DIM))
             .reshape_like(&(nbatch, Const::<HIDDEN_DIM>));
         let val = self.val_head.try_forward(x.with_empty_tape())?;
-        let var = self.var_head.try_forward(x.with_empty_tape())?;
-        let var = softplus(var);
-        let mu = self.mu_head.try_forward(x)?.tanh();
-        Ok((mu, var, val))
+        let std = self.std.clone().broadcast_like(&(nbatch, Const));
+        let mu = self.mu_head.try_forward(x)?;
+        Ok((mu, std, val))
     }
 }
 
@@ -245,6 +253,7 @@ impl PpoThinker {
         let net = Ppo::build(&device);
         let target_net = net.clone();
         let net_grads = net.alloc_grads();
+
         Self {
             optim: Adam::new(
                 &net,
@@ -286,14 +295,7 @@ impl Thinker for PpoThinker {
         };
         let action = dist.sample();
 
-        Action::from_slice(
-            action
-                .as_vec()
-                .into_iter()
-                .map(|x| x as f32)
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )
+        Action::from_slice(action.as_vec().as_slice())
     }
 
     fn learn(&mut self, rb: &mut ReplayBuffer) -> f32 {
@@ -362,21 +364,24 @@ impl Thinker for PpoThinker {
                 let policy_loss = -(surr2.minimum(surr1).mean());
 
                 let value_loss = (val - reward).square().mean();
-                let loss = policy_loss + value_loss + entropy.clone().mean() * 0.01;
+                let loss = policy_loss + value_loss - entropy.clone().mean() * 0.01;
                 // let e = entropy.as_vec();
                 // dbg!(e.iter().sum::<f32>() / e.len() as f32);
 
                 total_loss += loss.array();
 
                 net_grads = loss.backward();
+                self.optim.update(&mut self.net, &net_grads).unwrap();
+                self.net.zero_grads(&mut net_grads);
             }
-            self.optim.update(&mut self.net, &net_grads).unwrap();
-            self.net.zero_grads(&mut net_grads);
+
+            self.net.std = self.net.std.clone() * self.device.tensor(0.99).broadcast();
+
+            self.target_net.clone_from(&self.net);
         }
 
-        self.target_net.clone_from(&self.net);
         self.net_grads = Some(net_grads);
         // rb.buf.clear();
-        total_loss as f32 / AGENT_OPTIM_EPOCHS as f32
+        total_loss / AGENT_OPTIM_EPOCHS as f32
     }
 }

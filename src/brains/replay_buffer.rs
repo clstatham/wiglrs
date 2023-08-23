@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use itertools::Itertools;
 
-use crate::{hparams::AGENT_RB_MAX_LEN, Action, Observation};
+use crate::{hparams::AGENT_RB_MAX_LEN, Action};
 
 use super::FrameStack;
 

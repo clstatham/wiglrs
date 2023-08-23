@@ -1,8 +1,5 @@
 use bevy::prelude::*;
-use std::{
-    collections::BTreeMap,
-    sync::{atomic::AtomicU64, Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::atomic::AtomicU64};
 
 use crate::{hparams::N_FRAME_STACK, Action, Observation};
 

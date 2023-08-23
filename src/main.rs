@@ -486,24 +486,12 @@ fn update(
         let action = brains.get_mut(&agent).unwrap().act(my_state);
 
         all_actions.insert(agent, action);
-        all_rewards.insert(agent, -1.0);
+        all_rewards.insert(agent, 0.0);
         all_terminals.insert(agent, false);
     }
     let mut dead_agents = BTreeSet::default();
-    for (agent, mut force, _velocity, transform) in agents.iter_mut() {
+    for (agent, mut force, _velocity, _transform) in agents.iter_mut() {
         if !dead_agents.contains(&agent) {
-            // let distance_to_center = transform.translation.distance(Vec3::splat(0.0));
-            // if distance_to_center >= 200.0 {
-            //     let mut hp = health.get_mut(agent).unwrap();
-            //     hp.0 -= distance_to_center / 10000.0;
-            //     // *all_rewards.get_mut(&agent).unwrap() -= distance_to_center / 2000.0;
-            //     if hp.0 <= 0.0 {
-            //         dead_agents.insert(agent);
-            //         *all_terminals.get_mut(&agent).unwrap() = true;
-            //         println!("{} expired.", &brains[&agent].name);
-            //     }
-            // }
-
             if all_actions[&agent].shoot > 0.0 && !dead_agents.contains(&agent) {
                 let (ray_dir, ray_pos) = {
                     let (transform, childs) = agents_shootin.get(agent).unwrap();

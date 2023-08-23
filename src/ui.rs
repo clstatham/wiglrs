@@ -30,7 +30,7 @@ impl std::fmt::Display for LogText {
 pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText>) {
     egui::Window::new("Scores").show(cxs.ctx_mut(), |ui| {
         ui.vertical(|ui| {
-            for (ent, brain) in brains.iter().sorted_by_key(|(_, b)| b.kills).rev() {
+            for (_ent, brain) in brains.iter().sorted_by_key(|(_, b)| b.kills).rev() {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!("{} {}", brain.id, &brain.name))
@@ -48,7 +48,7 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
     });
     egui::Window::new("Action Mean/Std").show(cxs.ctx_mut(), |ui| {
         ui.vertical(|ui| {
-            for (ent, brain) in brains.iter().sorted_by_key(|(_, b)| b.id) {
+            for (_ent, brain) in brains.iter().sorted_by_key(|(_, b)| b.id) {
                 ui.group(|ui| {
                     ui.vertical(|ui| {
                         ui.heading(&brain.name);

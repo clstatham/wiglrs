@@ -1,6 +1,6 @@
 use bevy::prelude::Vec2;
 
-use crate::{Action, Observation};
+use crate::Action;
 
 use super::{replay_buffer::ReplayBuffer, FrameStack};
 
