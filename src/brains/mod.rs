@@ -44,7 +44,7 @@ impl FrameStack {
 pub struct Brain<T: Thinker> {
     pub name: String,
     pub timestamp: Timestamp,
-    pub version: u64,
+    pub deaths: u64,
     pub kills: usize,
     pub color: Color,
     pub id: u64,
@@ -67,7 +67,7 @@ impl<T: Thinker> Brain<T> {
             color: Color::rgb(rand::random(), rand::random(), rand::random()),
             id,
             kills: 0,
-            version: 0,
+            deaths: 0,
             rb: ReplayBuffer::default(),
             fs: FrameStack::default(),
             thinker,
@@ -78,7 +78,7 @@ impl<T: Thinker> Brain<T> {
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let path = format!(
             "training/{}/{}_{}_{}K_{}D",
-            self.timestamp, self.id, self.name, self.kills, self.version
+            self.timestamp, self.id, self.name, self.kills, self.deaths
         );
         std::fs::create_dir_all(&path).ok();
         self.thinker.save(path)?;

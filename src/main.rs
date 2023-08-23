@@ -17,8 +17,8 @@ use brains::{
     Brain, BrainBank,
 };
 use hparams::{
-    AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_RADIUS,
-    AGENT_SHOOT_DISTANCE, NUM_AGENTS,
+    AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_OPTIM_EPOCHS, AGENT_RADIUS,
+    AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, NUM_AGENTS,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -200,20 +200,17 @@ impl AgentBundle {
     }
 }
 
-fn check_respawn_all(
-    mut commands: Commands,
-    mut brains: NonSendMut<brains::BrainBank>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    asset_server: Res<AssetServer>,
-    frame_count: Res<FrameCount>,
-    mut avg_kills: ResMut<AvgAgentKills>,
+fn check_rb_full(
+    mut brains: NonSendMut<BrainBank>,
     mut log: ResMut<LogText>,
+    frame_count: Res<FrameCount>,
 ) {
-    for agent in brains.keys().copied().collect::<Vec<_>>() {
-        if commands.get_entity(agent).is_none() {
-            let mut brain = brains.remove(&agent).unwrap();
-
+    for brain in brains.values_mut() {
+        if brain.rb.buf.len() >= AGENT_RB_MAX_LEN {
+            log.push(format!(
+                "{} {} replay buffer full, training for {} epochs...",
+                brain.id, brain.name, AGENT_OPTIM_EPOCHS
+            ));
             brain.learn(frame_count.0 as usize);
             log.push(format!(
                 "{} {} Policy Loss: {}",
@@ -224,7 +221,25 @@ fn check_respawn_all(
                 "{} {} Value Loss: {}",
                 brain.id, &brain.name, brain.thinker.recent_value_loss
             ));
-            brain.version += 1;
+            brain.rb.buf.clear();
+        }
+    }
+}
+
+fn check_respawn_all(
+    mut commands: Commands,
+    mut brains: NonSendMut<BrainBank>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    asset_server: Res<AssetServer>,
+) {
+    for agent in brains.keys().copied().collect::<Vec<_>>() {
+        if commands.get_entity(agent).is_none() {
+            let mut brain = brains.remove(&agent).unwrap();
+
+            // brain.learn(frame_count.0 as usize);
+
+            brain.deaths += 1;
 
             spawn_agent(
                 brain,
@@ -234,7 +249,7 @@ fn check_respawn_all(
                 &mut brains,
                 &asset_server,
             );
-            avg_kills.0 = brains.values().map(|b| b.kills as f32).sum::<f32>() / NUM_AGENTS as f32;
+            // avg_kills.0 = brains.values().map(|b| b.kills as f32).sum::<f32>() / NUM_AGENTS as f32;
         }
     }
 }
@@ -281,7 +296,7 @@ fn spawn_agent(
     commands.spawn((
         Text2dBundle {
             text: Text::from_section(
-                format!("{} {} {}.0", brain.id, &brain.name, brain.version),
+                format!("{} {} {}.0", brain.id, &brain.name, brain.deaths),
                 TextStyle {
                     font: asset_server.load("fonts/FiraSans-Bold.ttf"),
                     font_size: 20.0,
@@ -430,7 +445,7 @@ fn update(
             let brain = &brains[&text_comp.entity_following];
             text.sections[0].value = format!(
                 "{} {} {}-{}",
-                brain.id, &brain.name, brain.kills, brain.version
+                brain.id, &brain.name, brain.kills, brain.deaths
             );
         } else {
             commands.entity(t_ent).despawn();
@@ -687,6 +702,7 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(Update, update)
         .add_systems(Update, check_respawn_all)
+        .add_systems(Update, check_rb_full)
         .add_systems(Update, ui)
         .add_systems(Update, handle_input)
         .run();

@@ -21,6 +21,7 @@ rand_distr = "0.4.3"
 tensorboard-rs = "0.5.9"
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.0.6", default-features = false, features = ["alloc"] }
+kdam = { version = "0.4.1", features = ["rich"] }
 
 [profile.dev.package."*"]
 opt-level = 3

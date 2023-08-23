@@ -361,9 +361,9 @@ impl Thinker for PpoThinker {
 
     fn learn<const MAX_LEN: usize>(&mut self, rb: &mut ReplayBuffer<MAX_LEN>) {
         let nstep = rb.buf.len() - 1;
-        if nstep < AGENT_RB_MAX_LEN - 1 {
-            return; // not enough data to train yet
-        }
+        // if nstep < AGENT_RB_MAX_LEN - 1 {
+        //     return; // not enough data to train yet
+        // }
         let mut gae = 0.0;
         let mut returns = VecDeque::new();
 
@@ -388,11 +388,15 @@ impl Thinker for PpoThinker {
         let mut actor_grads = self.actor_grads.take().unwrap();
         let mut critic_grads = self.critic_grads.take().unwrap();
         let rb: Vec<_> = rb.buf.clone().into();
-        for _ in 0..AGENT_OPTIM_EPOCHS {
-            for (step, returns) in rb
-                .chunks(AGENT_OPTIM_BATCH_SIZE)
-                .zip(returns.chunks(AGENT_OPTIM_BATCH_SIZE))
-            {
+        for epoch in kdam::tqdm!(0..AGENT_OPTIM_EPOCHS, desc = "Training", position = 0) {
+            let dsc = format!("Epoch {}", epoch + 1);
+            for (step, returns) in kdam::tqdm!(
+                rb[..nstep]
+                    .chunks(AGENT_OPTIM_BATCH_SIZE)
+                    .zip(returns.chunks(AGENT_OPTIM_BATCH_SIZE)),
+                desc = dsc,
+                position = 1
+            ) {
                 let nbatch = returns.len();
                 let returns = self
                     .device

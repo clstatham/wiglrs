@@ -38,7 +38,7 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new(format!("{}-{}", brain.kills, brain.version))
+                            egui::RichText::new(format!("{}-{}", brain.kills, brain.deaths))
                                 .text_style(egui::TextStyle::Heading),
                         );
                     });
