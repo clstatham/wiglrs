@@ -19,13 +19,17 @@ type Float = f32;
 const PI: Float = std::f32::consts::PI;
 pub type FTensor<S, T = NoneTape> = Tensor<S, Float, Device, T>;
 
-pub struct MvNormal<const K: usize, T: Tape<Float, Device> + Merge<NoneTape>> {
-    pub mu: FTensor<Rank1<K>, T>,
-    pub cov_diag: FTensor<Rank1<K>, T>,
+pub struct MvNormal<
+    const K: usize,
+    D: dfdx::tensor_ops::Device<Float>,
+    T: Tape<Float, D> + Merge<NoneTape>,
+> {
+    pub mu: Tensor<Rank1<K>, Float, D, T>,
+    pub cov_diag: Tensor<Rank1<K>, Float, D, T>,
 }
 
-impl<const K: usize> MvNormal<K, NoneTape> {
-    pub fn sample(&self) -> FTensor<Rank1<K>, NoneTape> {
+impl<const K: usize, D: dfdx::tensor_ops::Device<Float>> MvNormal<K, D, NoneTape> {
+    pub fn sample(&self) -> Tensor<Rank1<K>, Float, D, NoneTape> {
         let cov_mat = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
             K,
             self.cov_diag.as_vec().into_iter(),
@@ -39,11 +43,11 @@ impl<const K: usize> MvNormal<K, NoneTape> {
     }
 }
 
-impl<const K: usize, T: Tape<Float, Device>> MvNormal<K, T>
+impl<const K: usize, D: dfdx::tensor_ops::Device<Float>, T: Tape<Float, D>> MvNormal<K, D, T>
 where
     T: Merge<NoneTape>,
 {
-    pub fn log_prob(self, x: FTensor<Rank1<K>>) -> (FTensor<Rank1<1>, T>, Float) {
+    pub fn log_prob(self, x: Tensor<Rank1<K>, Float, D>) -> (Tensor<Rank1<1>, Float, D, T>, Float) {
         let cov_mat = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
             K,
             self.cov_diag.as_vec().into_iter(),
@@ -78,11 +82,18 @@ where
     }
 }
 
-fn mvn_batch_log_prob<const K: usize, T: Tape<Float, Device> + Merge<NoneTape>>(
-    mu: FTensor<(usize, Const<K>), T>,
-    var: FTensor<(usize, Const<K>), T>,
-    x: FTensor<(usize, Const<K>)>,
-) -> (FTensor<(usize, Const<1>), T>, FTensor<(usize, Const<1>)>) {
+fn mvn_batch_log_prob<
+    const K: usize,
+    D: dfdx::tensor_ops::Device<Float>,
+    T: Tape<Float, D> + Merge<NoneTape>,
+>(
+    mu: Tensor<(usize, Const<K>), Float, D, T>,
+    var: Tensor<(usize, Const<K>), Float, D, T>,
+    x: Tensor<(usize, Const<K>), Float, D>,
+) -> (
+    Tensor<(usize, Const<1>), Float, D, T>,
+    Tensor<(usize, Const<1>), Float, D>,
+) {
     let nbatch = x.shape().0;
     assert_eq!(mu.shape().0, nbatch);
     assert_eq!(var.shape().0, nbatch);
@@ -246,14 +257,13 @@ type PpoC = <PpoCritic as BuildOnDevice<Device, Float>>::Built;
 
 pub struct PpoThinker {
     actor: PpoA,
-    // target_actor: PpoA,
     critic: PpoC,
-    // target_critic: PpoC,
     actor_grads: Option<Gradients<Float, Device>>,
     critic_grads: Option<Gradients<Float, Device>>,
     actor_optim: Adam<PpoA, Float, Device>,
     critic_optim: Adam<PpoC, Float, Device>,
     device: Device,
+    cpu: Cpu,
     pub recent_mu: Vec<f32>,
     pub recent_std: Vec<f32>,
     pub recent_entropy: f32,
@@ -270,6 +280,7 @@ impl PpoThinker {
         let critic_grads = critic.alloc_grads();
 
         Self {
+            cpu: Cpu::seed_from_u64(rand::random()),
             actor_optim: Adam::new(
                 &actor,
                 AdamConfig {
@@ -315,6 +326,8 @@ impl Thinker for PpoThinker {
             .collect::<Vec<FTensor<Rank1<OBS_LEN>>>>())
         .stack();
         let (mu, std) = self.actor.forward(obs.clone());
+        let mu = mu.to_device(&self.cpu);
+        let std = std.to_device(&self.cpu);
         self.recent_mu = mu.as_vec();
         self.recent_std = std.as_vec();
         let dist = MvNormal {
@@ -339,9 +352,9 @@ impl Thinker for PpoThinker {
 
     fn learn(&mut self, rb: &mut ReplayBuffer) {
         let nstep = rb.buf.len();
-        if nstep < AGENT_RB_MAX_LEN {
-            return; // not enough data to train yet
-        }
+        // if nstep < AGENT_RB_MAX_LEN {
+        //     return; // not enough data to train yet
+        // }
         let mut discounted_reward = 0.0;
         let mut rewards = VecDeque::new();
 
@@ -437,7 +450,7 @@ impl Thinker for PpoThinker {
                 let value_loss = (val - reward).square().mean();
                 total_pi_loss += policy_loss.array();
                 total_val_loss += value_loss.array();
-                let policy_loss = policy_loss - entropy.clone().mean() * 0.001;
+                let policy_loss = policy_loss - entropy.mean() * 0.001;
 
                 actor_grads = policy_loss.backward();
                 self.actor_optim
