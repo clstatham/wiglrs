@@ -1,16 +1,20 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use bevy::{
-    core::FrameCount, math::Vec3Swizzles, prelude::*, sprite::MaterialMesh2dBundle,
-    winit::WinitSettings,
+    app::ScheduleRunnerPlugin, core::FrameCount, ecs::schedule::ScheduleLabel, math::Vec3Swizzles,
+    prelude::*, sprite::MaterialMesh2dBundle, winit::WinitSettings,
 };
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 use brains::{
     replay_buffer::SavedStep,
-    thinkers::{self, ppo::PpoThinker},
+    thinkers::{self, ppo::PpoThinker, Thinker},
     Brain, BrainBank,
 };
 use hparams::{
@@ -80,20 +84,28 @@ impl Observation {
 pub mod hparams;
 
 #[derive(Debug, Default, Clone, Copy)]
+pub struct ActionMetadata {
+    pub val: f32,
+    pub logp: f32,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Action {
     lin_force: Vec2,
     ang_force: f32,
     shoot: f32,
+    metadata: Option<ActionMetadata>,
 }
 
 pub const ACTION_LEN: usize = 4;
 
 impl Action {
-    pub fn from_slice(action: &[f32]) -> Self {
+    pub fn from_slice(action: &[f32], metadata: Option<ActionMetadata>) -> Self {
         Self {
             lin_force: Vec2::new(action[0], action[1]),
             ang_force: action[2],
             shoot: action[3],
+            metadata,
         }
     }
 
@@ -208,17 +220,29 @@ fn check_respawn_all(
                 "{} {} reward: {mean_reward}",
                 brain.id, &brain.name
             ));
-            writer.0.add_scalar(
-                &format!("Reward/{}", brain.id),
+            writer.add_scalar(
+                &format!("{}/Reward", brain.id),
                 mean_reward,
                 frame_count.0 as usize,
             );
 
-            let total_loss = brain.learn();
-            log.push(format!("{} {} loss: {total_loss}", brain.id, &brain.name));
-            writer.0.add_scalar(
-                &format!("Loss/{}", brain.id),
-                total_loss,
+            brain.learn();
+            log.push(format!(
+                "{} {} Policy Loss: {}",
+                brain.id, &brain.name, brain.thinker.recent_policy_loss
+            ));
+            writer.add_scalar(
+                &format!("{}/PolicyLoss", brain.id),
+                brain.thinker.recent_policy_loss,
+                frame_count.0 as usize,
+            );
+            log.push(format!(
+                "{} {} Value Loss: {}",
+                brain.id, &brain.name, brain.thinker.recent_value_loss
+            ));
+            writer.add_scalar(
+                &format!("{}/ValueLoss", brain.id),
+                brain.thinker.recent_value_loss,
                 frame_count.0 as usize,
             );
             brain.version += 1;
@@ -232,9 +256,7 @@ fn check_respawn_all(
                 &asset_server,
             );
             avg_kills.0 = brains.values().map(|b| b.kills as f32).sum::<f32>() / NUM_AGENTS as f32;
-            writer
-                .0
-                .add_scalar("Avg Kills", avg_kills.0, frame_count.0 as usize);
+            writer.add_scalar("Avg Kills", avg_kills.0, frame_count.0 as usize);
         }
     }
 }
@@ -315,7 +337,11 @@ fn setup(
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut brains: NonSendMut<BrainBank>,
     asset_server: Res<AssetServer>,
+    mut writer: NonSendMut<TbWriter>,
+    timestamp: Res<Timestamp>,
 ) {
+    writer.init(None, &timestamp);
+
     commands.spawn(Camera2dBundle {
         transform: Transform::from_xyz(0.0, 0.0, 500.0),
         ..Default::default()
@@ -376,7 +402,7 @@ fn setup(
         .insert(TransformBundle::from(Transform::from_xyz(500.0, 0.0, 0.0)));
 
     for _ in 0..NUM_AGENTS {
-        let brain = Brain::new(thinkers::ppo::PpoThinker::default());
+        let brain = Brain::new(thinkers::ppo::PpoThinker::default(), timestamp.to_string());
         spawn_agent(
             brain,
             &mut commands,
@@ -414,6 +440,8 @@ fn update(
     _walls: Query<&Collider, (Without<Agent>, With<Wall>)>,
     _keys: Res<Input<KeyCode>>,
     mut log: ResMut<LogText>,
+    mut writer: NonSendMut<TbWriter>,
+    frame_count: Res<FrameCount>,
 ) {
     let mut all_states = BTreeMap::new();
     let mut all_actions = BTreeMap::new();
@@ -470,20 +498,13 @@ fn update(
             my_state.other_states[i] = other_state;
         }
 
-        // for (other, _, other_vel, other_transform) in agents.iter() {
-        //     let other_state = OtherState {
-        //         rel_pos: transform.translation.xy() - other_transform.translation.xy(),
-        //         linvel: other_vel.linvel,
-        //         direction: other_transform.local_y().xy(),
-        //     };
-        //     my_state.other_states[brains[&other].id as usize] = other_state;
-        // }
-
-        // brains.get_mut(&agent).unwrap().frame_stack.push(my_state);
-
-        // let state = brains.get(&agent).unwrap().frame_stack.as_tensor();
         all_states.insert(agent, my_state);
         let action = brains.get_mut(&agent).unwrap().act(my_state);
+        writer.add_scalar(
+            &format!("{}/Entropy", brains[&agent].id),
+            brains[&agent].thinker.recent_entropy,
+            frame_count.0 as usize,
+        );
 
         all_actions.insert(agent, action);
         all_rewards.insert(agent, 0.0);
@@ -580,15 +601,58 @@ fn update(
     }
 }
 
-pub struct TbWriter(SummaryWriter);
+#[derive(Resource, Clone)]
+pub struct Timestamp(Arc<String>);
 
-impl Default for TbWriter {
+impl Default for Timestamp {
     fn default() -> Self {
         use chrono::prelude::*;
-        let timestamp = Local::now().format("%Y%m%d%H%M%S");
-        Self(tensorboard_rs::summary_writer::SummaryWriter::new(format!(
-            "training/{timestamp}"
-        )))
+        Self(Arc::new(format!("{}", Local::now().format("%Y%m%d%H%M%S"))))
+    }
+}
+
+impl std::fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Default)]
+pub struct TbWriter(Option<SummaryWriter>);
+
+impl TbWriter {
+    pub fn init(&mut self, subdir: Option<&str>, timestamp: &Timestamp) {
+        let dir = if let Some(subdir) = subdir {
+            format!("training/{}/{}", timestamp, subdir)
+        } else {
+            format!("training/{}", timestamp)
+        };
+        self.0 = Some(SummaryWriter::new(dir));
+    }
+
+    pub fn add_scalar(&mut self, label: impl AsRef<str>, scalar: f32, step: usize) {
+        if let Some(writer) = self.0.as_mut() {
+            writer.add_scalar(label.as_ref(), scalar, step);
+        } else {
+            warn!("Attempted to write to uninitialized TbWriter");
+        }
+    }
+}
+
+impl Drop for TbWriter {
+    fn drop(&mut self) {
+        if let Some(w) = self.0.as_mut() {
+            w.flush();
+        }
+    }
+}
+
+impl<T: Thinker> Drop for Brain<T> {
+    fn drop(&mut self) {
+        warn!("Saving {}...", &self.name);
+        if let Err(e) = self.save() {
+            error!("Failed to save {}: {:?}", &self.name, e);
+        }
     }
 }
 
@@ -602,19 +666,34 @@ fn main() {
             focused_mode: bevy::winit::UpdateMode::Continuous,
             ..default()
         })
+        .insert_resource(Timestamp::default())
         .insert_resource(AvgAgentKills::default())
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
         .insert_non_send_resource(TbWriter::default())
         .insert_non_send_resource(BrainBank::default())
+        .add_plugins(ScheduleRunnerPlugin {
+            run_mode: bevy::app::RunMode::Loop {
+                // wait: Some(Duration::from_secs_f64(1.0 / 60.0)),
+                wait: None,
+            },
+        })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                present_mode: bevy::window::PresentMode::AutoVsync,
+                present_mode: bevy::window::PresentMode::AutoNoVsync,
                 title: "wiglrs".to_owned(),
                 ..default()
             }),
             ..Default::default()
         }))
+        .insert_resource(RapierConfiguration {
+            gravity: Vec2::ZERO,
+            timestep_mode: TimestepMode::Fixed {
+                dt: 1.0 / 60.0,
+                substeps: 10,
+            },
+            ..Default::default()
+        })
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
         .add_plugins(RapierDebugRenderPlugin::default())
         .add_plugins(EguiPlugin)

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use bevy::prelude::Vec2;
 
 use crate::Action;
@@ -8,7 +10,8 @@ pub mod ppo;
 
 pub trait Thinker {
     fn act(&mut self, obs: FrameStack) -> Action;
-    fn learn(&mut self, b: &mut ReplayBuffer) -> f32;
+    fn learn(&mut self, b: &mut ReplayBuffer);
+    fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 pub struct RandomThinker;
@@ -22,9 +25,11 @@ impl Thinker for RandomThinker {
             ),
             ang_force: rand::random::<f32>() * 2.0 - 1.0,
             shoot: rand::random::<f32>() * 2.0 - 1.0,
+            metadata: None,
         }
     }
-    fn learn(&mut self, _b: &mut ReplayBuffer) -> f32 {
-        0.0
+    fn learn(&mut self, _b: &mut ReplayBuffer) {}
+    fn save(&self, _path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
     }
 }

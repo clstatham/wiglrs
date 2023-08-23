@@ -46,7 +46,7 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
             }
         });
     });
-    egui::Window::new("Action Mean/Std").show(cxs.ctx_mut(), |ui| {
+    egui::Window::new("Action Mean/Std/Entropy").show(cxs.ctx_mut(), |ui| {
         ui.vertical(|ui| {
             for (_ent, brain) in brains.iter().sorted_by_key(|(_, b)| b.id) {
                 ui.group(|ui| {
@@ -62,6 +62,7 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                             std.push_str(&format!(" {:.4}", s));
                         }
                         ui.label(std);
+                        ui.label(format!("ent: {}", brain.thinker.recent_entropy));
                     });
                 });
             }

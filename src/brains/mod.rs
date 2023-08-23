@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, sync::atomic::AtomicU64};
 
 use crate::{hparams::N_FRAME_STACK, Action, Observation};
 
-use self::{replay_buffer::ReplayBuffer, thinkers::Thinker};
+use self::{
+    replay_buffer::ReplayBuffer,
+    thinkers::{ppo::PpoThinker, Thinker},
+};
 
 pub mod replay_buffer;
 pub mod thinkers;
@@ -33,6 +36,7 @@ impl FrameStack {
 
 pub struct Brain<T: Thinker> {
     pub name: String,
+    pub timestamp: String,
     pub version: u64,
     pub kills: usize,
     pub color: Color,
@@ -43,13 +47,14 @@ pub struct Brain<T: Thinker> {
 }
 
 impl<T: Thinker> Brain<T> {
-    pub fn new(thinker: T) -> Self {
+    pub fn new(thinker: T, timestamp: String) -> Self {
         static BRAIN_IDS: AtomicU64 = AtomicU64::new(0);
         let id = BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let name = crate::names::random_name();
 
         Self {
             name,
+            timestamp,
             color: Color::rgb(rand::random(), rand::random(), rand::random()),
             id,
             kills: 0,
@@ -65,9 +70,18 @@ impl<T: Thinker> Brain<T> {
         self.thinker.act(self.fs)
     }
 
-    pub fn learn(&mut self) -> f32 {
+    pub fn learn(&mut self) {
         self.thinker.learn(&mut self.rb)
+    }
+
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = format!(
+            "training/{}/{}_{}_{}K_{}D",
+            self.timestamp, self.id, self.name, self.kills, self.version
+        );
+        std::fs::create_dir_all(&path).ok();
+        self.thinker.save(path)
     }
 }
 
-pub type BrainBank = BTreeMap<Entity, Brain<thinkers::ppo::PpoThinker>>;
+pub type BrainBank = BTreeMap<Entity, Brain<PpoThinker>>;
