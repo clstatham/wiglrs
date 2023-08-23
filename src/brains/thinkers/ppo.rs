@@ -8,7 +8,7 @@ use crate::brains::replay_buffer::ReplayBuffer;
 use crate::brains::FrameStack;
 use crate::hparams::{
     AGENT_ACTOR_LR, AGENT_CRITIC_LR, AGENT_HIDDEN_DIM, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS,
-    N_FRAME_STACK,
+    AGENT_RB_MAX_LEN, N_FRAME_STACK,
 };
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
@@ -360,22 +360,27 @@ impl Thinker for PpoThinker {
     }
 
     fn learn<const MAX_LEN: usize>(&mut self, rb: &mut ReplayBuffer<MAX_LEN>) {
-        let nstep = rb.buf.len();
-        // if nstep < AGENT_RB_MAX_LEN {
-        //     return; // not enough data to train yet
-        // }
-        let mut discounted_reward = 0.0;
-        let mut rewards = VecDeque::new();
-
-        for step in rb.buf.iter().rev() {
-            if step.terminal {
-                discounted_reward = 0.0;
-            }
-            discounted_reward = step.reward + 0.99 * discounted_reward;
-            rewards.push_front(discounted_reward);
+        let nstep = rb.buf.len() - 1;
+        if nstep < AGENT_RB_MAX_LEN - 1 {
+            return; // not enough data to train yet
         }
-        let rewards = self.device.tensor_from_vec(rewards.into(), (nstep,));
-        let rewards = rewards.normalize(1e-7).as_vec();
+        let mut gae = 0.0;
+        let mut returns = VecDeque::new();
+
+        for i in (0..nstep).rev() {
+            // if step.terminal {
+            //     discounted_reward = 0.0;
+            // }
+            // discounted_reward = step.reward + 0.99 * discounted_reward;
+            // rewards.push_front(discounted_reward);
+            let mask = if rb.buf[i].terminal { 0.0 } else { 1.0 };
+            let delta = rb.buf[i].reward + 0.99 * rb.buf[i + 1].action.metadata.unwrap().val * mask
+                - rb.buf[i].action.metadata.unwrap().val;
+            gae = delta + 0.99 * 0.95 * mask * gae;
+            returns.push_front(gae + rb.buf[i].action.metadata.unwrap().val);
+        }
+        let returns = self.device.tensor_from_vec(returns.into(), (nstep,));
+        let returns = returns.normalize(1e-7).as_vec();
 
         let mut total_pi_loss = 0.0;
         let mut total_val_loss = 0.0;
@@ -384,14 +389,14 @@ impl Thinker for PpoThinker {
         let mut critic_grads = self.critic_grads.take().unwrap();
         let rb: Vec<_> = rb.buf.clone().into();
         for _ in 0..AGENT_OPTIM_EPOCHS {
-            for (step, reward) in rb
+            for (step, returns) in rb
                 .chunks(AGENT_OPTIM_BATCH_SIZE)
-                .zip(rewards.chunks(AGENT_OPTIM_BATCH_SIZE))
+                .zip(returns.chunks(AGENT_OPTIM_BATCH_SIZE))
             {
-                let nbatch = reward.len();
-                let reward = self
+                let nbatch = returns.len();
+                let returns = self
                     .device
-                    .tensor_from_vec(reward.to_vec(), (nbatch, Const::<1>));
+                    .tensor_from_vec(returns.to_vec(), (nbatch, Const::<1>));
                 let s = step
                     .iter()
                     .map(|step| {
@@ -436,15 +441,7 @@ impl Thinker for PpoThinker {
                     .collect::<Vec<FTensor<Rank1<1>>>>()
                     .stack();
 
-                // let (old_mu, old_std) = self.target_actor.forward(s.clone());
-                // let old_val = self.target_critic.forward(s.clone());
-                // let old_val = old_val
-                //     .slice((0..nbatch, N_FRAME_STACK - 1..N_FRAME_STACK, 0..1))
-                //     .reshape_like(&(nbatch, Const));
-
-                // let (old_lp, _old_entropy) =
-                //     mvn_batch_log_prob(old_mu, old_std.square(), a.clone());
-                let advantage = (-old_val) + reward.clone();
+                let advantage = returns.clone() - old_val;
 
                 let (mu, std) = self.actor.forward(s.trace(actor_grads));
                 let val = self.critic.forward(s.trace(critic_grads));
@@ -457,11 +454,11 @@ impl Thinker for PpoThinker {
                 let surr1 = ratio.with_empty_tape() * advantage.clone();
                 let surr2 = ratio.clamp(0.8, 1.2) * advantage;
                 let policy_loss = -(surr2.minimum(surr1).mean());
-                let value_loss = (val - reward).square().mean();
-                total_val_loss += value_loss.array();
-                total_pi_loss += policy_loss.array();
+                let value_loss = (val - returns).square().mean();
+                total_val_loss += value_loss.array() * nbatch as f32;
+                total_pi_loss += policy_loss.array() * nbatch as f32;
                 let entropy_loss = entropy.mean() * 1e-5;
-                total_entropy_loss += entropy_loss.array();
+                total_entropy_loss += entropy_loss.array() * nbatch as f32;
                 let policy_loss = policy_loss - entropy_loss;
 
                 actor_grads = policy_loss.backward();

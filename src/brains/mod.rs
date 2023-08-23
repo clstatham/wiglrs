@@ -31,7 +31,7 @@ impl FrameStack {
     pub fn push(&mut self, s: Observation) {
         #[allow(clippy::reversed_empty_ranges)]
         for i in 0..N_FRAME_STACK - 1 {
-            self.0[i] = self.0[i + 1];
+            self.0[i] = self.0[i + 1].clone();
         }
         self.0[N_FRAME_STACK - 1] = s;
     }

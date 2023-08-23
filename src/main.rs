@@ -39,14 +39,14 @@ pub struct OtherState {
 
 pub const OTHER_STATE_LEN: usize = 6;
 
-#[derive(Default, Clone, Copy, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Observation {
     pub pos: Vec2,
     pub linvel: Vec2,
     pub direction: Vec2,
     // pub dt: f32,
     pub health: f32,
-    pub other_states: [OtherState; NUM_AGENTS - 1],
+    pub other_states: Vec<OtherState>,
 }
 
 pub const OBS_LEN: usize = OTHER_STATE_LEN * (NUM_AGENTS - 1) + 7;
@@ -102,9 +102,9 @@ pub const ACTION_LEN: usize = 4;
 impl Action {
     pub fn from_slice(action: &[f32], metadata: Option<ActionMetadata>) -> Self {
         Self {
-            lin_force: Vec2::new(action[0], action[1]),
-            ang_force: action[2],
-            shoot: action[3],
+            lin_force: Vec2::new(action[0], action[1]).clamp(Vec2::splat(-1.0), Vec2::splat(1.0)),
+            ang_force: action[2].clamp(-1.0, 1.0),
+            shoot: action[3].clamp(-1.0, 1.0),
             metadata,
         }
     }
@@ -452,7 +452,7 @@ fn update(
             linvel: velocity.linvel,
             direction: transform.local_y().xy(),
             health: health.get_component::<Health>(agent).unwrap().0,
-            other_states: [OtherState::default(); NUM_AGENTS - 1],
+            other_states: vec![OtherState::default(); NUM_AGENTS - 1],
         };
 
         for (i, (_, _, other_vel, other_transform)) in agents
@@ -474,7 +474,7 @@ fn update(
             my_state.other_states[i] = other_state;
         }
 
-        all_states.insert(agent, my_state);
+        all_states.insert(agent, my_state.clone());
         let action = brains
             .get_mut(&agent)
             .unwrap()
@@ -552,11 +552,8 @@ fn update(
                 }
             }
 
-            force.force = all_actions[&agent]
-                .lin_force
-                .clamp(Vec2::splat(-1.0), Vec2::splat(1.0))
-                * AGENT_LIN_MOVE_FORCE;
-            force.torque = all_actions[&agent].ang_force.clamp(-1.0, 1.0) * AGENT_ANG_MOVE_FORCE;
+            force.force = all_actions[&agent].lin_force * AGENT_LIN_MOVE_FORCE;
+            force.torque = all_actions[&agent].ang_force * AGENT_ANG_MOVE_FORCE;
         }
     }
 
