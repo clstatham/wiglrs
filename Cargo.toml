@@ -23,7 +23,7 @@ postcard = { version = "1.0.6", default-features = false, features = ["alloc"] }
 kdam = { version = "0.4.1", features = ["rich"] }
 burn = { path = "./burn/burn" }
 burn-autodiff = { path = "./burn/burn-autodiff" }
-burn-tch = { path = "./burn/burn-tch" }
+burn-wgpu = { path = "./burn/burn-wgpu" }
 burn-tensor = { path = "./burn/burn-tensor" }
 
 [profile.dev.package."*"]

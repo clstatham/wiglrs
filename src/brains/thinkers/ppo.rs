@@ -9,8 +9,8 @@ use burn::{
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
 };
-use burn_tch::TchBackend;
 use burn_tensor::{backend::ADBackend, TensorKind};
+use burn_wgpu::{AutoGraphicsApi, WgpuBackend};
 
 use std::ops::{Add, Mul};
 use std::{collections::VecDeque, marker::PhantomData};
@@ -25,7 +25,7 @@ use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::Thinker;
 
-pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
+pub type Be = burn_autodiff::ADBackendDecorator<burn_wgpu::WgpuBackend<AutoGraphicsApi, f32, i32>>;
 
 pub struct MvNormal<const K: usize, B: Backend> {
     pub mu: Tensor<B, 1>,
@@ -267,8 +267,8 @@ impl<B: Backend> PpoCritic<B> {
 pub struct PpoThinker {
     actor: PpoActor<Be>,
     critic: PpoCritic<Be>,
-    actor_optim: OptimizerAdaptor<Sgd<TchBackend<f32>>, PpoActor<Be>, Be>,
-    critic_optim: OptimizerAdaptor<Sgd<TchBackend<f32>>, PpoCritic<Be>, Be>,
+    actor_optim: OptimizerAdaptor<Sgd<WgpuBackend<AutoGraphicsApi, f32, i32>>, PpoActor<Be>, Be>,
+    critic_optim: OptimizerAdaptor<Sgd<WgpuBackend<AutoGraphicsApi, f32, i32>>, PpoCritic<Be>, Be>,
     pub recent_mu: Vec<f32>,
     pub recent_std: Vec<f32>,
     pub recent_entropy: f32,
@@ -327,7 +327,7 @@ impl Thinker for PpoThinker {
         self.recent_std = std.to_data().value;
         let mu = mu.squeeze(0);
         let std = std.squeeze(0);
-        let dist: MvNormal<ACTION_LEN, TchBackend<f32>> = MvNormal {
+        let dist: MvNormal<ACTION_LEN, _> = MvNormal {
             mu,
             cov_diag: std.clone() * std,
         };
