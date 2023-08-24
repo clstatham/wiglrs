@@ -9,8 +9,8 @@ use burn::{
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
 };
+use burn_tch::{TchBackend, TchDevice};
 use burn_tensor::{backend::ADBackend, TensorKind};
-use burn_wgpu::{AutoGraphicsApi, WgpuBackend};
 
 use std::ops::{Add, Mul};
 use std::{collections::VecDeque, marker::PhantomData};
@@ -25,7 +25,7 @@ use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::Thinker;
 
-pub type Be = burn_autodiff::ADBackendDecorator<burn_wgpu::WgpuBackend<AutoGraphicsApi, f32, i32>>;
+pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
 
 pub struct MvNormal<const K: usize, B: Backend> {
     pub mu: Tensor<B, 1>,
@@ -59,7 +59,8 @@ where
                 .map(|f| (*f).into())
                 .collect::<Vec<_>>()
                 .as_slice(),
-        );
+        )
+        .to_device(&self.mu.device());
         self.mu.clone() + x
     }
 
@@ -85,7 +86,8 @@ where
                 .collect::<Vec<_>>()
                 .as_slice(),
         )
-        .reshape([K, K]);
+        .reshape([K, K])
+        .to_device(&self.mu.device());
         let c = ((-self.mu).add(x)).reshape([K, 1]);
         let g = cov_mat.determinant();
         let d = a.matmul(b);
@@ -120,10 +122,11 @@ fn mvn_batch_log_prob<const K: usize>(
     let nbatch = x.shape().dims[0];
     assert_eq!(mu.shape().dims[0], nbatch);
     assert_eq!(var.shape().dims[0], nbatch);
+    let x = x.to_device(&mu.device());
     let mut out_lp = vec![];
     let mut out_e = vec![];
     for i in 0..nbatch {
-        let idx = Tensor::from_ints([i as i32]);
+        let idx = Tensor::from_ints([i as i32]).to_device(&mu.device());
         let mu = mu.clone().select(0, idx.clone()).squeeze(0);
         let var = var.clone().select(0, idx.clone()).squeeze(0);
         let x = x.clone().select(0, idx.clone()).squeeze(0);
@@ -135,7 +138,7 @@ fn mvn_batch_log_prob<const K: usize>(
     }
     (
         Tensor::cat(out_lp, 0),
-        Tensor::from_floats(out_e.as_slice()),
+        Tensor::from_floats(out_e.as_slice()).to_device(&mu.device()),
     )
 }
 
@@ -196,6 +199,7 @@ impl PpoActorConfig {
 }
 impl<B: Backend> PpoActor<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let x = x.to_device(&self.devices()[0]);
         let x = self.com1.forward(x);
         let x = self.relu.forward(x);
         let x = self.com2.forward(x);
@@ -250,6 +254,7 @@ impl PpoCriticConfig {
 
 impl<B: Backend> PpoCritic<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 1> {
+        let x = x.to_device(&self.devices()[0]);
         let x = self.lin1.forward(x);
         let x = self.relu.forward(x);
         let x = self.lin2.forward(x);
@@ -267,8 +272,8 @@ impl<B: Backend> PpoCritic<B> {
 pub struct PpoThinker {
     actor: PpoActor<Be>,
     critic: PpoCritic<Be>,
-    actor_optim: OptimizerAdaptor<Sgd<WgpuBackend<AutoGraphicsApi, f32, i32>>, PpoActor<Be>, Be>,
-    critic_optim: OptimizerAdaptor<Sgd<WgpuBackend<AutoGraphicsApi, f32, i32>>, PpoCritic<Be>, Be>,
+    actor_optim: OptimizerAdaptor<Sgd<TchBackend<f32>>, PpoActor<Be>, Be>,
+    critic_optim: OptimizerAdaptor<Sgd<TchBackend<f32>>, PpoCritic<Be>, Be>,
     pub recent_mu: Vec<f32>,
     pub recent_std: Vec<f32>,
     pub recent_entropy: f32,
@@ -284,12 +289,14 @@ impl PpoThinker {
             hidden_len: AGENT_HIDDEN_DIM,
             action_len: ACTION_LEN,
         }
-        .init();
+        .init()
+        .to_device(&TchDevice::Cuda(0));
         let critic = PpoCriticConfig {
             obs_len: OBS_LEN,
             hidden_len: AGENT_HIDDEN_DIM,
         }
-        .init();
+        .init()
+        .to_device(&TchDevice::Cuda(0));
         let actor_optim = SgdConfig::new().init();
         let critic_optim = SgdConfig::new().init();
         Self {
@@ -379,7 +386,7 @@ impl Thinker for PpoThinker {
                 position = 1
             ) {
                 let nbatch = returns.len();
-                let returns = Tensor::from_floats(returns);
+                let returns = Tensor::from_floats(returns).to_device(&self.actor.devices()[0]);
                 let s = step
                     .iter()
                     .map(|step| {
@@ -403,25 +410,27 @@ impl Thinker for PpoThinker {
                     .iter()
                     .map(|step| step.action.metadata.unwrap().logp)
                     .collect::<Vec<_>>();
-                let old_lp = Tensor::from_floats(old_lp.as_slice());
+                let old_lp =
+                    Tensor::from_floats(old_lp.as_slice()).to_device(&self.actor.devices()[0]);
                 let old_val = step
                     .iter()
                     .map(|step| step.action.metadata.unwrap().val)
                     .collect::<Vec<_>>();
-                let old_val: Tensor<_, 1> = Tensor::from_floats(old_val.as_slice());
+                let old_val: Tensor<_, 1> =
+                    Tensor::from_floats(old_val.as_slice()).to_device(&self.actor.devices()[0]);
 
                 let advantage = returns.clone() - old_val;
+
                 let s = s.require_grad();
                 let (mu, std) = self.actor.forward(s.clone());
-                // assert!(mu.is_require_grad());
-                // assert!(std.is_require_grad());
-
-                // assert!(val.is_require_grad());
-
                 let (lp, entropy) = mvn_batch_log_prob::<ACTION_LEN>(mu, std.clone() * std, a);
                 let ratio = (lp - old_lp).exp();
                 let surr1 = ratio.clone() * advantage.clone();
-                let surr2 = ratio.clamp(0.8, 1.2) * advantage;
+                let clamp = ratio
+                    .clone()
+                    .mask_fill(ratio.clone().lower_elem(0.8), 0.8)
+                    .mask_fill(ratio.greater_elem(1.2), 1.2);
+                let surr2 = clamp * advantage;
                 let masked = surr2.clone().mask_where(surr2.lower(surr1.clone()), surr1);
                 let policy_loss = -masked.mean();
 
@@ -456,14 +465,14 @@ impl Thinker for PpoThinker {
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-        self.actor.clone().save_file(
-            path.as_ref().join("actor.bin.gz"),
-            &BinGzFileRecorder::<FullPrecisionSettings>::new(),
-        )?;
-        self.critic.clone().save_file(
-            path.as_ref().join("critic.bin.gz"),
-            &BinGzFileRecorder::<FullPrecisionSettings>::new(),
-        )?;
+        // self.actor.clone().save_file(
+        //     path.as_ref().join("actor.bin.gz"),
+        //     &BinGzFileRecorder::<FullPrecisionSettings>::new(),
+        // )?;
+        // self.critic.clone().save_file(
+        //     path.as_ref().join("critic.bin.gz"),
+        //     &BinGzFileRecorder::<FullPrecisionSettings>::new(),
+        // )?;
         Ok(())
     }
 }
