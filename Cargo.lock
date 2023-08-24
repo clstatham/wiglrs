@@ -1229,9 +1229,7 @@ checksum = "a3e2c3daef883ecc1b5d58c15adae93470a91d425f3532ba1695849656af3fc1"
 
 [[package]]
 name = "burn"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87940584409e18d053f2d0cee015993f55588c8cd0a3216b189cc4b8d30571ee"
+version = "0.9.0"
 dependencies = [
  "burn-core",
  "burn-train",
@@ -1239,9 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "burn-autodiff"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2513e7b559fd1042204a0bf2a4aeedd1f89d968d5474e0643fb1bfff60501114"
+version = "0.9.0"
 dependencies = [
  "burn-common",
  "burn-tensor",
@@ -1252,9 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "burn-common"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7af5b6e414f20bd4f718585a1e4fcd5b03347edad65ede3e6f4bb26c4a1a30a"
+version = "0.9.0"
 dependencies = [
  "const-random",
  "rand",
@@ -1264,9 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "burn-core"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce665fd8eeb9f69ef68de54853aeb254e0597e1cf52444ddb78d8a2a5ca26234"
+version = "0.9.0"
 dependencies = [
  "bincode",
  "burn-autodiff",
@@ -1289,9 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "burn-dataset"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a026d10e44c5f375bfd113c865f305449ac5cda987cced04a461db79cf9a291"
+version = "0.9.0"
 dependencies = [
  "csv",
  "derive-new",
@@ -1315,9 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "burn-derive"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86b9170bf2cf6e1375db8cc5f7222ed9fd7c172d82450a5d53fcff3b2f3e694a"
+version = "0.9.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1326,9 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "burn-tch"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de60f9841be898fdcefb212ba6de8e1ec2bdaa3b28d6f132e8dde0f838af2dce"
+version = "0.9.0"
 dependencies = [
  "burn-tensor",
  "half",
@@ -1339,9 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "burn-tensor"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90436d5f70be24d538bb54f45f0724da80d737b4a8c5d07a0dabc2290156dd55"
+version = "0.9.0"
 dependencies = [
  "derive-new",
  "half",
@@ -1355,9 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "burn-tensor-testgen"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e208e3a9016679cd6b5217a141c4854b43babdaa5bc9671754cb03a5fe62201"
+version = "0.9.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1366,9 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "burn-train"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "913717358438caff0468ee61313318f8ab92da258c7a6250d23f52dd48329c35"
+version = "0.9.0"
 dependencies = [
  "burn-core",
  "derive-new",
@@ -1378,6 +1358,8 @@ dependencies = [
  "nvml-wrapper",
  "rgb",
  "serde",
+ "sysinfo",
+ "systemstat",
  "terminal_size",
  "textplots",
 ]
@@ -1413,6 +1395,12 @@ name = "bytes"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89b2fd2a0dcf38d7971e2194b6b6eebab45ae01067456a7fd93d5547a61b70be"
+
+[[package]]
+name = "bytesize"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3e368af43e418a04d52505cf3dbc23dda4e3407ae2fa99fd0e4f308ce546acc"
 
 [[package]]
 name = "bzip2"
@@ -2225,6 +2213,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "faster-hex"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9042d281a5eec0f2387f8c3ea6c4514e2cf2732c90a85aaf383b761ee3b290d"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "fastrand"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2455,9 +2452,9 @@ checksum = "b6c80984affa11d98d1b88b66ac8853f143217b399d3c74116778ff8fdb4ed2e"
 
 [[package]]
 name = "gix-features"
-version = "0.32.1"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882695cccf38da4c3cc7ee687bdb412cf25e37932d7f8f2c306112ea712449f1"
+checksum = "7f77decb545f63a52852578ef5f66ecd71017ffc1983d551d5fa2328d6d9817f"
 dependencies = [
  "gix-hash",
  "gix-trace",
@@ -2466,28 +2463,28 @@ dependencies = [
 
 [[package]]
 name = "gix-fs"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d5b6e9d34a2c61ea4a02bbca94c409ab6dbbca1348cbb67298cd7fed8758761"
+checksum = "53d5089f3338647776733a75a800a664ab046f56f21c515fa4722e395f877ef8"
 dependencies = [
  "gix-features",
 ]
 
 [[package]]
 name = "gix-hash"
-version = "0.11.4"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b422ff2ad9a0628baaad6da468cf05385bf3f5ab495ad5a33cce99b9f41092f"
+checksum = "7d4796bac3aaf0c2f8bea152ca924ae3bdc5f135caefe6431116bcd67e98eab9"
 dependencies = [
- "hex",
+ "faster-hex",
  "thiserror",
 ]
 
 [[package]]
 name = "gix-tempfile"
-version = "7.0.2"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa28d567848cec8fdd77d36ad4f5f78ecfaba7d78f647d4f63c8ae1a2cec7243"
+checksum = "cea558d3daf3b1d0001052b12218c66c8f84788852791333b633d7eeb6999db1"
 dependencies = [
  "dashmap",
  "gix-fs",
@@ -2732,12 +2729,6 @@ name = "hermit-abi"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "443144c8cdadd93ebf52ddb4056d257f5b52c04d3c804e657d19eb73fc33668b"
-
-[[package]]
-name = "hex"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hexasphere"
@@ -4627,9 +4618,9 @@ dependencies = [
 
 [[package]]
 name = "sanitize-filename"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08c502bdb638f1396509467cb0580ef3b29aa2a45c5d43e5d84928241280296c"
+checksum = "2ed72fbaf78e6f2d41744923916966c4fbe3d7c74e3037a8ee482f1115572603"
 dependencies = [
  "lazy_static",
  "regex",
@@ -4989,6 +4980,21 @@ dependencies = [
  "libc",
  "ntapi",
  "once_cell",
+ "rayon",
+ "winapi",
+]
+
+[[package]]
+name = "systemstat"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a24aec24a9312c83999a28e3ef9db7e2afd5c64bf47725b758cdc1cafd5b0bd2"
+dependencies = [
+ "bytesize",
+ "lazy_static",
+ "libc",
+ "nom 7.1.3",
+ "time 0.3.27",
  "winapi",
 ]
 

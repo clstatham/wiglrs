@@ -290,13 +290,14 @@ impl PpoThinker {
             action_len: ACTION_LEN,
         }
         .init()
-        .to_device(&TchDevice::Cuda(0));
+        .fork(&TchDevice::Cuda(0));
+        dbg!(actor.devices());
         let critic = PpoCriticConfig {
             obs_len: OBS_LEN,
             hidden_len: AGENT_HIDDEN_DIM,
         }
         .init()
-        .to_device(&TchDevice::Cuda(0));
+        .fork(&TchDevice::Cuda(0));
         let actor_optim = SgdConfig::new().init();
         let critic_optim = SgdConfig::new().init();
         Self {
@@ -426,12 +427,12 @@ impl Thinker for PpoThinker {
                 let (lp, entropy) = mvn_batch_log_prob::<ACTION_LEN>(mu, std.clone() * std, a);
                 let ratio = (lp - old_lp).exp();
                 let surr1 = ratio.clone() * advantage.clone();
-                let clamp = ratio
-                    .clone()
-                    .mask_fill(ratio.clone().lower_elem(0.8), 0.8)
-                    .mask_fill(ratio.greater_elem(1.2), 1.2);
-                let surr2 = clamp * advantage;
-                let masked = surr2.clone().mask_where(surr2.lower(surr1.clone()), surr1);
+                // let clamp = ratio
+                //     .clone()
+                //     .mask_fill(ratio.clone().lower_elem(0.8), 0.8)
+                //     .mask_fill(ratio.greater_elem(1.2), 1.2);
+                let surr2 = ratio.clamp(0.8, 1.2) * advantage;
+                let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
                 let policy_loss = -masked.mean();
 
                 total_pi_loss += policy_loss.clone().into_scalar() * nbatch as f32;
@@ -465,14 +466,14 @@ impl Thinker for PpoThinker {
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-        // self.actor.clone().save_file(
-        //     path.as_ref().join("actor.bin.gz"),
-        //     &BinGzFileRecorder::<FullPrecisionSettings>::new(),
-        // )?;
-        // self.critic.clone().save_file(
-        //     path.as_ref().join("critic.bin.gz"),
-        //     &BinGzFileRecorder::<FullPrecisionSettings>::new(),
-        // )?;
+        self.actor.clone().save_file(
+            path.as_ref().join("actor.bin.gz"),
+            &BinGzFileRecorder::<FullPrecisionSettings>::new(),
+        )?;
+        self.critic.clone().save_file(
+            path.as_ref().join("critic.bin.gz"),
+            &BinGzFileRecorder::<FullPrecisionSettings>::new(),
+        )?;
         Ok(())
     }
 }
