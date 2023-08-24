@@ -5,7 +5,7 @@ pub const AGENT_CRITIC_LR: f64 = 1e-4;
 pub const AGENT_OPTIM_EPOCHS: usize = 5;
 pub const AGENT_OPTIM_BATCH_SIZE: usize = 64;
 
-pub const AGENT_RB_MAX_LEN: usize = 10_000 + 1; // add one for the initial state
+pub const AGENT_RB_MAX_LEN: usize = 100_000 + 1; // add one for the initial state
 pub const N_FRAME_STACK: usize = 1;
 
 pub const AGENT_RADIUS: f32 = 20.0;

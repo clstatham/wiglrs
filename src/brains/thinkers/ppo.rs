@@ -1,8 +1,19 @@
-use dfdx::nn::modules::Linear as ModLinear;
-use dfdx::optim::Adam;
-use dfdx::prelude::*;
-use std::collections::VecDeque;
+use burn::{
+    config::Config,
+    module::{ADModule, Module, ModuleMapper},
+    nn::{Linear, LinearConfig, ReLU},
+    optim::{
+        adaptor::OptimizerAdaptor, Adam, AdamConfig, GradientsParams, Optimizer, Sgd, SgdConfig,
+        SimpleOptimizer,
+    },
+    record::{BinGzFileRecorder, FullPrecisionSettings},
+    tensor::{backend::Backend, Tensor},
+};
+use burn_tch::TchBackend;
+use burn_tensor::{backend::ADBackend, TensorKind};
+
 use std::ops::{Add, Mul};
+use std::{collections::VecDeque, marker::PhantomData};
 
 use crate::brains::replay_buffer::ReplayBuffer;
 use crate::brains::FrameStack;
@@ -14,263 +25,250 @@ use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::Thinker;
 
-pub type Device = Cuda;
-type Float = f32;
-const PI: Float = std::f32::consts::PI;
-pub type FTensor<S, T = NoneTape> = Tensor<S, Float, Device, T>;
+pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
 
-pub struct MvNormal<
-    const K: usize,
-    D: dfdx::tensor_ops::Device<Float>,
-    T: Tape<Float, D> + Merge<NoneTape>,
-> {
-    pub mu: Tensor<Rank1<K>, Float, D, T>,
-    pub cov_diag: Tensor<Rank1<K>, Float, D, T>,
+pub struct MvNormal<const K: usize, B: Backend> {
+    pub mu: Tensor<B, 1>,
+    pub cov_diag: Tensor<B, 1>,
 }
 
-impl<const K: usize, D: dfdx::tensor_ops::Device<Float>> MvNormal<K, D, NoneTape> {
-    pub fn sample(&self) -> Tensor<Rank1<K>, Float, D, NoneTape> {
+impl<const K: usize, B: Backend> MvNormal<K, B>
+where
+    f32: std::convert::From<<B as Backend>::FloatElem>,
+{
+    pub fn sample(&self) -> Tensor<B, 1> {
+        use rand_distr::{Distribution, StandardNormal};
         let cov_mat = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
             K,
-            self.cov_diag.as_vec().into_iter(),
+            self.cov_diag
+                .to_data()
+                .value
+                .into_iter()
+                .map(|f| f32::from(f)),
         ));
         let a = cov_mat.cholesky().unwrap().unpack();
-        let z = self.mu.device().sample_normal::<Rank1<K>>();
-        let z = nalgebra::DVector::from_iterator(K, z.as_vec().into_iter());
-        let x = a.mul(&z);
-        let x = self.mu.device().tensor(x.data.as_vec().clone());
+        let z = nalgebra::DVector::from_iterator(
+            K,
+            (0..K).map(|_| StandardNormal.sample(&mut rand::thread_rng())),
+        );
+        let x = a * &z;
+        let x = Tensor::from_floats(
+            x.data
+                .as_slice()
+                .into_iter()
+                .map(|f| (*f).into())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
         self.mu.clone() + x
     }
-}
 
-impl<const K: usize, D: dfdx::tensor_ops::Device<Float>, T: Tape<Float, D>> MvNormal<K, D, T>
-where
-    T: Merge<NoneTape>,
-{
-    pub fn log_prob(self, x: Tensor<Rank1<K>, Float, D>) -> (Tensor<Rank1<1>, Float, D, T>, Float) {
+    pub fn log_prob(self, x: Tensor<B, 1>) -> Tensor<B, 1> {
         let cov_mat = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
             K,
-            self.cov_diag.as_vec().into_iter(),
+            self.cov_diag
+                .to_data()
+                .value
+                .into_iter()
+                .map(|f| f32::from(f)),
         ));
-        let a = (-self.mu.with_empty_tape())
-            .add(x.clone())
-            .broadcast::<Rank2<1, K>, _>();
-        let b = x.device().tensor_from_vec(
-            cov_mat.clone().try_inverse().unwrap().data.as_vec().clone(),
-            (Const::<K>, Const::<K>),
-        );
-        let c = ((-self.mu).add(x)).broadcast::<Rank2<K, 1>, _>();
+        let a = (-self.mu.clone()).add(x.clone()).reshape([1, K]);
+        let b = Tensor::from_floats(
+            cov_mat
+                .clone()
+                .try_inverse()
+                .unwrap()
+                .data
+                .as_slice()
+                .into_iter()
+                .map(|f| (*f).into())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+        .reshape([K, K]);
+        let c = ((-self.mu).add(x)).reshape([K, 1]);
         let g = cov_mat.determinant();
         let d = a.matmul(b);
         let e = d.matmul(c);
         let numer = (e * -0.5).exp();
-        let f = (2.0 * PI).powf(K as Float);
+        let f = (2.0 * std::f32::consts::PI).powf(K as f32);
         let denom = (f * g).sqrt();
         let pdf = numer / denom;
-        let logpdf = pdf.ln().reshape();
-        let entropy = (K as Float / 2.0) + ((K as Float / 2.0) * (2.0 * PI).ln()) + (g.ln() / 2.0);
-        (logpdf, entropy)
+        let logpdf = pdf.log();
+        logpdf.reshape([1])
     }
 
-    pub fn entropy(&self) -> Float {
+    pub fn entropy(&self) -> f32 {
         let cov_mat = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
             K,
-            self.cov_diag.as_vec().into_iter(),
+            self.cov_diag
+                .to_data()
+                .value
+                .into_iter()
+                .map(|f| f32::from(f)),
         ));
         let g = cov_mat.determinant();
-        (K as Float / 2.0) + ((K as Float / 2.0) * (2.0 * PI).ln()) + (g.ln() / 2.0)
+        (K as f32 / 2.0) + ((K as f32 / 2.0) * (2.0 * std::f32::consts::PI).ln()) + (g.ln() / 2.0)
     }
 }
 
-fn mvn_batch_log_prob<
-    const K: usize,
-    D: dfdx::tensor_ops::Device<Float>,
-    T: Tape<Float, D> + Merge<NoneTape>,
->(
-    mu: Tensor<(usize, Const<K>), Float, D, T>,
-    var: Tensor<(usize, Const<K>), Float, D, T>,
-    x: Tensor<(usize, Const<K>), Float, D>,
-) -> (
-    Tensor<(usize, Const<1>), Float, D, T>,
-    Tensor<(usize, Const<1>), Float, D>,
-) {
-    let nbatch = x.shape().0;
-    assert_eq!(mu.shape().0, nbatch);
-    assert_eq!(var.shape().0, nbatch);
+fn mvn_batch_log_prob<const K: usize>(
+    mu: Tensor<Be, 2>,
+    var: Tensor<Be, 2>,
+    x: Tensor<Be, 2>,
+) -> (Tensor<Be, 1>, Tensor<Be, 1>) {
+    let nbatch = x.shape().dims[0];
+    assert_eq!(mu.shape().dims[0], nbatch);
+    assert_eq!(var.shape().dims[0], nbatch);
     let mut out_lp = vec![];
     let mut out_e = vec![];
-    for i in 0..nbatch - 1 {
-        let idx = mu.device().tensor(i);
-        let mu = mu.with_empty_tape().select(idx.clone());
-        let var = var.with_empty_tape().select(idx.clone());
-        let x = x.with_empty_tape().select(idx.clone());
-        let dist = MvNormal { mu, cov_diag: var };
-        let (lp, e) = dist.log_prob(x);
+    for i in 0..nbatch {
+        let idx = Tensor::from_ints([i as i32]);
+        let mu = mu.clone().select(0, idx.clone()).squeeze(0);
+        let var = var.clone().select(0, idx.clone()).squeeze(0);
+        let x = x.clone().select(0, idx.clone()).squeeze(0);
+        let dist: MvNormal<ACTION_LEN, Be> = MvNormal { mu, cov_diag: var };
+        let e = dist.entropy();
+        let lp = dist.log_prob(x).unsqueeze();
         out_lp.push(lp);
         out_e.push(e);
     }
-    let dev = mu.device().clone();
-    let idx = mu.device().tensor(nbatch - 1);
-    let mu = mu.select(idx.clone());
-    let var = var.select(idx.clone());
-    let x = x.select(idx.clone());
-    let dist = MvNormal { mu, cov_diag: var };
-    let (lp, e) = dist.log_prob(x);
-    out_lp.push(lp);
-    out_e.push(e);
-    (out_lp.stack(), dev.tensor_from_vec(out_e, (nbatch, Const)))
+    (
+        Tensor::cat(out_lp, 0),
+        Tensor::from_floats(out_e.as_slice()),
+    )
 }
 
-fn softplus<
-    S: Shape,
-    E: Dtype + num_traits::Float,
-    D: dfdx::tensor_ops::Device<E>,
-    T: Tape<E, D>,
->(
-    input: Tensor<S, E, D, T>,
-) -> Tensor<S, E, D, T> {
-    input.exp().add(E::from(1.0).unwrap()).ln()
-}
+// fn softplus<
+//     S: Shape,
+//     E: Dtype + num_traits::Float,
+//     D: dfdx::tensor_ops::Device<E>,
+//     T: Tape<E, D>,
+// >(
+//     input: Tensor<S, E, D, T>,
+// ) -> Tensor<S, E, D, T> {
+//     input.exp().add(E::from(1.0).unwrap()).ln()
+// }
 
-#[derive(Clone)]
-struct PpoActor<
-    const OBS_LEN: usize,
-    const HIDDEN_DIM: usize,
-    const ACTION_LEN: usize,
-    E: Dtype,
-    D: dfdx::tensor_ops::Device<E>,
-> {
-    common: (
-        ModLinear<OBS_LEN, HIDDEN_DIM, E, D>,
-        ReLU,
-        ModLinear<HIDDEN_DIM, HIDDEN_DIM, E, D>,
-        ReLU,
-    ),
-    mu_head: (
-        ModLinear<HIDDEN_DIM, HIDDEN_DIM, E, D>,
-        ReLU,
-        ModLinear<HIDDEN_DIM, ACTION_LEN, E, D>,
-        Tanh,
-    ),
-    std_head: (
-        ModLinear<HIDDEN_DIM, HIDDEN_DIM, E, D>,
-        ReLU,
-        ModLinear<HIDDEN_DIM, ACTION_LEN, E, D>,
-    ),
-}
+pub struct FooMapper;
 
-impl<
-        const OBS_LEN: usize,
-        const HIDDEN_DIM: usize,
-        const ACTION_LEN: usize,
-        E: Dtype + num_traits::Float + rand_distr::uniform::SampleUniform,
-        D: dfdx::tensor_ops::Device<E>,
-    > TensorCollection<E, D> for PpoActor<OBS_LEN, HIDDEN_DIM, ACTION_LEN, E, D>
-{
-    type To<E2: Dtype, D2: dfdx::tensor_ops::Device<E2>> =
-        PpoActor<OBS_LEN, HIDDEN_DIM, ACTION_LEN, E2, D2>;
-
-    fn iter_tensors<V: ModuleVisitor<Self, E, D>>(
-        visitor: &mut V,
-    ) -> Result<Option<Self::To<V::E2, V::D2>>, V::Err> {
-        visitor.visit_fields(
-            (
-                Self::module("common", |s| &s.common, |s| &mut s.common),
-                Self::module("mu_head", |s| &s.mu_head, |s| &mut s.mu_head),
-                Self::module("std_head", |s| &s.std_head, |s| &mut s.std_head),
-            ),
-            |(c, mu, std)| Self::To {
-                common: c,
-                mu_head: mu,
-                std_head: std,
-            },
-        )
+impl ModuleMapper<Be> for FooMapper {
+    fn map<const D: usize>(
+        &mut self,
+        id: &burn::module::ParamId,
+        tensor: Tensor<Be, D>,
+    ) -> Tensor<Be, D> {
+        dbg!(tensor.is_require_grad());
+        tensor
     }
 }
 
-impl<
-        const OBS_LEN: usize,
-        const HIDDEN_DIM: usize,
-        const ACTION_LEN: usize,
-        E: Dtype + num_traits::Float,
-        D: dfdx::tensor_ops::Device<E>,
-        T: Tape<E, D>,
-    > Module<Tensor<(usize, Const<OBS_LEN>), E, D, T>>
-    for PpoActor<OBS_LEN, HIDDEN_DIM, ACTION_LEN, E, D>
-{
-    type Error = D::Err;
-    type Output = (
-        Tensor<(Const<ACTION_LEN>,), E, D, T>,
-        Tensor<(Const<ACTION_LEN>,), E, D, T>,
-    );
-    fn try_forward(
-        &self,
-        input: Tensor<(usize, Const<OBS_LEN>), E, D, T>,
-    ) -> Result<Self::Output, Self::Error> {
-        let nstack = input.shape().concrete()[0];
-        let x = self.common.try_forward(input)?;
-        let idx = x.device().tensor(nstack - 1);
-        let x = x.try_select(idx)?;
-        let std = self.std_head.try_forward(x.with_empty_tape())?;
-        let std = softplus(std);
-        let mu = self.mu_head.try_forward(x)?;
-        Ok((mu, std))
-    }
+#[derive(Module, Debug)]
+pub struct PpoActor<B: Backend> {
+    com1: Linear<B>,
+    com2: Linear<B>,
+    mu_head1: Linear<B>,
+    mu_head2: Linear<B>,
+    std_head1: Linear<B>,
+    std_head2: Linear<B>,
+    relu: ReLU,
 }
 
-impl<
-        const OBS_LEN: usize,
-        const HIDDEN_DIM: usize,
-        const ACTION_LEN: usize,
-        E: Dtype + num_traits::Float,
-        D: dfdx::tensor_ops::Device<E>,
-        T: Tape<E, D>,
-    > Module<Tensor<(usize, usize, Const<OBS_LEN>), E, D, T>>
-    for PpoActor<OBS_LEN, HIDDEN_DIM, ACTION_LEN, E, D>
-{
-    type Error = D::Err;
-    type Output = (
-        Tensor<(usize, Const<ACTION_LEN>), E, D, T>,
-        Tensor<(usize, Const<ACTION_LEN>), E, D, T>,
-    );
-    fn try_forward(
-        &self,
-        input: Tensor<(usize, usize, Const<OBS_LEN>), E, D, T>,
-    ) -> Result<Self::Output, Self::Error> {
-        let nbatch = input.shape().0;
-        let nstack = input.shape().1;
-        let x = self.common.try_forward(input)?;
+#[derive(Config, Debug)]
+pub struct PpoActorConfig {
+    obs_len: usize,
+    hidden_len: usize,
+    action_len: usize,
+}
+
+impl PpoActorConfig {
+    pub fn init<B: ADBackend>(&self) -> PpoActor<B> {
+        PpoActor {
+            com1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
+            com2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            mu_head1: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            mu_head2: LinearConfig::new(self.hidden_len, self.action_len).init(),
+            std_head1: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            std_head2: LinearConfig::new(self.hidden_len, self.action_len).init(),
+            relu: ReLU::new(),
+        }
+    }
+}
+impl<B: Backend> PpoActor<B> {
+    pub fn forward(&self, x: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let x = self.com1.forward(x);
+        let x = self.relu.forward(x);
+        let x = self.com2.forward(x);
+        let x = self.relu.forward(x);
+
+        let [nbatch, nstack, nhidden] = x.shape().dims;
+
         let x = x
-            .slice((0..nbatch, nstack - 1..nstack, 0..HIDDEN_DIM))
-            .reshape_like(&(nbatch, Const::<HIDDEN_DIM>));
-        let std = self.std_head.try_forward(x.with_empty_tape())?;
-        let std = softplus(std);
-        let mu = self.mu_head.try_forward(x)?;
-        Ok((mu, std))
+            .slice([0..nbatch, nstack - 1..nstack, 0..nhidden])
+            .squeeze(1);
+        let mu = self.mu_head1.forward(x.clone());
+        let mu = self.relu.forward(mu);
+        let mu = self.mu_head2.forward(mu);
+        let mu = mu.tanh();
+
+        let std = self.std_head1.forward(x);
+        let std = self.relu.forward(std);
+        let std = self.std_head2.forward(std);
+        // softplus
+        let std = (std.exp() + 1.0).log();
+
+        (mu, std)
     }
 }
 
-type PpoA = PpoActor<OBS_LEN, AGENT_HIDDEN_DIM, ACTION_LEN, Float, Device>;
+#[derive(Module, Debug)]
+pub struct PpoCritic<B: Backend> {
+    lin1: Linear<B>,
+    lin2: Linear<B>,
+    lin3: Linear<B>,
+    lin4: Linear<B>,
+    relu: ReLU,
+}
 
-#[rustfmt::skip]
-type PpoCritic = (
-    (Linear<OBS_LEN, AGENT_HIDDEN_DIM>, ReLU),
-    (Linear<AGENT_HIDDEN_DIM, AGENT_HIDDEN_DIM>, ReLU,),
-    (Linear<AGENT_HIDDEN_DIM, AGENT_HIDDEN_DIM>, ReLU,),
-    (Linear<AGENT_HIDDEN_DIM, 1>,),
-    //
-);
-type PpoC = <PpoCritic as BuildOnDevice<Device, Float>>::Built;
+#[derive(Debug, Config)]
+pub struct PpoCriticConfig {
+    obs_len: usize,
+    hidden_len: usize,
+}
+
+impl PpoCriticConfig {
+    pub fn init<B: ADBackend>(&self) -> PpoCritic<B> {
+        PpoCritic {
+            lin1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
+            lin2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            lin3: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            lin4: LinearConfig::new(self.hidden_len, 1).init(),
+            relu: ReLU::new(),
+        }
+    }
+}
+
+impl<B: Backend> PpoCritic<B> {
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 1> {
+        let x = self.lin1.forward(x);
+        let x = self.relu.forward(x);
+        let x = self.lin2.forward(x);
+        let x = self.relu.forward(x);
+        let x = self.lin3.forward(x);
+        let x = self.relu.forward(x);
+        let x = self.lin4.forward(x);
+        let [nbatch, nstack, nfeat] = x.shape().dims;
+        x.slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
+            .squeeze::<2>(1)
+            .squeeze(1)
+    }
+}
 
 pub struct PpoThinker {
-    actor: PpoA,
-    critic: PpoC,
-    actor_grads: Option<Gradients<Float, Device>>,
-    critic_grads: Option<Gradients<Float, Device>>,
-    actor_optim: Adam<PpoA, Float, Device>,
-    critic_optim: Adam<PpoC, Float, Device>,
-    device: Device,
-    cpu: Cpu,
+    actor: PpoActor<Be>,
+    critic: PpoCritic<Be>,
+    actor_optim: OptimizerAdaptor<Sgd<TchBackend<f32>>, PpoActor<Be>, Be>,
+    critic_optim: OptimizerAdaptor<Sgd<TchBackend<f32>>, PpoCritic<Be>, Be>,
     pub recent_mu: Vec<f32>,
     pub recent_std: Vec<f32>,
     pub recent_entropy: f32,
@@ -281,35 +279,24 @@ pub struct PpoThinker {
 
 impl PpoThinker {
     pub fn new() -> Self {
-        let device = Device::seed_from_u64(rand::random());
-        let actor = PpoA::build(&device);
-        let actor_grads = actor.alloc_grads();
-        let critic = device.build_module::<PpoCritic, Float>();
-        let critic_grads = critic.alloc_grads();
-
+        let actor = PpoActorConfig {
+            obs_len: OBS_LEN,
+            hidden_len: AGENT_HIDDEN_DIM,
+            action_len: ACTION_LEN,
+        }
+        .init();
+        let critic = PpoCriticConfig {
+            obs_len: OBS_LEN,
+            hidden_len: AGENT_HIDDEN_DIM,
+        }
+        .init();
+        let actor_optim = SgdConfig::new().init();
+        let critic_optim = SgdConfig::new().init();
         Self {
-            cpu: Cpu::seed_from_u64(rand::random()),
-            actor_optim: Adam::new(
-                &actor,
-                AdamConfig {
-                    lr: AGENT_ACTOR_LR,
-                    ..Default::default()
-                },
-            ),
             actor,
-            actor_grads: Some(actor_grads),
-            // target_actor,
-            critic_optim: Adam::new(
-                &critic,
-                AdamConfig {
-                    lr: AGENT_CRITIC_LR,
-                    ..Default::default()
-                },
-            ),
             critic,
-            critic_grads: Some(critic_grads),
-            // target_critic,
-            device,
+            actor_optim,
+            critic_optim,
             recent_mu: Vec::new(),
             recent_std: Vec::new(),
             recent_entropy: 0.0,
@@ -328,33 +315,31 @@ impl Default for PpoThinker {
 
 impl Thinker for PpoThinker {
     fn act(&mut self, obs: FrameStack) -> Action {
-        let obs: FTensor<(usize, Const<OBS_LEN>)> = (obs
+        let obs = obs
             .as_vec()
             .into_iter()
-            .map(|x| self.device.tensor(x.as_vec()))
-            .collect::<Vec<FTensor<Rank1<OBS_LEN>>>>())
-        .stack();
-        let (mu, std) = self.actor.forward(obs.clone());
-        let mu = mu.to_device(&self.cpu);
-        let std = std.to_device(&self.cpu);
-        self.recent_mu = mu.as_vec();
-        self.recent_std = std.as_vec();
-        let dist = MvNormal {
+            .map(|o| Tensor::from_floats(o.as_vec().as_slice()).unsqueeze::<2>())
+            .collect::<Vec<_>>();
+        let obs = Tensor::cat(obs, 0).unsqueeze();
+        let (mu, std) = self.actor.valid().forward(obs.clone());
+
+        self.recent_mu = mu.to_data().value;
+        self.recent_std = std.to_data().value;
+        let mu = mu.squeeze(0);
+        let std = std.squeeze(0);
+        let dist: MvNormal<ACTION_LEN, TchBackend<f32>> = MvNormal {
             mu,
-            cov_diag: std.square(),
+            cov_diag: std.clone() * std,
         };
         self.recent_entropy = dist.entropy();
         let action = dist.sample();
-        let val = self.critic.forward(obs);
-        let val = val
-            .slice((N_FRAME_STACK - 1..N_FRAME_STACK, 0..1))
-            .reshape_like(&(Const::<1>,));
+        let val = self.critic.valid().forward(obs);
 
         Action::from_slice(
-            action.as_vec().as_slice(),
+            action.to_data().value.as_slice(),
             Some(ActionMetadata {
-                logp: dist.log_prob(action).0.array()[0],
-                val: val.array()[0],
+                logp: dist.log_prob(action).to_data().value[0],
+                val: val.to_data().value[0],
             }),
         )
     }
@@ -368,25 +353,21 @@ impl Thinker for PpoThinker {
         let mut returns = VecDeque::new();
 
         for i in (0..nstep).rev() {
-            // if step.terminal {
-            //     discounted_reward = 0.0;
-            // }
-            // discounted_reward = step.reward + 0.99 * discounted_reward;
-            // rewards.push_front(discounted_reward);
             let mask = if rb.buf[i].terminal { 0.0 } else { 1.0 };
             let delta = rb.buf[i].reward + 0.99 * rb.buf[i + 1].action.metadata.unwrap().val * mask
                 - rb.buf[i].action.metadata.unwrap().val;
             gae = delta + 0.99 * 0.95 * mask * gae;
             returns.push_front(gae + rb.buf[i].action.metadata.unwrap().val);
         }
-        let returns = self.device.tensor_from_vec(returns.into(), (nstep,));
-        let returns = returns.normalize(1e-7).as_vec();
+        let returns: Vec<f32> = returns.into();
+
+        let returns: Tensor<Be, 1> = Tensor::from_floats(returns.as_slice());
+        let returns = (returns.clone() - returns.clone().mean()) / (returns.var(0) + 1e-7);
+        let returns = returns.to_data().value;
 
         let mut total_pi_loss = 0.0;
         let mut total_val_loss = 0.0;
         let mut total_entropy_loss = 0.0;
-        let mut actor_grads = self.actor_grads.take().unwrap();
-        let mut critic_grads = self.critic_grads.take().unwrap();
         let rb: Vec<_> = rb.buf.clone().into();
         for epoch in kdam::tqdm!(0..AGENT_OPTIM_EPOCHS, desc = "Training", position = 0) {
             let dsc = format!("Epoch {}", epoch + 1);
@@ -398,99 +379,91 @@ impl Thinker for PpoThinker {
                 position = 1
             ) {
                 let nbatch = returns.len();
-                let returns = self
-                    .device
-                    .tensor_from_vec(returns.to_vec(), (nbatch, Const::<1>));
+                let returns = Tensor::from_floats(returns);
                 let s = step
                     .iter()
                     .map(|step| {
-                        step.obs
-                            .as_vec()
-                            .into_iter()
-                            .map(|x| self.device.tensor(x.as_vec()))
-                            .collect::<Vec<FTensor<Rank1<OBS_LEN>>>>()
-                            .stack()
-                    })
-                    .collect::<Vec<FTensor<(usize, Const<OBS_LEN>)>>>()
-                    .stack();
-                let a = step
-                    .iter()
-                    .map(|step| {
-                        self.device.tensor(
-                            step.action
+                        Tensor::cat(
+                            step.obs
                                 .as_vec()
                                 .into_iter()
-                                .map(|x| x as Float)
-                                .collect::<Vec<Float>>(),
+                                .map(|x| Tensor::from_floats(x.as_vec().as_slice()).unsqueeze())
+                                .collect::<Vec<_>>(),
+                            1,
                         )
                     })
-                    .collect::<Vec<FTensor<Rank1<ACTION_LEN>>>>()
-                    .stack();
+                    .collect::<Vec<_>>();
+                let s: Tensor<Be, 3> = Tensor::cat(s, 0);
+                let a = step
+                    .iter()
+                    .map(|step| Tensor::from_floats(step.action.as_vec().as_slice()).unsqueeze())
+                    .collect::<Vec<_>>();
+                let a: Tensor<Be, 2> = Tensor::cat(a, 0);
                 let old_lp = step
                     .iter()
-                    .map(|step| {
-                        self.device
-                            .tensor(step.action.metadata.unwrap().logp)
-                            .broadcast()
-                    })
-                    .collect::<Vec<FTensor<Rank1<1>>>>()
-                    .stack();
+                    .map(|step| step.action.metadata.unwrap().logp)
+                    .collect::<Vec<_>>();
+                let old_lp = Tensor::from_floats(old_lp.as_slice());
                 let old_val = step
                     .iter()
-                    .map(|step| {
-                        self.device
-                            .tensor(step.action.metadata.unwrap().val)
-                            .broadcast()
-                    })
-                    .collect::<Vec<FTensor<Rank1<1>>>>()
-                    .stack();
+                    .map(|step| step.action.metadata.unwrap().val)
+                    .collect::<Vec<_>>();
+                let old_val: Tensor<_, 1> = Tensor::from_floats(old_val.as_slice());
 
                 let advantage = returns.clone() - old_val;
+                let s = s.require_grad();
+                let (mu, std) = self.actor.forward(s.clone());
+                // assert!(mu.is_require_grad());
+                // assert!(std.is_require_grad());
 
-                let (mu, std) = self.actor.forward(s.trace(actor_grads));
-                let val = self.critic.forward(s.trace(critic_grads));
-                let val = val
-                    .slice((0..nbatch, N_FRAME_STACK - 1..N_FRAME_STACK, 0..1))
-                    .reshape_like(&(nbatch, Const));
+                // assert!(val.is_require_grad());
 
-                let (lp, entropy) = mvn_batch_log_prob(mu, std.square(), a);
+                let (lp, entropy) = mvn_batch_log_prob::<ACTION_LEN>(mu, std.clone() * std, a);
                 let ratio = (lp - old_lp).exp();
-                let surr1 = ratio.with_empty_tape() * advantage.clone();
+                let surr1 = ratio.clone() * advantage.clone();
                 let surr2 = ratio.clamp(0.8, 1.2) * advantage;
-                let policy_loss = -(surr2.minimum(surr1).mean());
-                let value_loss = (val - returns).square().mean();
-                total_val_loss += value_loss.array() * nbatch as f32;
-                total_pi_loss += policy_loss.array() * nbatch as f32;
+                let masked = surr2.clone().mask_where(surr2.lower(surr1.clone()), surr1);
+                let policy_loss = -masked.mean();
+
+                total_pi_loss += policy_loss.clone().into_scalar() * nbatch as f32;
                 let entropy_loss = entropy.mean() * 1e-5;
-                total_entropy_loss += entropy_loss.array() * nbatch as f32;
+                total_entropy_loss += entropy_loss.clone().into_scalar() * nbatch as f32;
                 let policy_loss = policy_loss - entropy_loss;
 
-                actor_grads = policy_loss.backward();
-                self.actor_optim
-                    .update(&mut self.actor, &actor_grads)
-                    .unwrap();
-                self.actor.zero_grads(&mut actor_grads);
-
-                critic_grads = value_loss.backward();
-                self.critic_optim
-                    .update(&mut self.critic, &critic_grads)
-                    .unwrap();
-                self.critic.zero_grads(&mut critic_grads);
+                let actor_grads = policy_loss.backward();
+                self.actor = self.actor_optim.step(
+                    AGENT_ACTOR_LR,
+                    self.actor.clone(),
+                    GradientsParams::from_grads(actor_grads, &self.actor),
+                );
+                // self.actor.zero_grads(&mut actor_grads);
+                let val = self.critic.forward(s.require_grad());
+                let val_err = val - returns;
+                let value_loss = (val_err.clone() * val_err).mean();
+                total_val_loss += value_loss.clone().into_scalar() * nbatch as f32;
+                let critic_grads = value_loss.backward();
+                self.critic = self.critic_optim.step(
+                    AGENT_CRITIC_LR,
+                    self.critic.clone(),
+                    GradientsParams::from_grads(critic_grads, &self.critic),
+                );
             }
         }
         self.recent_policy_loss = total_pi_loss / nstep as f32;
         self.recent_value_loss = total_val_loss / nstep as f32;
         self.recent_entropy_loss = total_entropy_loss / nstep as f32;
-        self.actor_grads = Some(actor_grads);
-        self.critic_grads = Some(critic_grads);
         // rb.buf.clear();
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-        self.actor
-            .save_safetensors(path.as_ref().join("actor.safetensors"))?;
-        self.critic
-            .save_safetensors(path.as_ref().join("critic.safetensors"))?;
+        self.actor.clone().save_file(
+            path.as_ref().join("actor.bin.gz"),
+            &BinGzFileRecorder::<FullPrecisionSettings>::new(),
+        )?;
+        self.critic.clone().save_file(
+            path.as_ref().join("critic.bin.gz"),
+            &BinGzFileRecorder::<FullPrecisionSettings>::new(),
+        )?;
         Ok(())
     }
 }

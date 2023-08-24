@@ -7,7 +7,10 @@ use std::{
 
 use self::{
     replay_buffer::ReplayBuffer,
-    thinkers::{ppo::PpoThinker, Thinker},
+    thinkers::{
+        ppo::{Be, PpoThinker},
+        Thinker,
+    },
 };
 use crate::{
     hparams::{AGENT_RB_MAX_LEN, N_FRAME_STACK},
