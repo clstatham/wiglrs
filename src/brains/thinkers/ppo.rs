@@ -3,8 +3,8 @@ use burn::{
     module::{ADModule, Module, ModuleMapper},
     nn::{Linear, LinearConfig, ReLU},
     optim::{
-        adaptor::OptimizerAdaptor, Adam, AdamConfig, GradientsParams, Optimizer, Sgd, SgdConfig,
-        SimpleOptimizer,
+        adaptor::OptimizerAdaptor, momentum::MomentumConfig, Adam, AdamConfig, GradientsParams,
+        Optimizer, Sgd, SgdConfig, SimpleOptimizer,
     },
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -291,15 +291,22 @@ impl PpoThinker {
         }
         .init()
         .fork(&TchDevice::Cuda(0));
-        dbg!(actor.devices());
         let critic = PpoCriticConfig {
             obs_len: OBS_LEN,
             hidden_len: AGENT_HIDDEN_DIM,
         }
         .init()
         .fork(&TchDevice::Cuda(0));
-        let actor_optim = SgdConfig::new().init();
-        let critic_optim = SgdConfig::new().init();
+        let actor_optim = SgdConfig::new()
+            .with_momentum(Some(
+                MomentumConfig::new().with_momentum(0.9).with_nesterov(true),
+            ))
+            .init();
+        let critic_optim = SgdConfig::new()
+            .with_momentum(Some(
+                MomentumConfig::new().with_momentum(0.9).with_nesterov(true),
+            ))
+            .init();
         Self {
             actor,
             critic,
