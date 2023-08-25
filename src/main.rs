@@ -592,12 +592,14 @@ fn update(
 
     for (agent, _, _, _) in agents.iter() {
         let fs = brains.get(&agent).unwrap().fs.clone();
-        brains.get_mut(&agent).unwrap().rb.remember(SavedStep {
-            obs: fs,
-            action: all_actions.remove(&agent).unwrap(),
-            reward: all_rewards.remove(&agent).unwrap(),
-            terminal: all_terminals.remove(&agent).unwrap(),
-        });
+        for brain in brains.values_mut() {
+            brain.rb.remember(SavedStep {
+                obs: fs.clone(),
+                action: all_actions.get(&agent).unwrap().to_owned(),
+                reward: all_rewards.get(&agent).unwrap().to_owned(),
+                terminal: all_terminals.get(&agent).unwrap().to_owned(),
+            });
+        }
     }
 
     for agent in dead_agents {

@@ -32,89 +32,46 @@ use super::Thinker;
 pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
 
 pub struct MvNormal<const K: usize> {
-    pub mu: Tensor<Be, 1>,
-    pub cov_diag: Tensor<Be, 1>,
+    pub mu: Tensor<Be, 2>,
+    pub cov_diag: Tensor<Be, 2>,
 }
 
 impl<const K: usize> MvNormal<K> {
-    pub fn sample(&self) -> Tensor<Be, 1> {
+    pub fn sample(&self) -> Tensor<Be, 2> {
         let std = self.cov_diag.clone().sqrt();
-        let z = Tensor::random([K], burn_tensor::Distribution::Normal(0.0, 1.0))
+        let nbatch = self.mu.shape().dims[0];
+        let z = Tensor::random([nbatch, K], burn_tensor::Distribution::Normal(0.0, 1.0))
             .to_device(&self.mu.device());
         self.mu.clone() + z * std
     }
 
-    pub fn log_prob(self, x: Tensor<Be, 1>) -> Tensor<Be, 1> {
+    pub fn log_prob(self, x: Tensor<Be, 2>) -> Tensor<Be, 2> {
+        let x = x.to_device(&self.mu.device());
         let a = x.clone() - self.mu.clone();
         assert!(self.cov_diag.to_data().value.into_iter().all(|f| f > 0.0));
-        let mut det = Tensor::ones([1]).to_device(&self.cov_diag.device());
+        let nbatch = self.mu.shape().dims[0];
+        let mut det = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
         for i in 0..K {
-            det = det * self.cov_diag.clone().slice([i..i + 1]);
+            det = det * self.cov_diag.clone().slice([0..nbatch, i..i + 1]);
         }
         let d = a.clone() / self.cov_diag.clone();
-        let e = (d * a).sum();
-        let numer = (e * -0.5).exp().reshape([1]);
+        let e = (d * a).sum_dim(1);
+        let numer = (e * -0.5).exp().reshape([nbatch, 1]);
         let f = (2.0 * PI).powf(K as f32);
         let denom = (det * f).sqrt();
         let pdf = numer / denom;
         pdf.log()
     }
 
-    fn elementwise_log_prob(&self, x: Tensor<Be, 1>) -> Tensor<Be, 1> {
-        (-self.cov_diag.clone().log() * 0.5) + -0.5 * (2.0 * PI).ln()
-            - ((x.clone() - self.mu.clone()) * (x - self.mu.clone()))
-                / (self.cov_diag.clone() * 2.0)
-    }
-
-    pub fn clipped_log_prob(&self, x: Tensor<Be, 1>, low: f32, high: f32) -> Tensor<Be, 1> {
-        let elementwise_lp = self.elementwise_log_prob(x.clone());
-        let low = Tensor::full_device(x.shape(), low, &x.device());
-        let high = Tensor::full_device(x.shape(), high, &x.device());
-        let low_log_prob = self.elementwise_log_prob(low.clone());
-        let high_log_prob = self.elementwise_log_prob(-high.clone());
-        let clipped_elementwise_lp = elementwise_lp
-            .clone()
-            .mask_where(x.clone().lower_equal(low), low_log_prob)
-            .mask_where(x.clone().greater_equal(high), high_log_prob);
-        clipped_elementwise_lp.sum()
-    }
-
-    pub fn entropy(&self) -> Tensor<Be, 1> {
-        let mut g = Tensor::ones([1]).to_device(&self.cov_diag.device());
+    pub fn entropy(&self) -> Tensor<Be, 2> {
+        let nbatch = self.mu.shape().dims[0];
+        let mut g = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
         let two_pi_e_sigma = self.cov_diag.clone() * E * 2.0 * PI;
         for i in 0..K {
-            g = g * two_pi_e_sigma.clone().slice([i..i + 1]);
+            g = g * two_pi_e_sigma.clone().slice([0..nbatch, i..i + 1]);
         }
         g.log() * 0.5
     }
-}
-
-fn mvn_batch_log_prob<const K: usize>(
-    mu: Tensor<Be, 2>,
-    var: Tensor<Be, 2>,
-    x: Tensor<Be, 2>,
-) -> (Tensor<Be, 1>, Tensor<Be, 1>) {
-    let nbatch = x.shape().dims[0];
-    assert_eq!(mu.shape().dims[0], nbatch);
-    assert_eq!(var.shape().dims[0], nbatch);
-    let x = x.to_device(&mu.device());
-    let mut out_lp = vec![];
-    let mut out_e = vec![];
-    for i in 0..nbatch {
-        let idx = Tensor::from_ints([i as i32]).to_device(&mu.device());
-        let mu = mu.clone().select(0, idx.clone()).squeeze(0);
-        let var = var.clone().select(0, idx.clone()).squeeze(0);
-        let x = x.clone().select(0, idx.clone()).squeeze(0);
-        let dist: MvNormal<ACTION_LEN> = MvNormal { mu, cov_diag: var };
-        let e = dist.entropy();
-        let lp = dist.log_prob(x).unsqueeze();
-        out_lp.push(lp);
-        out_e.push(e);
-    }
-    (
-        Tensor::cat(out_lp, 0).to_device(&mu.device()),
-        Tensor::cat(out_e, 0).to_device(&mu.device()),
-    )
 }
 
 pub fn sigmoid<B: Backend, const ND: usize>(x: Tensor<B, ND>) -> Tensor<B, ND> {
@@ -398,8 +355,6 @@ impl Thinker for PpoThinker {
 
         self.recent_mu = mu.to_data().value;
         self.recent_std = std.to_data().value;
-        let mu = mu.squeeze(0);
-        let std = std.squeeze(0);
         let dist: MvNormal<ACTION_LEN> = MvNormal {
             mu,
             cov_diag: std.clone() * std,
@@ -452,7 +407,7 @@ impl Thinker for PpoThinker {
                 desc = dsc,
                 position = 1
             ) {
-                // let nbatch = returns.len();
+                let nbatch = returns.len();
                 let returns = Tensor::from_floats(returns).to_device(&self.actor.devices()[0]);
                 let s = step
                     .iter()
@@ -477,8 +432,9 @@ impl Thinker for PpoThinker {
                     .iter()
                     .map(|step| step.action.metadata.unwrap().logp)
                     .collect::<Vec<_>>();
-                let old_lp =
-                    Tensor::from_floats(old_lp.as_slice()).to_device(&self.actor.devices()[0]);
+                let old_lp = Tensor::from_floats(old_lp.as_slice())
+                    .to_device(&self.actor.devices()[0])
+                    .reshape([nbatch, 1]);
                 let old_val = step
                     .iter()
                     .map(|step| step.action.metadata.unwrap().val)
@@ -486,11 +442,17 @@ impl Thinker for PpoThinker {
                 let old_val: Tensor<_, 1> =
                     Tensor::from_floats(old_val.as_slice()).to_device(&self.actor.devices()[0]);
 
-                let advantage = returns.clone() - old_val;
+                let advantage = (returns.clone() - old_val).reshape([nbatch, 1]);
 
                 let s = s.require_grad();
                 let (mu, std) = self.actor.forward(s.clone());
-                let (lp, entropy) = mvn_batch_log_prob::<ACTION_LEN>(mu, std.clone() * std, a);
+                // let (lp, entropy) = mvn_batch_log_prob::<ACTION_LEN>(mu, std.clone() * std, a);
+                let dist = MvNormal::<ACTION_LEN> {
+                    mu,
+                    cov_diag: std.clone() * std,
+                };
+                let entropy = dist.entropy();
+                let lp = dist.log_prob(a);
                 let kl = (old_lp.clone() - lp.clone()).mean();
                 total_kl += kl.into_scalar();
                 let ratio = (lp - old_lp).exp();
