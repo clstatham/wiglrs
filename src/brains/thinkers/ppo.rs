@@ -2,8 +2,8 @@
 
 use burn::{
     config::Config,
-    module::Module,
-    nn::{Linear, LinearConfig, ReLU},
+    module::{Module, Param, ParamId},
+    nn::{Initializer, Linear, LinearConfig, ReLU},
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -17,11 +17,11 @@ use std::{
     f32::consts::{E, PI},
 };
 
-use crate::brains::replay_buffer::ReplayBuffer;
 use crate::brains::FrameStack;
 use crate::hparams::{
     AGENT_ACTOR_LR, AGENT_CRITIC_LR, AGENT_HIDDEN_DIM, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS,
 };
+use crate::{brains::replay_buffer::ReplayBuffer, hparams::N_FRAME_STACK};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::Thinker;
@@ -54,8 +54,7 @@ impl<const K: usize> MvNormal<K> {
         let f = (2.0 * PI).powf(K as f32);
         let denom = (det * f).sqrt();
         let pdf = numer / denom;
-        let logpdf = pdf.log();
-        logpdf.reshape([1])
+        pdf.log()
     }
 
     fn elementwise_log_prob(&self, x: Tensor<Be, 1>) -> Tensor<Be, 1> {
@@ -78,11 +77,6 @@ impl<const K: usize> MvNormal<K> {
     }
 
     pub fn entropy(&self) -> Tensor<Be, 1> {
-        // let cov_mat = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_iterator(
-        //     K,
-        //     self.cov_diag.to_data().value.into_iter().map(f32::from),
-        // ));
-        // let g = cov_mat.determinant();
         let mut g = Tensor::ones([1]).to_device(&self.cov_diag.device());
         let two_pi_e_sigma = self.cov_diag.clone() * E * 2.0 * PI;
         for i in 0..K {
@@ -120,10 +114,109 @@ fn mvn_batch_log_prob<const K: usize>(
     )
 }
 
+pub fn sigmoid<B: Backend, const ND: usize>(x: Tensor<B, ND>) -> Tensor<B, ND> {
+    x.ones_like() / (x.ones_like() + x.clone().neg().exp())
+}
+
+#[derive(Module, Debug)]
+pub struct Gru<B: Backend> {
+    w_xz: Param<Tensor<B, 2>>,
+    w_hz: Param<Tensor<B, 2>>,
+    b_z: Param<Tensor<B, 1>>,
+    w_xr: Param<Tensor<B, 2>>,
+    w_hr: Param<Tensor<B, 2>>,
+    b_r: Param<Tensor<B, 1>>,
+    w_xh: Param<Tensor<B, 2>>,
+    w_hh: Param<Tensor<B, 2>>,
+    b_h: Param<Tensor<B, 1>>,
+}
+
+#[derive(Config, Debug)]
+pub struct GruConfig {
+    input_len: usize,
+    hidden_len: usize,
+}
+
+impl GruConfig {
+    pub fn init<B: ADBackend>(&self) -> Gru<B> {
+        let initializer = Initializer::Normal {
+            mean: 0.0,
+            std: 0.01,
+        };
+        Gru {
+            w_xz: Param::new(
+                ParamId::new(),
+                initializer.init([self.input_len, self.hidden_len]),
+            ),
+            w_hz: Param::new(
+                ParamId::new(),
+                initializer.init([self.hidden_len, self.hidden_len]),
+            ),
+            b_z: Param::new(ParamId::new(), Tensor::zeros([self.hidden_len])),
+            w_xr: Param::new(
+                ParamId::new(),
+                initializer.init([self.input_len, self.hidden_len]),
+            ),
+            w_hr: Param::new(
+                ParamId::new(),
+                initializer.init([self.hidden_len, self.hidden_len]),
+            ),
+            b_r: Param::new(ParamId::new(), Tensor::zeros([self.hidden_len])),
+            w_xh: Param::new(
+                ParamId::new(),
+                initializer.init([self.input_len, self.hidden_len]),
+            ),
+            w_hh: Param::new(
+                ParamId::new(),
+                initializer.init([self.hidden_len, self.hidden_len]),
+            ),
+            b_h: Param::new(ParamId::new(), Tensor::zeros([self.hidden_len])),
+        }
+    }
+}
+
+impl<B: Backend> Gru<B> {
+    pub fn forward(
+        &self,
+        xs: Tensor<B, 3>,
+        h: Option<Tensor<B, 2>>,
+    ) -> (Tensor<B, 3>, Tensor<B, 2>) {
+        let dev = &self.devices()[0];
+        let [nbatch, nseq, nfeat] = xs.shape().dims;
+        let [nhidden] = self.b_h.shape().dims;
+        let mut h = h.unwrap_or(Tensor::zeros([nbatch, nhidden])).to_device(dev);
+        let mut outputs = Tensor::zeros([nbatch, nseq, nhidden]).to_device(dev);
+
+        for i in 0..nseq {
+            let x: Tensor<B, 2> = xs.clone().slice([0..nbatch, i..i + 1, 0..nfeat]).squeeze(1);
+            let z = sigmoid(
+                x.clone().matmul(self.w_xz.val())
+                    + h.clone().matmul(self.w_hz.val())
+                    + self.b_z.val().reshape([1, nhidden]),
+            );
+            let r = sigmoid(
+                x.clone().matmul(self.w_xr.val())
+                    + h.clone().matmul(self.w_hr.val())
+                    + self.b_r.val().reshape([1, nhidden]),
+            );
+            let h_tilde = (x.clone().matmul(self.w_xh.val())
+                + (r * h.clone()).matmul(self.w_hh.val())
+                + self.b_h.val().reshape([1, nhidden]))
+            .tanh();
+            h = z.clone() * h + (z.ones_like() - z) * h_tilde;
+            outputs = outputs.slice_assign(
+                [0..nbatch, i..i + 1, 0..nhidden],
+                h.clone().reshape([nbatch, 1, nhidden]),
+            );
+        }
+
+        (outputs, h)
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct PpoActor<B: Backend> {
-    com1: Linear<B>,
-    com2: Linear<B>,
+    rnn: Gru<B>,
     mu_head1: Linear<B>,
     mu_head2: Linear<B>,
     std_head1: Linear<B>,
@@ -141,8 +234,8 @@ pub struct PpoActorConfig {
 impl PpoActorConfig {
     pub fn init<B: ADBackend>(&self) -> PpoActor<B> {
         PpoActor {
-            com1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
-            com2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            rnn: GruConfig::new(self.obs_len, self.hidden_len).init(),
+            // rnn: LstmConfig::new(self.obs_len, self.hidden_len, true, batch_size)
             mu_head1: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
             mu_head2: LinearConfig::new(self.hidden_len, self.action_len).init(),
             std_head1: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
@@ -154,16 +247,8 @@ impl PpoActorConfig {
 impl<B: Backend> PpoActor<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let x = x.to_device(&self.devices()[0]);
-        let x = self.com1.forward(x);
-        let x = self.relu.forward(x);
-        let x = self.com2.forward(x);
-        let x = self.relu.forward(x);
+        let (_, x) = self.rnn.forward(x, None);
 
-        let [nbatch, nstack, nhidden] = x.shape().dims;
-
-        let x = x
-            .slice([0..nbatch, nstack - 1..nstack, 0..nhidden])
-            .squeeze(1);
         let mu = self.mu_head1.forward(x.clone());
         let mu = self.relu.forward(mu);
         let mu = self.mu_head2.forward(mu);
@@ -181,8 +266,7 @@ impl<B: Backend> PpoActor<B> {
 
 #[derive(Module, Debug)]
 pub struct PpoCritic<B: Backend> {
-    lin1: Linear<B>,
-    lin2: Linear<B>,
+    rnn: Gru<B>,
     lin3: Linear<B>,
     lin4: Linear<B>,
     relu: ReLU,
@@ -197,8 +281,7 @@ pub struct PpoCriticConfig {
 impl PpoCriticConfig {
     pub fn init<B: ADBackend>(&self) -> PpoCritic<B> {
         PpoCritic {
-            lin1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
-            lin2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            rnn: GruConfig::new(self.obs_len, self.hidden_len).init(),
             lin3: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
             lin4: LinearConfig::new(self.hidden_len, 1).init(),
             relu: ReLU::new(),
@@ -209,17 +292,13 @@ impl PpoCriticConfig {
 impl<B: Backend> PpoCritic<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 1> {
         let x = x.to_device(&self.devices()[0]);
-        let x = self.lin1.forward(x);
-        let x = self.relu.forward(x);
-        let x = self.lin2.forward(x);
-        let x = self.relu.forward(x);
+
+        let (_, x) = self.rnn.forward(x, None);
+
         let x = self.lin3.forward(x);
         let x = self.relu.forward(x);
         let x = self.lin4.forward(x);
-        let [nbatch, nstack, nfeat] = x.shape().dims;
-        x.slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
-            .squeeze::<2>(1)
-            .squeeze(1)
+        x.squeeze(1)
     }
 }
 
@@ -392,7 +471,6 @@ impl Thinker for PpoThinker {
                     .zeros_like()
                     .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
                 let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
-                // dbg!(nclamp.clone().mean().into_scalar());
                 total_nclamp += nclamp.mean().into_scalar();
 
                 let surr2 = ratio.clamp(0.8, 1.2) * advantage;
@@ -410,7 +488,6 @@ impl Thinker for PpoThinker {
                     self.actor.clone(),
                     GradientsParams::from_grads(actor_grads, &self.actor),
                 );
-                // self.actor.zero_grads(&mut actor_grads);
                 let val = self.critic.forward(s.require_grad());
                 let val_err = val - returns;
                 let value_loss = (val_err.clone() * val_err).mean();

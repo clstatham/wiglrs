@@ -39,17 +39,28 @@ pub struct OtherState {
 
 pub const OTHER_STATE_LEN: usize = 6;
 
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Observation {
     pub pos: Vec2,
     pub linvel: Vec2,
     pub direction: Vec2,
-    // pub dt: f32,
     pub health: f32,
     pub other_states: Vec<OtherState>,
 }
 
 pub const OBS_LEN: usize = OTHER_STATE_LEN * (NUM_AGENTS - 1) + 7;
+
+impl Default for Observation {
+    fn default() -> Self {
+        Self {
+            pos: Vec2::default(),
+            linvel: Vec2::default(),
+            direction: Vec2::default(),
+            health: 0.0,
+            other_states: vec![OtherState::default(); NUM_AGENTS - 1],
+        }
+    }
+}
 
 impl Observation {
     pub fn as_vec(&self) -> Vec<f32> {

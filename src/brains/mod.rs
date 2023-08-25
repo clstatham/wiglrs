@@ -29,11 +29,10 @@ impl Default for FrameStack {
 
 impl FrameStack {
     pub fn push(&mut self, s: Observation) {
-        #[allow(clippy::reversed_empty_ranges)]
-        for i in 0..N_FRAME_STACK - 1 {
-            self.0[i] = self.0[i + 1].clone();
+        if self.0.len() >= N_FRAME_STACK {
+            self.0.pop_front();
         }
-        self.0[N_FRAME_STACK - 1] = s;
+        self.0.push_back(s);
     }
 
     pub fn as_vec(&self) -> Vec<Observation> {

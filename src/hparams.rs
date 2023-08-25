@@ -6,7 +6,7 @@ pub const AGENT_OPTIM_EPOCHS: usize = 3;
 pub const AGENT_OPTIM_BATCH_SIZE: usize = 256;
 
 pub const AGENT_RB_MAX_LEN: usize = 1000;
-pub const N_FRAME_STACK: usize = 1;
+pub const N_FRAME_STACK: usize = 3;
 
 pub const AGENT_RADIUS: f32 = 20.0;
 pub const AGENT_LIN_MOVE_FORCE: f32 = 600.0;
