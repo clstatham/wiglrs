@@ -49,7 +49,7 @@ impl<const K: usize> MvNormal<K> {
         let x = x.to_device(&self.mu.device());
         let a = x.clone() - self.mu.clone();
         // assert!(self.cov_diag.to_data().value.into_iter().all(|f| f > 0.0));
-        let cov_diag = self.cov_diag.clone() + 1e-7;
+        let cov_diag = self.cov_diag.clone();
         let nbatch = self.mu.shape().dims[0];
         let mut det = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
         for i in 0..K {
@@ -61,6 +61,9 @@ impl<const K: usize> MvNormal<K> {
         let f = (2.0 * PI).powf(K as f32);
         let denom = (det * f).sqrt();
         let pdf = numer / denom;
+        let non_nans = pdf.clone().equal(pdf.clone()); // filter nans
+        let ones = pdf.ones_like();
+        let pdf = ones.mask_where(non_nans, pdf);
         pdf.log()
     }
 
