@@ -24,10 +24,7 @@ use crate::hparams::{
 };
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
-use super::{
-    stats::{cholesky, diag},
-    Thinker,
-};
+use super::Thinker;
 
 pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
 
@@ -38,13 +35,10 @@ pub struct MvNormal<const K: usize> {
 
 impl<const K: usize> MvNormal<K> {
     pub fn sample(&self) -> Tensor<Be, 1> {
-        let cov_mat = diag(self.cov_diag.clone());
-        let a = cholesky(cov_mat);
+        let std = self.cov_diag.clone().sqrt();
         let z = Tensor::random([K], burn_tensor::Distribution::Normal(0.0, 1.0))
-            .to_device(&self.mu.device())
-            .reshape([K, 1]);
-        let x = a.matmul(z).reshape([K]);
-        self.mu.clone() + x
+            .to_device(&self.mu.device());
+        self.mu.clone() + z * std
     }
 
     pub fn log_prob(self, x: Tensor<Be, 1>) -> Tensor<Be, 1> {
@@ -317,9 +311,6 @@ impl Thinker for PpoThinker {
 
     fn learn<const MAX_LEN: usize>(&mut self, rb: &mut ReplayBuffer<MAX_LEN>) {
         let nstep = rb.buf.len() - 1;
-        // if nstep < AGENT_RB_MAX_LEN - 1 {
-        //     return; // not enough data to train yet
-        // }
         let mut gae = 0.0;
         let mut returns = VecDeque::new();
 
@@ -353,7 +344,7 @@ impl Thinker for PpoThinker {
                 desc = dsc,
                 position = 1
             ) {
-                let nbatch = returns.len();
+                // let nbatch = returns.len();
                 let returns = Tensor::from_floats(returns).to_device(&self.actor.devices()[0]);
                 let s = step
                     .iter()

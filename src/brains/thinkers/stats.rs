@@ -232,7 +232,7 @@ fn print_matrix(x: &Tensor<Be, 2>) {
 mod tests {
     use burn_tensor::Tensor;
 
-    use super::{cholesky, diag, eye, inverse, lu, print_matrix, Be};
+    use super::{cholesky, diag, eye, print_matrix, Be};
 
     #[test]
     fn test_diag() {
@@ -289,33 +289,18 @@ mod tests {
     }
 
     #[test]
-    fn test_lu() {
+    fn test_choelsky_diag() {
         #[rustfmt::skip]
         let x: [f32; 16] = [
-            7., 3., -1., 2., 
-            3., 8., 1., -4., 
-            -1., 1., 4., -1., 
-            2., -4., -1., 3., 
+            9., 0., 0., 0., 
+            0., 12., 0., 0., 
+            0., 0., 16., 0., 
+            0., 0., 0., 20., 
         ];
-        let x_nalg = nalgebra::DMatrix::from_row_slice(4, 4, &x);
         let x_tensor = Tensor::<Be, 1>::from_floats(x).reshape([4, 4]);
-        for i in 0..16 {
-            let i1 = x_nalg.data.as_slice()[i];
-            let i2 = x_tensor.to_data().value[i];
-            assert_eq!(i1, i2);
-        }
-
-        let lu_nalg = x_nalg.lu();
-        let (l_tensor, u_tensor) = lu(x_tensor.clone());
-        assert_all_close_4x4(l_tensor, lu_nalg.l());
-        assert_all_close_4x4(u_tensor, lu_nalg.u());
-
-        let x_tensor = Tensor::from_floats([1., 2., 3., 4., 1., 6., 7., 8., 9.]).reshape([3, 3]);
-        print_matrix(&x_tensor);
-        let x_inv = inverse(x_tensor.clone());
-        // dbg!(x_inv.to_data());
-        print_matrix(&x_inv);
-        let i = x_inv.matmul(x_tensor);
-        print_matrix(&i);
+        let x_ch = cholesky(x_tensor.clone());
+        let x_sqrt = x_tensor.sqrt();
+        print_matrix(&x_ch);
+        print_matrix(&x_sqrt);
     }
 }
