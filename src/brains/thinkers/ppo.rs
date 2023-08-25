@@ -3,7 +3,10 @@
 use burn::{
     config::Config,
     module::{Module, Param, ParamId},
-    nn::{Initializer, Linear, LinearConfig, ReLU},
+    nn::{
+        transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
+        Initializer, Linear, LinearConfig,
+    },
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -237,12 +240,11 @@ impl<B: Backend> Gru<B> {
 
 #[derive(Module, Debug)]
 pub struct PpoActor<B: Backend> {
-    rnn: Gru<B>,
-    mu_head1: Linear<B>,
+    common: Gru<B>,
+    mu_head1: TransformerEncoder<B>,
     mu_head2: Linear<B>,
-    std_head1: Linear<B>,
+    std_head1: TransformerEncoder<B>,
     std_head2: Linear<B>,
-    relu: ReLU,
 }
 
 #[derive(Config, Debug)]
@@ -255,28 +257,34 @@ pub struct PpoActorConfig {
 impl PpoActorConfig {
     pub fn init<B: ADBackend>(&self) -> PpoActor<B> {
         PpoActor {
-            rnn: GruConfig::new(self.obs_len, self.hidden_len).init(),
-            // rnn: LstmConfig::new(self.obs_len, self.hidden_len, true, batch_size)
-            mu_head1: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            common: GruConfig::new(self.obs_len, self.hidden_len).init(),
+            mu_head1: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 2, 1).init(),
             mu_head2: LinearConfig::new(self.hidden_len, self.action_len).init(),
-            std_head1: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            std_head1: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 2, 1).init(),
             std_head2: LinearConfig::new(self.hidden_len, self.action_len).init(),
-            relu: ReLU::new(),
         }
     }
 }
 impl<B: Backend> PpoActor<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let x = x.to_device(&self.devices()[0]);
-        let (_, x) = self.rnn.forward(x, None);
 
-        let mu = self.mu_head1.forward(x.clone());
-        let mu = self.relu.forward(mu);
-        let mu = self.mu_head2.forward(mu);
-        let mu = mu.tanh();
+        let (x, _) = self.common.forward(x, None);
 
-        let std = self.std_head1.forward(x);
-        let std = self.relu.forward(std);
+        let mu = self
+            .mu_head1
+            .forward(TransformerEncoderInput::new(x.clone()));
+        let [nbatch, nstack, nfeat] = mu.shape().dims;
+        let mu = mu
+            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
+            .squeeze(1);
+        let mu = self.mu_head2.forward(mu).tanh();
+
+        let std = self.std_head1.forward(TransformerEncoderInput::new(x));
+        let [nbatch, nstack, nfeat] = std.shape().dims;
+        let std = std
+            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
+            .squeeze(1);
         let std = self.std_head2.forward(std);
         // softplus
         let std = (std.exp() + 1.0).log();
@@ -288,9 +296,8 @@ impl<B: Backend> PpoActor<B> {
 #[derive(Module, Debug)]
 pub struct PpoCritic<B: Backend> {
     rnn: Gru<B>,
-    lin3: Linear<B>,
-    lin4: Linear<B>,
-    relu: ReLU,
+    transformer: TransformerEncoder<B>,
+    head: Linear<B>,
 }
 
 #[derive(Debug, Config)]
@@ -303,9 +310,9 @@ impl PpoCriticConfig {
     pub fn init<B: ADBackend>(&self) -> PpoCritic<B> {
         PpoCritic {
             rnn: GruConfig::new(self.obs_len, self.hidden_len).init(),
-            lin3: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
-            lin4: LinearConfig::new(self.hidden_len, 1).init(),
-            relu: ReLU::new(),
+            transformer: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 2, 1)
+                .init(),
+            head: LinearConfig::new(self.hidden_len, 1).init(),
         }
     }
 }
@@ -313,12 +320,13 @@ impl PpoCriticConfig {
 impl<B: Backend> PpoCritic<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 1> {
         let x = x.to_device(&self.devices()[0]);
-
-        let (_, x) = self.rnn.forward(x, None);
-
-        let x = self.lin3.forward(x);
-        let x = self.relu.forward(x);
-        let x = self.lin4.forward(x);
+        let (x, _) = self.rnn.forward(x, None);
+        let x = self.transformer.forward(TransformerEncoderInput::new(x));
+        let [nbatch, nstack, nfeat] = x.shape().dims;
+        let x: Tensor<B, 2> = x
+            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
+            .squeeze(1);
+        let x = self.head.forward(x);
         x.squeeze(1)
     }
 }
