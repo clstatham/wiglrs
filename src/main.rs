@@ -10,7 +10,7 @@ use bevy::{
     core::FrameCount,
     math::Vec3Swizzles,
     prelude::*,
-    sprite::MaterialMesh2dBundle,
+    sprite::{Anchor, MaterialMesh2dBundle},
     window::{PresentMode, WindowMode},
     winit::WinitSettings,
 };
@@ -216,13 +216,59 @@ impl AgentBundle {
     }
 }
 
-fn check_rb_full(
+#[derive(Event)]
+struct TrainBrains;
+
+#[derive(Event)]
+struct DoneTraining;
+
+#[derive(Component)]
+struct TrainingText;
+
+fn check_train_brains(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut tx: EventWriter<TrainBrains>,
+    mut rx: EventReader<DoneTraining>,
+    text: Query<Entity, With<TrainingText>>,
+    frame_count: Res<FrameCount>,
+) {
+    if frame_count.0 as usize % AGENT_RB_MAX_LEN == AGENT_RB_MAX_LEN - 1 {
+        commands.spawn((
+            Text2dBundle {
+                text: Text::from_section(
+                    "Training...",
+                    TextStyle {
+                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                        font_size: 72.0,
+                        color: Color::YELLOW,
+                    },
+                ),
+                transform: Transform::from_translation(Vec3::splat(0.0)),
+                text_anchor: Anchor::Center,
+                ..Default::default()
+            },
+            TrainingText,
+        ));
+        tx.send(TrainBrains);
+    }
+    if rx.iter().next().is_some() {
+        if let Ok(ent) = text.get_single() {
+            commands.entity(ent).despawn();
+        }
+    }
+}
+
+fn train_brains(
     mut brains: NonSendMut<BrainBank>,
     mut log: ResMut<LogText>,
     frame_count: Res<FrameCount>,
+    mut rx: EventReader<TrainBrains>,
+    mut tx: EventWriter<DoneTraining>,
 ) {
-    for brain in brains.values_mut() {
-        if brain.rb.buf.len() >= AGENT_RB_MAX_LEN {
+    if rx.iter().next().is_some() {
+        for brain in brains.values_mut() {
+            // if brain.rb.buf.len() >= AGENT_RB_MAX_LEN {
             log.push(format!(
                 "{} {} replay buffer full, training for {} epochs...",
                 brain.id, brain.name, AGENT_OPTIM_EPOCHS
@@ -245,7 +291,9 @@ fn check_rb_full(
             //     brain.id, &brain.name, brain.thinker.recent_kl
             // ));
             brain.rb.buf.clear();
+            // }
         }
+        tx.send(DoneTraining);
     }
 }
 
@@ -728,8 +776,11 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(Update, update)
         .add_systems(Update, check_respawn_all)
-        .add_systems(Update, check_rb_full)
+        .add_systems(Update, check_train_brains)
+        .add_systems(Update, train_brains)
         .add_systems(Update, ui)
         .add_systems(Update, handle_input)
+        .add_event::<TrainBrains>()
+        .add_event::<DoneTraining>()
         .run();
 }
