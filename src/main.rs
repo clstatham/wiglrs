@@ -592,14 +592,14 @@ fn update(
 
     for (agent, _, _, _) in agents.iter() {
         let fs = brains.get(&agent).unwrap().fs.clone();
-        for brain in brains.values_mut() {
-            brain.rb.remember(SavedStep {
-                obs: fs.clone(),
-                action: all_actions.get(&agent).unwrap().to_owned(),
-                reward: all_rewards.get(&agent).unwrap().to_owned(),
-                terminal: all_terminals.get(&agent).unwrap().to_owned(),
-            });
-        }
+        // for brain in brains.values_mut() {
+        brains.get_mut(&agent).unwrap().rb.remember(SavedStep {
+            obs: fs.clone(),
+            action: all_actions.get(&agent).unwrap().to_owned(),
+            reward: all_rewards.get(&agent).unwrap().to_owned(),
+            terminal: all_terminals.get(&agent).unwrap().to_owned(),
+        });
+        // }
     }
 
     for agent in dead_agents {
@@ -712,7 +712,7 @@ fn main() {
             gravity: Vec2::ZERO,
             timestep_mode: TimestepMode::Fixed {
                 dt: 1.0 / 60.0,
-                substeps: 10,
+                substeps: 2,
             },
             ..Default::default()
         })
