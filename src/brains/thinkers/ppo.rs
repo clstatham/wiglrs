@@ -39,6 +39,8 @@ pub struct MvNormal<const K: usize> {
 impl<const K: usize> MvNormal<K> {
     pub fn sample(&self) -> Tensor<Be, 2> {
         let std = self.cov_diag.clone().sqrt();
+        let cov = std.to_data().value;
+        assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
         let z = Tensor::random([nbatch, K], burn_tensor::Distribution::Normal(0.0, 1.0))
             .to_device(&self.mu.device());
@@ -48,7 +50,8 @@ impl<const K: usize> MvNormal<K> {
     pub fn log_prob(self, x: Tensor<Be, 2>) -> Tensor<Be, 2> {
         let x = x.to_device(&self.mu.device());
         let a = x.clone() - self.mu.clone();
-        assert!(self.cov_diag.to_data().value.into_iter().all(|f| f > 0.0));
+        let cov = self.cov_diag.to_data().value;
+        assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let cov_diag = self.cov_diag.clone();
         let nbatch = self.mu.shape().dims[0];
         let mut det = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
@@ -69,6 +72,8 @@ impl<const K: usize> MvNormal<K> {
     }
 
     pub fn entropy(&self) -> Tensor<Be, 2> {
+        let cov = self.cov_diag.to_data().value;
+        assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
         let mut g = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
         let two_pi_e_sigma = self.cov_diag.clone() * E * 2.0 * PI;
@@ -220,9 +225,9 @@ impl PpoActorConfig {
     pub fn init<B: ADBackend>(&self) -> PpoActor<B> {
         PpoActor {
             common: GruConfig::new(self.obs_len, self.hidden_len).init(),
-            mu_head1: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 2, 1).init(),
+            mu_head1: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 1, 1).init(),
             mu_head2: LinearConfig::new(self.hidden_len, self.action_len).init(),
-            std_head1: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 2, 1).init(),
+            std_head1: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 1, 1).init(),
             std_head2: LinearConfig::new(self.hidden_len, self.action_len).init(),
         }
     }
@@ -249,7 +254,7 @@ impl<B: Backend> PpoActor<B> {
             .squeeze(1);
         let std = self.std_head2.forward(std);
         // softplus
-        let std = (std.exp() + 1.0).log() + 1e-5f32.sqrt();
+        let std: Tensor<B, 2> = (std.exp() + 1.0).log();
 
         (mu, std)
     }
@@ -272,7 +277,7 @@ impl PpoCriticConfig {
     pub fn init<B: ADBackend>(&self) -> PpoCritic<B> {
         PpoCritic {
             rnn: GruConfig::new(self.obs_len, self.hidden_len).init(),
-            transformer: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 2, 1)
+            transformer: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 1, 1)
                 .init(),
             head: LinearConfig::new(self.hidden_len, 1).init(),
         }
@@ -365,7 +370,7 @@ impl Thinker for PpoThinker {
             cov_diag: std.clone() * std,
         };
         self.recent_entropy = dist.entropy().into_scalar();
-        let action = dist.sample();
+        let action = dist.sample().clamp(-1.0, 1.0);
         let val = self.critic.forward(obs);
 
         Action::from_slice(
@@ -451,15 +456,15 @@ impl Thinker for PpoThinker {
 
                 let s = s.require_grad();
                 let (mu, std) = self.actor.forward(s.clone());
-                // let (lp, entropy) = mvn_batch_log_prob::<ACTION_LEN>(mu, std.clone() * std, a);
                 let dist = MvNormal::<ACTION_LEN> {
                     mu,
                     cov_diag: std.clone() * std,
                 };
                 let entropy = dist.entropy();
                 let lp = dist.log_prob(a);
-                let kl = (old_lp.clone() - lp.clone()).mean();
-                total_kl += kl.into_scalar();
+                // dbg!(old_lp.clone().to_data(), lp.clone().to_data());
+                // let kl = (old_lp.clone() - lp.clone()).mean();
+                // total_kl += kl.into_scalar();
                 let ratio = (lp - old_lp).exp();
                 let surr1 = ratio.clone() * advantage.clone();
                 let nclamp = ratio

@@ -235,10 +235,10 @@ fn check_rb_full(
                 "{} {} Policy Clamp Ratio: {}",
                 brain.id, &brain.name, brain.thinker.recent_nclamp
             ));
-            log.push(format!(
-                "{} {} Policy KL Divergence: {}",
-                brain.id, &brain.name, brain.thinker.recent_kl
-            ));
+            // log.push(format!(
+            //     "{} {} Policy KL Divergence: {}",
+            //     brain.id, &brain.name, brain.thinker.recent_kl
+            // ));
             brain.rb.buf.clear();
         }
     }

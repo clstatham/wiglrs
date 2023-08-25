@@ -117,8 +117,8 @@ impl Brain<PpoThinker> {
         );
         self.writer
             .add_scalar("PolicyClampRatio", self.thinker.recent_nclamp, frame_count);
-        self.writer
-            .add_scalar("PolicyKLDivergence", self.thinker.recent_kl, frame_count);
+        // self.writer
+        //     .add_scalar("PolicyKLDivergence", self.thinker.recent_kl, frame_count);
     }
 }
 
