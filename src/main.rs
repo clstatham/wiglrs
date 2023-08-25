@@ -13,14 +13,9 @@ use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 use brains::{
     replay_buffer::SavedStep,
-    thinkers::{
-        self,
-        ppo::{Be, PpoThinker},
-        Thinker,
-    },
+    thinkers::{self, ppo::PpoThinker, Thinker},
     Brain, BrainBank,
 };
-use burn::optim::Adam;
 use hparams::{
     AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_OPTIM_EPOCHS, AGENT_RADIUS,
     AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, NUM_AGENTS,

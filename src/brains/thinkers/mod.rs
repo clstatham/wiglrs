@@ -7,6 +7,7 @@ use crate::Action;
 use super::{replay_buffer::ReplayBuffer, FrameStack};
 
 pub mod ppo;
+pub mod stats;
 
 pub trait Thinker {
     fn act(&mut self, obs: FrameStack) -> Action;
