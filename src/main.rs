@@ -216,10 +216,17 @@ fn check_rb_full(
                 "{} {} Policy Loss: {}",
                 brain.id, &brain.name, brain.thinker.recent_policy_loss
             ));
-
             log.push(format!(
                 "{} {} Value Loss: {}",
                 brain.id, &brain.name, brain.thinker.recent_value_loss
+            ));
+            log.push(format!(
+                "{} {} Policy Clamp Ratio: {}",
+                brain.id, &brain.name, brain.thinker.recent_nclamp
+            ));
+            log.push(format!(
+                "{} {} Policy KL Divergence: {}",
+                brain.id, &brain.name, brain.thinker.recent_kl
             ));
             brain.rb.buf.clear();
         }

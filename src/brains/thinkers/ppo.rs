@@ -242,6 +242,8 @@ pub struct PpoThinker {
     pub recent_policy_loss: f32,
     pub recent_value_loss: f32,
     pub recent_entropy_loss: f32,
+    pub recent_nclamp: f32,
+    pub recent_kl: f32,
 }
 
 impl PpoThinker {
@@ -272,6 +274,8 @@ impl PpoThinker {
             recent_policy_loss: 0.0,
             recent_value_loss: 0.0,
             recent_entropy_loss: 0.0,
+            recent_nclamp: 0.0,
+            recent_kl: 0.0,
         }
     }
 }
@@ -337,6 +341,10 @@ impl Thinker for PpoThinker {
         let mut total_pi_loss = 0.0;
         let mut total_val_loss = 0.0;
         let mut total_entropy_loss = 0.0;
+        let mut total_nclamp = 0.0;
+        let mut total_kl = 0.0;
+        let total_batches =
+            (nstep as f32 / AGENT_OPTIM_BATCH_SIZE as f32).ceil() as usize * AGENT_OPTIM_EPOCHS;
         let rb: Vec<_> = rb.buf.clone().into();
         for epoch in kdam::tqdm!(0..AGENT_OPTIM_EPOCHS, desc = "Training", position = 0) {
             let dsc = format!("Epoch {}", epoch + 1);
@@ -386,19 +394,25 @@ impl Thinker for PpoThinker {
                 let s = s.require_grad();
                 let (mu, std) = self.actor.forward(s.clone());
                 let (lp, entropy) = mvn_batch_log_prob::<ACTION_LEN>(mu, std.clone() * std, a);
+                let kl = (old_lp.clone() - lp.clone()).mean();
+                total_kl += kl.into_scalar();
                 let ratio = (lp - old_lp).exp();
                 let surr1 = ratio.clone() * advantage.clone();
-                // let clamp = ratio
-                //     .clone()
-                //     .mask_fill(ratio.clone().lower_elem(0.8), 0.8)
-                //     .mask_fill(ratio.greater_elem(1.2), 1.2);
+                let nclamp = ratio
+                    .clone()
+                    .zeros_like()
+                    .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
+                let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
+                // dbg!(nclamp.clone().mean().into_scalar());
+                total_nclamp += nclamp.mean().into_scalar();
+
                 let surr2 = ratio.clamp(0.8, 1.2) * advantage;
                 let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
                 let policy_loss = -masked.mean();
 
-                total_pi_loss += policy_loss.clone().into_scalar() * nbatch as f32;
+                total_pi_loss += policy_loss.clone().into_scalar();
                 let entropy_loss = entropy.mean() * 1e-3;
-                total_entropy_loss += entropy_loss.clone().into_scalar() * nbatch as f32;
+                total_entropy_loss += entropy_loss.clone().into_scalar();
                 let policy_loss = policy_loss - entropy_loss;
 
                 let actor_grads = policy_loss.backward();
@@ -411,7 +425,7 @@ impl Thinker for PpoThinker {
                 let val = self.critic.forward(s.require_grad());
                 let val_err = val - returns;
                 let value_loss = (val_err.clone() * val_err).mean();
-                total_val_loss += value_loss.clone().into_scalar() * nbatch as f32;
+                total_val_loss += value_loss.clone().into_scalar();
                 let critic_grads = value_loss.backward();
                 self.critic = self.critic_optim.step(
                     AGENT_CRITIC_LR,
@@ -420,19 +434,20 @@ impl Thinker for PpoThinker {
                 );
             }
         }
-        self.recent_policy_loss = total_pi_loss / nstep as f32;
-        self.recent_value_loss = total_val_loss / nstep as f32;
-        self.recent_entropy_loss = total_entropy_loss / nstep as f32;
-        // rb.buf.clear();
+        self.recent_policy_loss = total_pi_loss / total_batches as f32;
+        self.recent_value_loss = total_val_loss / total_batches as f32;
+        self.recent_entropy_loss = total_entropy_loss / total_batches as f32;
+        self.recent_nclamp = total_nclamp / total_batches as f32;
+        self.recent_kl = total_kl / total_batches as f32;
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
         self.actor.clone().save_file(
-            path.as_ref().join("actor.bin.gz"),
+            path.as_ref().join("actor"),
             &BinGzFileRecorder::<FullPrecisionSettings>::new(),
         )?;
         self.critic.clone().save_file(
-            path.as_ref().join("critic.bin.gz"),
+            path.as_ref().join("critic"),
             &BinGzFileRecorder::<FullPrecisionSettings>::new(),
         )?;
         Ok(())

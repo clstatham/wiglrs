@@ -116,6 +116,10 @@ impl Brain<PpoThinker> {
             self.thinker.recent_entropy_loss,
             frame_count,
         );
+        self.writer
+            .add_scalar("PolicyClampRatio", self.thinker.recent_nclamp, frame_count);
+        self.writer
+            .add_scalar("PolicyKLDivergence", self.thinker.recent_kl, frame_count);
     }
 }
 
