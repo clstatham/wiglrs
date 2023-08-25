@@ -17,11 +17,11 @@ use std::{
     f32::consts::{E, PI},
 };
 
+use crate::brains::replay_buffer::ReplayBuffer;
 use crate::brains::FrameStack;
 use crate::hparams::{
     AGENT_ACTOR_LR, AGENT_CRITIC_LR, AGENT_HIDDEN_DIM, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS,
 };
-use crate::{brains::replay_buffer::ReplayBuffer, hparams::N_FRAME_STACK};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::Thinker;
@@ -139,36 +139,57 @@ pub struct GruConfig {
 
 impl GruConfig {
     pub fn init<B: ADBackend>(&self) -> Gru<B> {
-        let initializer = Initializer::Normal {
-            mean: 0.0,
-            std: 0.01,
-        };
+        let initializer = Initializer::XavierNormal { gain: 1.0 };
         Gru {
             w_xz: Param::new(
                 ParamId::new(),
-                initializer.init([self.input_len, self.hidden_len]),
+                initializer.init_with(
+                    [self.input_len, self.hidden_len],
+                    Some(self.input_len),
+                    Some(self.hidden_len),
+                ),
             ),
             w_hz: Param::new(
                 ParamId::new(),
-                initializer.init([self.hidden_len, self.hidden_len]),
+                initializer.init_with(
+                    [self.hidden_len, self.hidden_len],
+                    Some(self.hidden_len),
+                    Some(self.hidden_len),
+                ),
             ),
             b_z: Param::new(ParamId::new(), Tensor::zeros([self.hidden_len])),
             w_xr: Param::new(
                 ParamId::new(),
-                initializer.init([self.input_len, self.hidden_len]),
+                initializer.init_with(
+                    [self.input_len, self.hidden_len],
+                    Some(self.input_len),
+                    Some(self.hidden_len),
+                ),
             ),
             w_hr: Param::new(
                 ParamId::new(),
-                initializer.init([self.hidden_len, self.hidden_len]),
+                initializer.init_with(
+                    [self.hidden_len, self.hidden_len],
+                    Some(self.hidden_len),
+                    Some(self.hidden_len),
+                ),
             ),
             b_r: Param::new(ParamId::new(), Tensor::zeros([self.hidden_len])),
             w_xh: Param::new(
                 ParamId::new(),
-                initializer.init([self.input_len, self.hidden_len]),
+                initializer.init_with(
+                    [self.input_len, self.hidden_len],
+                    Some(self.input_len),
+                    Some(self.hidden_len),
+                ),
             ),
             w_hh: Param::new(
                 ParamId::new(),
-                initializer.init([self.hidden_len, self.hidden_len]),
+                initializer.init_with(
+                    [self.hidden_len, self.hidden_len],
+                    Some(self.hidden_len),
+                    Some(self.hidden_len),
+                ),
             ),
             b_h: Param::new(ParamId::new(), Tensor::zeros([self.hidden_len])),
         }
