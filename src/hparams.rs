@@ -1,11 +1,11 @@
 pub const NUM_AGENTS: usize = 3;
 pub const AGENT_HIDDEN_DIM: usize = 512;
-pub const AGENT_ACTOR_LR: f64 = 1e-4;
+pub const AGENT_ACTOR_LR: f64 = 3e-5;
 pub const AGENT_CRITIC_LR: f64 = 1e-4;
 pub const AGENT_OPTIM_EPOCHS: usize = 3;
 pub const AGENT_OPTIM_BATCH_SIZE: usize = 256;
 
-pub const AGENT_RB_MAX_LEN: usize = 1000 + 1; // add one for the initial state
+pub const AGENT_RB_MAX_LEN: usize = 1000;
 pub const N_FRAME_STACK: usize = 1;
 
 pub const AGENT_RADIUS: f32 = 20.0;

@@ -48,16 +48,14 @@ impl<const K: usize> MvNormal<K> {
     }
 
     pub fn log_prob(self, x: Tensor<Be, 1>) -> Tensor<Be, 1> {
-        let a = (x.clone() - self.mu.clone()).reshape([1, K]);
-        let inv_cov = Tensor::ones_like(&self.cov_diag) / self.cov_diag.clone();
-        let inv_cov_mat = diag(inv_cov);
-        let c = ((-self.mu).add(x)).reshape([K, 1]);
+        let a = x.clone() - self.mu.clone();
+        assert!(self.cov_diag.to_data().value.into_iter().all(|f| f > 0.0));
         let mut det = Tensor::ones([1]).to_device(&self.cov_diag.device());
         for i in 0..K {
             det = det * self.cov_diag.clone().slice([i..i + 1]);
         }
-        let d = a.matmul(inv_cov_mat);
-        let e = d.matmul(c);
+        let d = a.clone() / self.cov_diag.clone();
+        let e = (d * a).sum();
         let numer = (e * -0.5).exp().reshape([1]);
         let f = (2.0 * PI).powf(K as f32);
         let denom = (det * f).sqrt();
