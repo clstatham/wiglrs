@@ -48,7 +48,7 @@ impl<const K: usize> MvNormal<K> {
     pub fn log_prob(self, x: Tensor<Be, 2>) -> Tensor<Be, 2> {
         let x = x.to_device(&self.mu.device());
         let a = x.clone() - self.mu.clone();
-        // assert!(self.cov_diag.to_data().value.into_iter().all(|f| f > 0.0));
+        assert!(self.cov_diag.to_data().value.into_iter().all(|f| f > 0.0));
         let cov_diag = self.cov_diag.clone();
         let nbatch = self.mu.shape().dims[0];
         let mut det = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
@@ -249,7 +249,7 @@ impl<B: Backend> PpoActor<B> {
             .squeeze(1);
         let std = self.std_head2.forward(std);
         // softplus
-        let std = (std.exp() + 1.0).log() + 1e-5;
+        let std = (std.exp() + 1.0).log() + 1e-5f32.sqrt();
 
         (mu, std)
     }
