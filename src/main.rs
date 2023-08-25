@@ -6,8 +6,13 @@ use std::{
 };
 
 use bevy::{
-    app::ScheduleRunnerPlugin, core::FrameCount, math::Vec3Swizzles, prelude::*,
-    sprite::MaterialMesh2dBundle, window::PresentMode, winit::WinitSettings,
+    app::ScheduleRunnerPlugin,
+    core::FrameCount,
+    math::Vec3Swizzles,
+    prelude::*,
+    sprite::MaterialMesh2dBundle,
+    window::{PresentMode, WindowMode},
+    winit::WinitSettings,
 };
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
@@ -704,6 +709,7 @@ fn main() {
             primary_window: Some(Window {
                 present_mode: bevy::window::PresentMode::AutoNoVsync,
                 title: "wiglrs".to_owned(),
+                mode: WindowMode::BorderlessFullscreen,
                 ..default()
             }),
             ..Default::default()

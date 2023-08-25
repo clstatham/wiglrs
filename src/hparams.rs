@@ -1,4 +1,4 @@
-pub const NUM_AGENTS: usize = 6;
+pub const NUM_AGENTS: usize = 4;
 pub const AGENT_HIDDEN_DIM: usize = 128;
 pub const AGENT_ACTOR_LR: f64 = 1e-4;
 pub const AGENT_CRITIC_LR: f64 = 1e-4;

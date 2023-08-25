@@ -109,7 +109,7 @@ pub struct GruConfig {
 
 impl GruConfig {
     pub fn init<B: ADBackend>(&self) -> Gru<B> {
-        let initializer = Initializer::XavierNormal { gain: 0.1 };
+        let initializer = Initializer::XavierNormal { gain: 1.0 };
         Gru {
             w_xz: Param::new(
                 ParamId::new(),
