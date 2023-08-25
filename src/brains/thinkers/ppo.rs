@@ -61,9 +61,10 @@ impl<const K: usize> MvNormal<K> {
         let f = (2.0 * PI).powf(K as f32);
         let denom = (det * f).sqrt();
         let pdf = numer / denom;
-        let non_nans = pdf.clone().equal(pdf.clone()); // filter nans
-        let ones = pdf.ones_like();
-        let pdf = ones.mask_where(non_nans, pdf);
+        // let non_nans = pdf.clone().equal(pdf.clone()); // filter nans
+        // let ones = pdf.ones_like();
+        // let pdf = ones.mask_where(non_nans, pdf);
+        // pdf.log()
         pdf.log()
     }
 
@@ -103,7 +104,7 @@ pub struct GruConfig {
 
 impl GruConfig {
     pub fn init<B: ADBackend>(&self) -> Gru<B> {
-        let initializer = Initializer::XavierNormal { gain: 1.0 };
+        let initializer = Initializer::XavierNormal { gain: 0.1 };
         Gru {
             w_xz: Param::new(
                 ParamId::new(),
@@ -248,7 +249,7 @@ impl<B: Backend> PpoActor<B> {
             .squeeze(1);
         let std = self.std_head2.forward(std);
         // softplus
-        let std = (std.exp() + 1.0).log();
+        let std = (std.exp() + 1.0).log() + 1e-5;
 
         (mu, std)
     }
