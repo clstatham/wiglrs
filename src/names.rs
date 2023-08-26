@@ -10,6 +10,7 @@ Kevin
 Morty
 Lumi
 Savannah
+Resa
 Horton
 Sandi
 McCullough
