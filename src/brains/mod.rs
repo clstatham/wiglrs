@@ -43,7 +43,7 @@ impl FrameStack {
 pub struct Brain<T: Thinker> {
     pub name: String,
     pub timestamp: Timestamp,
-    pub deaths: u64,
+    pub deaths: usize,
     pub kills: usize,
     pub color: Color,
     pub id: u64,
@@ -106,9 +106,8 @@ impl Brain<PpoThinker> {
 
     pub fn learn(&mut self, frame_count: usize) {
         self.thinker.learn(&mut self.rb);
-        let mean_reward =
-            self.rb.buf.iter().map(|s| s.reward).sum::<f32>() / self.rb.buf.len() as f32;
-        self.writer.add_scalar("Reward", mean_reward, frame_count);
+        let net_reward = self.rb.buf.iter().map(|s| s.reward).sum::<f32>();
+        self.writer.add_scalar("Reward", net_reward, frame_count);
         self.writer
             .add_scalar("Loss/Policy", self.thinker.recent_policy_loss, frame_count);
         self.writer

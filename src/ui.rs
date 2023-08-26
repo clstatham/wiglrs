@@ -92,7 +92,10 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                     .zip(brain.thinker.recent_std.iter())
                                     .enumerate()
                                     .map(|(i, (mu, std))| {
-                                        let rg = Vec2::new(*std, 1.0 / *std).normalize();
+                                        // https://www.desmos.com/calculator/rkoehr8rve
+                                        let scale = std * 3.0;
+                                        let rg =
+                                            Vec2::new(scale.exp(), (1.0 / scale).exp()).normalize();
                                         Bar::new(i as f64, *mu as f64).fill(Color32::from_rgb(
                                             (rg.x * 255.0) as u8,
                                             (rg.y * 255.0) as u8,

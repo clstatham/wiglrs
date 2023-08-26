@@ -20,11 +20,11 @@ use std::{
     f32::consts::{E, PI},
 };
 
-use crate::brains::replay_buffer::ReplayBuffer;
 use crate::brains::FrameStack;
 use crate::hparams::{
     AGENT_ACTOR_LR, AGENT_CRITIC_LR, AGENT_HIDDEN_DIM, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS,
 };
+use crate::{brains::replay_buffer::ReplayBuffer, hparams::AGENT_ENTROPY_BETA};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::Thinker;
@@ -76,11 +76,11 @@ impl<const K: usize> MvNormal<K> {
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
         let mut g = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
-        let two_pi_e_sigma = self.cov_diag.clone() * E * 2.0 * PI;
         for i in 0..K {
-            g = g * two_pi_e_sigma.clone().slice([0..nbatch, i..i + 1]);
+            g = g * self.cov_diag.clone().slice([0..nbatch, i..i + 1]);
         }
-        g.log() * 0.5
+        let second_term = (K as f32 * 0.5) * (1.0 + (2.0 * PI).ln());
+        g.log() * 0.5 + second_term
     }
 }
 
@@ -478,9 +478,9 @@ impl Thinker for PpoThinker {
                 let policy_loss = -masked.mean();
 
                 total_pi_loss += policy_loss.clone().into_scalar();
-                let entropy_loss = entropy.mean() * 1e-3;
+                let entropy_loss = entropy.mean();
                 total_entropy_loss += entropy_loss.clone().into_scalar();
-                let policy_loss = policy_loss - entropy_loss;
+                let policy_loss = policy_loss - entropy_loss * AGENT_ENTROPY_BETA;
 
                 let actor_grads = policy_loss.backward();
                 self.actor = self.actor_optim.step(
