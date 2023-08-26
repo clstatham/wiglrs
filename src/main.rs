@@ -17,13 +17,13 @@ use bevy::{
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 use brains::{
-    replay_buffer::SavedStep,
+    replay_buffer::Sart,
     thinkers::{self, ppo::PpoThinker, Thinker},
     Brain, BrainBank,
 };
 use hparams::{
     AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_OPTIM_EPOCHS, AGENT_RADIUS,
-    AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, AGENT_TICK_RATE, NUM_AGENTS,
+    AGENT_SHOOT_DISTANCE, AGENT_TICK_RATE, AGENT_UPDATE_INTERVAL, NUM_AGENTS,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -234,7 +234,7 @@ fn check_train_brains(
     frame_count: Res<FrameCount>,
     time: Res<Time>,
 ) {
-    if frame_count.0 as usize % AGENT_RB_MAX_LEN == AGENT_RB_MAX_LEN - 1 {
+    if frame_count.0 > 1 && frame_count.0 as usize % AGENT_UPDATE_INTERVAL == 0 {
         commands.spawn((
             Text2dBundle {
                 text: Text::from_section(
@@ -316,13 +316,7 @@ fn train_brains(
             "{} {} Policy Clamp Ratio: {}",
             brain.id, &brain.name, brain.thinker.recent_nclamp
         ));
-        // log.push(format!(
-        //     "{} {} Policy KL Divergence: {}",
-        //     brain.id, &brain.name, brain.thinker.recent_kl
-        // ));
-        brain.rb.buf.clear();
-        // }
-        // }
+
         tx.send(DoneTraining);
     }
 }
@@ -676,7 +670,7 @@ fn update(
     for (agent, _, _, _) in agents.iter() {
         let fs = brains.get(&agent).unwrap().fs.clone();
         // for brain in brains.values_mut() {
-        brains.get_mut(&agent).unwrap().rb.remember(SavedStep {
+        brains.get_mut(&agent).unwrap().rb.remember_sart(Sart {
             obs: fs.clone(),
             action: all_actions.get(&agent).unwrap().to_owned(),
             reward: all_rewards.get(&agent).unwrap().to_owned(),
@@ -686,6 +680,7 @@ fn update(
     }
 
     for agent in dead_agents {
+        brains.get_mut(&agent).unwrap().rb.finish_trajectory();
         commands.entity(agent).despawn_recursive();
     }
 }

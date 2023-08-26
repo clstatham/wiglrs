@@ -6,7 +6,7 @@ use std::{
 };
 
 use self::{
-    replay_buffer::ReplayBuffer,
+    replay_buffer::SartAdvBuffer,
     thinkers::{ppo::PpoThinker, Thinker},
 };
 use crate::{
@@ -47,7 +47,7 @@ pub struct Brain<T: Thinker> {
     pub kills: usize,
     pub color: Color,
     pub id: u64,
-    pub rb: ReplayBuffer<AGENT_RB_MAX_LEN>,
+    pub rb: SartAdvBuffer<AGENT_RB_MAX_LEN>,
     pub fs: FrameStack,
     pub last_action: Action,
     pub thinker: T,
@@ -68,7 +68,7 @@ impl<T: Thinker> Brain<T> {
             id,
             kills: 0,
             deaths: 0,
-            rb: ReplayBuffer::default(),
+            rb: SartAdvBuffer::default(),
             fs: FrameStack::default(),
             last_action: Action::default(),
             thinker,

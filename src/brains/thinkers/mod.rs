@@ -4,14 +4,14 @@ use bevy::prelude::Vec2;
 
 use crate::Action;
 
-use super::{replay_buffer::ReplayBuffer, FrameStack};
+use super::{replay_buffer::SartAdvBuffer, FrameStack};
 
 pub mod ppo;
 pub mod stats;
 
 pub trait Thinker {
     fn act(&mut self, obs: FrameStack) -> Action;
-    fn learn<const MAX_LEN: usize>(&mut self, b: &mut ReplayBuffer<MAX_LEN>);
+    fn learn<const MAX_LEN: usize>(&mut self, b: &mut SartAdvBuffer<MAX_LEN>);
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>;
 }
 
@@ -29,7 +29,7 @@ impl Thinker for RandomThinker {
             metadata: None,
         }
     }
-    fn learn<const MAX_LEN: usize>(&mut self, _b: &mut ReplayBuffer<MAX_LEN>) {}
+    fn learn<const MAX_LEN: usize>(&mut self, _b: &mut SartAdvBuffer<MAX_LEN>) {}
     fn save(&self, _path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }

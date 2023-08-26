@@ -15,16 +15,13 @@ use burn::{
 use burn_tch::{TchBackend, TchDevice};
 
 use burn_tensor::backend::ADBackend;
-use std::{
-    collections::VecDeque,
-    f32::consts::{E, PI},
-};
+use std::f32::consts::PI;
 
 use crate::brains::FrameStack;
 use crate::hparams::{
     AGENT_ACTOR_LR, AGENT_CRITIC_LR, AGENT_HIDDEN_DIM, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS,
 };
-use crate::{brains::replay_buffer::ReplayBuffer, hparams::AGENT_ENTROPY_BETA};
+use crate::{brains::replay_buffer::SartAdvBuffer, hparams::AGENT_ENTROPY_BETA};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::Thinker;
@@ -382,128 +379,105 @@ impl Thinker for PpoThinker {
         )
     }
 
-    fn learn<const MAX_LEN: usize>(&mut self, rb: &mut ReplayBuffer<MAX_LEN>) {
-        let nstep = rb.buf.len() - 1;
-        let mut gae = 0.0;
-        let mut returns = VecDeque::new();
-
-        for i in (0..nstep).rev() {
-            let mask = if rb.buf[i].terminal { 0.0 } else { 1.0 };
-            let delta = rb.buf[i].reward + 0.99 * rb.buf[i + 1].action.metadata.unwrap().val * mask
-                - rb.buf[i].action.metadata.unwrap().val;
-            gae = delta + 0.99 * 0.95 * mask * gae;
-            returns.push_front(gae + rb.buf[i].action.metadata.unwrap().val);
-        }
-        let returns: Vec<f32> = returns.into();
-
-        let returns: Tensor<Be, 1> = Tensor::from_floats(returns.as_slice());
-        let returns = (returns.clone() - returns.clone().mean()) / (returns.var(0) + 1e-7);
-        let returns = returns.to_data().value;
+    fn learn<const MAX_LEN: usize>(&mut self, rb: &mut SartAdvBuffer<MAX_LEN>) {
+        let mut nstep = 0;
 
         let mut total_pi_loss = 0.0;
         let mut total_val_loss = 0.0;
         let mut total_entropy_loss = 0.0;
         let mut total_nclamp = 0.0;
-        let total_batches =
-            (nstep as f32 / AGENT_OPTIM_BATCH_SIZE as f32).ceil() as usize * AGENT_OPTIM_EPOCHS;
-        let rb: Vec<_> = rb.buf.clone().into();
-        for epoch in kdam::tqdm!(0..AGENT_OPTIM_EPOCHS, desc = "Training", position = 0) {
-            let dsc = format!("Epoch {}", epoch + 1);
-            for (step, returns) in kdam::tqdm!(
-                rb[..nstep]
-                    .chunks(AGENT_OPTIM_BATCH_SIZE)
-                    .zip(returns.chunks(AGENT_OPTIM_BATCH_SIZE)),
-                desc = dsc,
-                position = 1
-            ) {
-                let nbatch = returns.len();
-                let returns = Tensor::from_floats(returns).to_device(&self.actor.devices()[0]);
-                let s = step
-                    .iter()
-                    .map(|step| {
-                        Tensor::cat(
-                            step.obs
-                                .as_vec()
-                                .into_iter()
-                                .map(|x| Tensor::from_floats(x.as_vec().as_slice()).unsqueeze())
-                                .collect::<Vec<_>>(),
-                            1,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let s: Tensor<Be, 3> = Tensor::cat(s, 0);
-                let a = step
-                    .iter()
-                    .map(|step| Tensor::from_floats(step.action.as_vec().as_slice()).unsqueeze())
-                    .collect::<Vec<_>>();
-                let a: Tensor<Be, 2> = Tensor::cat(a, 0);
-                let old_lp = step
-                    .iter()
-                    .map(|step| step.action.metadata.unwrap().logp)
-                    .collect::<Vec<_>>();
-                let old_lp = Tensor::from_floats(old_lp.as_slice())
-                    .to_device(&self.actor.devices()[0])
-                    .reshape([nbatch, 1]);
-                let old_val = step
-                    .iter()
-                    .map(|step| step.action.metadata.unwrap().val)
-                    .collect::<Vec<_>>();
-                let old_val: Tensor<_, 1> =
-                    Tensor::from_floats(old_val.as_slice()).to_device(&self.actor.devices()[0]);
+        for _epoch in kdam::tqdm!(0..AGENT_OPTIM_EPOCHS, desc = "Training") {
+            nstep += AGENT_OPTIM_BATCH_SIZE;
+            // let dsc = format!("Epoch {}", epoch + 1);
+            // for (step, returns) in kdam::tqdm!(desc = dsc, position = 1) {
+            let step = rb.sample_batch(AGENT_OPTIM_BATCH_SIZE);
+            let returns =
+                Tensor::from_floats(step.returns.as_slice()).to_device(&self.actor.devices()[0]);
+            let s = step
+                .obs
+                .iter()
+                .map(|stack| {
+                    Tensor::cat(
+                        stack
+                            .as_vec()
+                            .into_iter()
+                            .map(|x| Tensor::from_floats(x.as_vec().as_slice()).unsqueeze())
+                            .collect::<Vec<_>>(),
+                        1,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let s: Tensor<Be, 3> = Tensor::cat(s, 0);
+            let a = step
+                .action
+                .iter()
+                .map(|action| Tensor::from_floats(action.as_vec().as_slice()).unsqueeze())
+                .collect::<Vec<_>>();
+            let a: Tensor<Be, 2> = Tensor::cat(a, 0);
+            let old_lp = step
+                .action
+                .iter()
+                .map(|action| action.metadata.unwrap().logp)
+                .collect::<Vec<_>>();
+            let old_lp = Tensor::from_floats(old_lp.as_slice())
+                .to_device(&self.actor.devices()[0])
+                .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
 
-                let advantage = (returns.clone() - old_val).reshape([nbatch, 1]);
+            // let advantage = (returns.clone() - old_val).reshape([nbatch, 1]);
+            let advantage = Tensor::from_floats(step.advantage.as_slice())
+                .to_device(&self.actor.devices()[0])
+                .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
 
-                let s = s.require_grad();
-                let (mu, std) = self.actor.forward(s.clone());
-                let dist = MvNormal::<ACTION_LEN> {
-                    mu,
-                    cov_diag: std.clone() * std,
-                };
-                let entropy = dist.entropy();
-                let lp = dist.log_prob(a);
-                // dbg!(old_lp.clone().to_data(), lp.clone().to_data());
-                // let kl = (old_lp.clone() - lp.clone()).mean();
-                // total_kl += kl.into_scalar();
-                let ratio = (lp - old_lp).exp();
-                let surr1 = ratio.clone() * advantage.clone();
-                let nclamp = ratio
-                    .clone()
-                    .zeros_like()
-                    .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
-                let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
-                total_nclamp += nclamp.mean().into_scalar();
+            let (mu, std) = self.actor.forward(s.clone());
+            let dist = MvNormal::<ACTION_LEN> {
+                mu,
+                cov_diag: std.clone() * std,
+            };
+            let entropy = dist.entropy();
+            let lp = dist.log_prob(a);
+            // dbg!(old_lp.clone().to_data(), lp.clone().to_data());
+            // let kl = (old_lp.clone() - lp.clone()).mean();
+            // total_kl += kl.into_scalar();
+            let ratio = (lp - old_lp).exp();
+            let surr1 = ratio.clone() * advantage.clone();
+            let nclamp = ratio
+                .clone()
+                .zeros_like()
+                .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
+            let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
+            total_nclamp += nclamp.mean().into_scalar();
 
-                let surr2 = ratio.clamp(0.8, 1.2) * advantage;
-                let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
-                let policy_loss = -masked.mean();
+            let surr2 = ratio.clamp(0.8, 1.2) * advantage;
+            let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
+            let policy_loss = -masked.mean();
 
-                total_pi_loss += policy_loss.clone().into_scalar();
-                let entropy_loss = entropy.mean();
-                total_entropy_loss += entropy_loss.clone().into_scalar();
-                let policy_loss = policy_loss - entropy_loss * AGENT_ENTROPY_BETA;
+            total_pi_loss += policy_loss.clone().into_scalar();
+            let entropy_loss = entropy.mean();
+            total_entropy_loss += entropy_loss.clone().into_scalar();
+            let policy_loss = policy_loss - entropy_loss * AGENT_ENTROPY_BETA;
 
-                let actor_grads = policy_loss.backward();
-                self.actor = self.actor_optim.step(
-                    AGENT_ACTOR_LR,
-                    self.actor.clone(),
-                    GradientsParams::from_grads(actor_grads, &self.actor),
-                );
-                let val = self.critic.forward(s.require_grad());
-                let val_err = val - returns;
-                let value_loss = (val_err.clone() * val_err).mean();
-                total_val_loss += value_loss.clone().into_scalar();
-                let critic_grads = value_loss.backward();
-                self.critic = self.critic_optim.step(
-                    AGENT_CRITIC_LR,
-                    self.critic.clone(),
-                    GradientsParams::from_grads(critic_grads, &self.critic),
-                );
-            }
+            let actor_grads = policy_loss.backward();
+            self.actor = self.actor_optim.step(
+                AGENT_ACTOR_LR,
+                self.actor.clone(),
+                GradientsParams::from_grads(actor_grads, &self.actor),
+            );
+            let val = self.critic.forward(s);
+            let val_err = val - returns;
+            let value_loss = (val_err.clone() * val_err).mean();
+            total_val_loss += value_loss.clone().into_scalar();
+            let critic_grads = value_loss.backward();
+            self.critic = self.critic_optim.step(
+                AGENT_CRITIC_LR,
+                self.critic.clone(),
+                GradientsParams::from_grads(critic_grads, &self.critic),
+            );
+            // }
         }
-        self.recent_policy_loss = total_pi_loss / total_batches as f32;
-        self.recent_value_loss = total_val_loss / total_batches as f32;
-        self.recent_entropy_loss = total_entropy_loss / total_batches as f32;
-        self.recent_nclamp = total_nclamp / total_batches as f32;
+        self.recent_policy_loss = total_pi_loss / nstep as f32;
+        self.recent_value_loss = total_val_loss / nstep as f32;
+        self.recent_entropy_loss = total_entropy_loss / nstep as f32;
+        self.recent_nclamp = total_nclamp / nstep as f32;
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
