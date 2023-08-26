@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    f32::consts::PI,
     sync::Arc,
 };
 
@@ -20,6 +21,7 @@ use brains::{
     thinkers::{self, ppo::PpoThinker, Thinker},
     Brain, BrainBank,
 };
+use burn_tensor::backend::Backend;
 use hparams::{
     AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_OPTIM_EPOCHS, AGENT_RADIUS,
     AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, AGENT_TICK_RATE, AGENT_UPDATE_INTERVAL, NUM_AGENTS,
@@ -30,29 +32,34 @@ use tensorboard_rs::summary_writer::SummaryWriter;
 use ui::{ui, LogText};
 
 pub mod brains;
+pub mod envs;
 pub mod names;
 pub mod ui;
 
-#[derive(Default, Clone, Copy, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct OtherState {
     pub rel_pos: Vec2,
     pub linvel: Vec2,
-    pub direction_dotprod: f32,
+    pub direction: Vec2,
     pub firing: bool,
 }
 
-pub const OTHER_STATE_LEN: usize = 6;
+pub const OTHER_STATE_LEN: usize = 7;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Observation {
     pub pos: Vec2,
     pub linvel: Vec2,
     pub direction: Vec2,
     pub health: f32,
+    pub up_wall_dist: f32,
+    pub down_wall_dist: f32,
+    pub left_wall_dist: f32,
+    pub right_wall_dist: f32,
     pub other_states: Vec<OtherState>,
 }
 
-pub const OBS_LEN: usize = OTHER_STATE_LEN * (NUM_AGENTS - 1) + 7;
+pub const OBS_LEN: usize = OTHER_STATE_LEN * (NUM_AGENTS - 1) + 11;
 
 impl Default for Observation {
     fn default() -> Self {
@@ -61,6 +68,10 @@ impl Default for Observation {
             linvel: Vec2::default(),
             direction: Vec2::default(),
             health: 0.0,
+            up_wall_dist: 0.0,
+            down_wall_dist: 0.0,
+            left_wall_dist: 0.0,
+            right_wall_dist: 0.0,
             other_states: vec![OtherState::default(); NUM_AGENTS - 1],
         }
     }
@@ -75,6 +86,10 @@ impl Observation {
             self.linvel.y / 2000.0,
             self.direction.x,
             self.direction.y,
+            self.up_wall_dist / 2000.0,
+            self.down_wall_dist / 2000.0,
+            self.left_wall_dist / 2000.0,
+            self.right_wall_dist / 2000.0,
             self.health / AGENT_MAX_HEALTH,
             // self.dt,
         ];
@@ -84,7 +99,8 @@ impl Observation {
                 other.rel_pos.y / 2000.0,
                 other.linvel.x / 2000.0,
                 other.linvel.y / 2000.0,
-                other.direction_dotprod,
+                other.direction.x,
+                other.direction.y,
                 if other.firing { 1.0 } else { 0.0 },
             ]);
         }
@@ -429,18 +445,17 @@ fn setup(
     asset_server: Res<AssetServer>,
     timestamp: Res<Timestamp>,
 ) {
-    // writer.init(None, &timestamp);
-
     commands.spawn(Camera2dBundle {
         transform: Transform::from_xyz(0.0, 0.0, 500.0),
         ..Default::default()
     });
 
+    // bottom wall
     commands
         .spawn(Collider::cuboid(500.0, 10.0))
         .insert(SpriteBundle {
             sprite: Sprite {
-                color: Color::BLACK,
+                color: Color::BEIGE,
                 custom_size: Some(Vec2::new(1000.0, 20.0)),
                 ..default()
             },
@@ -448,13 +463,14 @@ fn setup(
         })
         .insert(Wall)
         .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(0.0, -300.0, 0.0)));
+        .insert(TransformBundle::from(Transform::from_xyz(0.0, -250.0, 0.0)));
 
+    // top wall
     commands
         .spawn(Collider::cuboid(500.0, 10.0))
         .insert(SpriteBundle {
             sprite: Sprite {
-                color: Color::BLACK,
+                color: Color::BEIGE,
                 custom_size: Some(Vec2::new(1000.0, 20.0)),
                 ..default()
             },
@@ -462,12 +478,14 @@ fn setup(
         })
         .insert(Wall)
         .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(0.0, 300.0, 0.0)));
+        .insert(TransformBundle::from(Transform::from_xyz(0.0, 250.0, 0.0)));
+
+    // left wall
     commands
         .spawn(Collider::cuboid(10.0, 300.0))
         .insert(SpriteBundle {
             sprite: Sprite {
-                color: Color::BLACK,
+                color: Color::BLUE,
                 custom_size: Some(Vec2::new(20.0, 600.0)),
                 ..default()
             },
@@ -476,11 +494,13 @@ fn setup(
         .insert(Wall)
         .insert(ActiveEvents::all())
         .insert(TransformBundle::from(Transform::from_xyz(-500.0, 0.0, 0.0)));
+
+    // right wall
     commands
         .spawn(Collider::cuboid(10.0, 300.0))
         .insert(SpriteBundle {
             sprite: Sprite {
-                color: Color::BLACK,
+                color: Color::RED,
                 custom_size: Some(Vec2::new(20.0, 600.0)),
                 ..default()
             },
@@ -489,6 +509,138 @@ fn setup(
         .insert(Wall)
         .insert(ActiveEvents::all())
         .insert(TransformBundle::from(Transform::from_xyz(500.0, 0.0, 0.0)));
+
+    // right-middle wall
+    commands
+        .spawn(Collider::cuboid(100.0, 10.0))
+        .insert(SpriteBundle {
+            sprite: Sprite {
+                color: Color::RED,
+                custom_size: Some(Vec2::new(200.0, 20.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
+        .insert(TransformBundle::from(Transform::from_xyz(400.0, 0.0, 0.0)));
+
+    // left-middle wall
+    commands
+        .spawn(Collider::cuboid(100.0, 10.0))
+        .insert(SpriteBundle {
+            sprite: Sprite {
+                color: Color::BLUE,
+                custom_size: Some(Vec2::new(200.0, 20.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
+        .insert(TransformBundle::from(Transform::from_xyz(-400.0, 0.0, 0.0)));
+
+    // top-middle wall
+    commands
+        .spawn(Collider::cuboid(10.0, 100.0))
+        .insert(SpriteBundle {
+            sprite: Sprite {
+                color: Color::BEIGE,
+                custom_size: Some(Vec2::new(20.0, 200.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
+        .insert(TransformBundle::from(Transform::from_xyz(0.0, 200.0, 0.0)));
+
+    // bottom-middle wall
+    commands
+        .spawn(Collider::cuboid(10.0, 100.0))
+        .insert(SpriteBundle {
+            sprite: Sprite {
+                color: Color::BEIGE,
+                custom_size: Some(Vec2::new(20.0, 200.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
+        .insert(TransformBundle::from(Transform::from_xyz(0.0, -200.0, 0.0)));
+
+    // bottom-left corner wall
+    commands
+        .spawn(Collider::cuboid(10.0, 120.0))
+        .insert(SpriteBundle {
+            sprite: Sprite {
+                color: Color::BLUE,
+                custom_size: Some(Vec2::new(20.0, 240.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
+        .insert(TransformBundle::from(
+            Transform::from_rotation(Quat::from_axis_angle(Vec3::Z, 45.0 / 180.0 * PI))
+                .with_translation(Vec3::new(-400.0, -200.0, 0.0)),
+        ));
+
+    // top-right corner wall
+    commands
+        .spawn(Collider::cuboid(10.0, 120.0))
+        .insert(SpriteBundle {
+            sprite: Sprite {
+                color: Color::RED,
+                custom_size: Some(Vec2::new(20.0, 240.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
+        .insert(TransformBundle::from(
+            Transform::from_rotation(Quat::from_axis_angle(Vec3::Z, 45.0 / 180.0 * PI))
+                .with_translation(Vec3::new(400.0, 200.0, 0.0)),
+        ));
+
+    // top-left corner wall
+    commands
+        .spawn(Collider::cuboid(10.0, 120.0))
+        .insert(SpriteBundle {
+            sprite: Sprite {
+                color: Color::BLUE,
+                custom_size: Some(Vec2::new(20.0, 240.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
+        .insert(TransformBundle::from(
+            Transform::from_rotation(Quat::from_axis_angle(Vec3::Z, -45.0 / 180.0 * PI))
+                .with_translation(Vec3::new(-400.0, 200.0, 0.0)),
+        ));
+
+    // bottom-right corner wall
+    commands
+        .spawn(Collider::cuboid(10.0, 120.0))
+        .insert(SpriteBundle {
+            sprite: Sprite {
+                color: Color::RED,
+                custom_size: Some(Vec2::new(20.0, 240.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .insert(Wall)
+        .insert(ActiveEvents::all())
+        .insert(TransformBundle::from(
+            Transform::from_rotation(Quat::from_axis_angle(Vec3::Z, -45.0 / 180.0 * PI))
+                .with_translation(Vec3::new(400.0, -200.0, 0.0)),
+        ));
 
     for _ in 0..NUM_AGENTS {
         let brain = Brain::new(thinkers::ppo::PpoThinker::default(), &timestamp);
@@ -567,7 +719,38 @@ fn update(
             direction: transform.local_y().xy(),
             health: health.get_component::<Health>(agent).unwrap().0,
             other_states: vec![OtherState::default(); NUM_AGENTS - 1],
+            ..Default::default()
         };
+
+        let filter = QueryFilter::only_fixed();
+        if let Some((_, toi)) =
+            cx.cast_ray(transform.translation.xy(), Vec2::Y, Real::MAX, true, filter)
+        {
+            my_state.up_wall_dist = toi;
+        }
+        if let Some((_, toi)) = cx.cast_ray(
+            transform.translation.xy(),
+            Vec2::NEG_Y,
+            Real::MAX,
+            true,
+            filter,
+        ) {
+            my_state.down_wall_dist = toi;
+        }
+        if let Some((_, toi)) =
+            cx.cast_ray(transform.translation.xy(), Vec2::X, Real::MAX, true, filter)
+        {
+            my_state.right_wall_dist = toi;
+        }
+        if let Some((_, toi)) = cx.cast_ray(
+            transform.translation.xy(),
+            Vec2::NEG_X,
+            Real::MAX,
+            true,
+            filter,
+        ) {
+            my_state.left_wall_dist = toi;
+        }
 
         for (i, (other, _, other_vel, other_transform)) in agents
             .iter()
@@ -578,11 +761,13 @@ fn update(
             let other_state = OtherState {
                 rel_pos: transform.translation.xy() - other_transform.translation.xy(),
                 linvel: other_vel.linvel,
-                direction_dotprod: transform.local_y().xy().dot(other_transform.local_y().xy()),
+                direction: other_transform.local_y().xy(),
                 firing: brains[&other].last_action.shoot > 0.0,
             };
             my_state.other_states[i] = other_state;
         }
+
+        // dbg!(&agent, &my_state);
 
         all_states.insert(agent, my_state.clone());
         let action = if frame_count.0 as usize % AGENT_TICK_RATE == 0 {
@@ -770,6 +955,7 @@ fn handle_input(
 }
 
 fn main() {
+    burn_tch::TchBackend::<f32>::seed(rand::random());
     App::new()
         .insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
