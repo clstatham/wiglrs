@@ -15,6 +15,7 @@ use burn::{
 use burn_tch::{TchBackend, TchDevice};
 
 use burn_tensor::backend::ADBackend;
+use itertools::Itertools;
 use std::f32::consts::PI;
 
 use crate::brains::FrameStack;
@@ -379,7 +380,7 @@ impl Thinker for PpoThinker {
         )
     }
 
-    fn learn<const MAX_LEN: usize>(&mut self, rb: &mut SartAdvBuffer<MAX_LEN>) {
+    fn learn(&mut self, rb: &SartAdvBuffer) {
         let mut nstep = 0;
 
         let mut total_pi_loss = 0.0;
@@ -390,9 +391,16 @@ impl Thinker for PpoThinker {
             nstep += AGENT_OPTIM_BATCH_SIZE;
             // let dsc = format!("Epoch {}", epoch + 1);
             // for (step, returns) in kdam::tqdm!(desc = dsc, position = 1) {
-            let step = rb.sample_batch(AGENT_OPTIM_BATCH_SIZE);
-            let returns =
-                Tensor::from_floats(step.returns.as_slice()).to_device(&self.actor.devices()[0]);
+            let step = rb.sample_batch(AGENT_OPTIM_BATCH_SIZE).unwrap();
+            let returns = Tensor::from_floats(
+                step.returns
+                    .iter()
+                    .copied()
+                    .map(|r| r.unwrap())
+                    .collect_vec()
+                    .as_slice(),
+            )
+            .to_device(&self.actor.devices()[0]);
             let s = step
                 .obs
                 .iter()
@@ -424,9 +432,16 @@ impl Thinker for PpoThinker {
                 .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
 
             // let advantage = (returns.clone() - old_val).reshape([nbatch, 1]);
-            let advantage = Tensor::from_floats(step.advantage.as_slice())
-                .to_device(&self.actor.devices()[0])
-                .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
+            let advantage = Tensor::from_floats(
+                step.advantage
+                    .iter()
+                    .copied()
+                    .map(|a| a.unwrap())
+                    .collect_vec()
+                    .as_slice(),
+            )
+            .to_device(&self.actor.devices()[0])
+            .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
 
             let (mu, std) = self.actor.forward(s.clone());
             let dist = MvNormal::<ACTION_LEN> {

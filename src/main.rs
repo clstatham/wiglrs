@@ -17,13 +17,13 @@ use bevy::{
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 use brains::{
-    replay_buffer::Sart,
+    replay_buffer::{Sart, SartAdvBuffer},
     thinkers::{self, ppo::PpoThinker, Thinker},
     Brain, BrainBank,
 };
 use hparams::{
     AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_OPTIM_EPOCHS, AGENT_RADIUS,
-    AGENT_SHOOT_DISTANCE, AGENT_TICK_RATE, AGENT_UPDATE_INTERVAL, NUM_AGENTS,
+    AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, AGENT_TICK_RATE, AGENT_UPDATE_INTERVAL, NUM_AGENTS,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -285,19 +285,21 @@ fn check_train_brains(
     }
 }
 
+#[derive(Default)]
+pub struct ReplayBuffers(pub BTreeMap<usize, SartAdvBuffer>);
+
 fn train_brains(
     mut brains: NonSendMut<BrainBank>,
+    rbs: NonSend<ReplayBuffers>,
     mut log: ResMut<LogText>,
     frame_count: Res<FrameCount>,
     mut rx: EventReader<TrainBrain>,
     mut tx: EventWriter<DoneTraining>,
 ) {
     if let Some(id) = rx.iter().next() {
-        // for brain in brains.values_mut() {
-        // if brain.rb.buf.len() >= AGENT_RB_MAX_LEN {
         let brain = brains
             .iter_mut()
-            .find_map(|(_, v)| if v.id == id.0 as u64 { Some(v) } else { None })
+            .find_map(|(_, v)| if v.id == id.0 { Some(v) } else { None })
             .unwrap();
         if brain.deaths > 0 {
             log.push(format!(
@@ -305,7 +307,7 @@ fn train_brains(
                 brain.id, brain.name, AGENT_OPTIM_EPOCHS
             ));
 
-            brain.learn(frame_count.0 as usize);
+            brain.learn(frame_count.0 as usize, &rbs.0);
             log.push(format!(
                 "{} {} Policy Loss: {}",
                 brain.id, &brain.name, brain.thinker.recent_policy_loss
@@ -427,6 +429,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut brains: NonSendMut<BrainBank>,
+    mut rbs: NonSendMut<ReplayBuffers>,
     asset_server: Res<AssetServer>,
     timestamp: Res<Timestamp>,
 ) {
@@ -493,6 +496,7 @@ fn setup(
 
     for _ in 0..NUM_AGENTS {
         let brain = Brain::new(thinkers::ppo::PpoThinker::default(), &timestamp);
+        rbs.0.insert(brain.id, SartAdvBuffer::default());
         spawn_agent(
             brain,
             &mut commands,
@@ -511,6 +515,7 @@ fn update(
         (With<Agent>, Without<NameText>),
     >,
     mut brains: NonSendMut<BrainBank>,
+    mut rbs: NonSendMut<ReplayBuffers>,
     mut health: Query<&mut Health>,
     agents_shootin: Query<(&Transform, &Children), (With<Agent>, Without<ShootyLine>)>,
     mut line_vis: Query<
@@ -672,18 +677,23 @@ fn update(
 
     for (agent, _, _, _) in agents.iter() {
         let fs = brains.get(&agent).unwrap().fs.clone();
-        // for brain in brains.values_mut() {
-        brains.get_mut(&agent).unwrap().rb.remember_sart(Sart {
-            obs: fs.clone(),
-            action: all_actions.get(&agent).unwrap().to_owned(),
-            reward: all_rewards.get(&agent).unwrap().to_owned(),
-            terminal: all_terminals.get(&agent).unwrap().to_owned(),
-        });
-        // }
+        if let Some(rb) = rbs.0.get_mut(&brains.get(&agent).unwrap().id) {
+            rb.remember_sart(
+                Sart {
+                    obs: fs.clone(),
+                    action: all_actions.get(&agent).unwrap().to_owned(),
+                    reward: all_rewards.get(&agent).unwrap().to_owned(),
+                    terminal: all_terminals.get(&agent).unwrap().to_owned(),
+                },
+                Some(AGENT_RB_MAX_LEN),
+            );
+        }
     }
 
     for agent in dead_agents {
-        brains.get_mut(&agent).unwrap().rb.finish_trajectory();
+        if let Some(rb) = rbs.0.get_mut(&brains.get(&agent).unwrap().id) {
+            rb.finish_trajectory();
+        }
         commands.entity(agent).despawn_recursive();
     }
 }
@@ -772,6 +782,7 @@ fn main() {
         })
         .insert_resource(Timestamp::default())
         .insert_resource(AvgAgentKills::default())
+        .insert_non_send_resource(ReplayBuffers::default())
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
         .insert_non_send_resource(BrainBank::default())
@@ -785,7 +796,7 @@ fn main() {
             primary_window: Some(Window {
                 present_mode: bevy::window::PresentMode::AutoNoVsync,
                 title: "wiglrs".to_owned(),
-                mode: WindowMode::BorderlessFullscreen,
+                mode: WindowMode::Windowed,
                 ..default()
             }),
             ..Default::default()

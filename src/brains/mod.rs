@@ -1,18 +1,14 @@
 use bevy::prelude::*;
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::File,
-    sync::atomic::AtomicU64,
+    sync::atomic::AtomicUsize,
 };
 
 use self::{
     replay_buffer::SartAdvBuffer,
     thinkers::{ppo::PpoThinker, Thinker},
 };
-use crate::{
-    hparams::{AGENT_RB_MAX_LEN, N_FRAME_STACK},
-    Action, Observation, TbWriter, Timestamp,
-};
+use crate::{hparams::N_FRAME_STACK, Action, Observation, TbWriter, Timestamp};
 use serde::{Deserialize, Serialize};
 
 pub mod replay_buffer;
@@ -46,8 +42,7 @@ pub struct Brain<T: Thinker> {
     pub deaths: usize,
     pub kills: usize,
     pub color: Color,
-    pub id: u64,
-    pub rb: SartAdvBuffer<AGENT_RB_MAX_LEN>,
+    pub id: usize,
     pub fs: FrameStack,
     pub last_action: Action,
     pub thinker: T,
@@ -56,19 +51,17 @@ pub struct Brain<T: Thinker> {
 
 impl<T: Thinker> Brain<T> {
     pub fn new(thinker: T, timestamp: &Timestamp) -> Self {
-        static BRAIN_IDS: AtomicU64 = AtomicU64::new(0);
-        let id = BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        static BRAIN_IDS: AtomicUsize = AtomicUsize::new(0);
         let name = crate::names::random_name();
         let mut writer = TbWriter::default();
-        writer.init(Some(format!("{}_{}", id, &name).as_str()), timestamp);
+        writer.init(Some(name.as_str()), timestamp);
         Self {
             name,
             timestamp: timestamp.to_owned(),
             color: Color::rgb(rand::random(), rand::random(), rand::random()),
-            id,
+            id: BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             kills: 0,
             deaths: 0,
-            rb: SartAdvBuffer::default(),
             fs: FrameStack::default(),
             last_action: Action::default(),
             thinker,
@@ -78,18 +71,18 @@ impl<T: Thinker> Brain<T> {
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let path = format!(
-            "training/{}/{}_{}_{}K_{}D",
-            self.timestamp, self.id, self.name, self.kills, self.deaths
+            "training/{}/{}_{}K_{}D",
+            self.timestamp, self.name, self.kills, self.deaths
         );
         std::fs::create_dir_all(&path).ok();
         self.thinker.save(path)?;
-        let rb = postcard::to_allocvec(&self.rb)?;
-        let mut rb_f = File::create(format!(
-            "training/{}/{}_{}_rb.postcard",
-            self.timestamp, self.id, self.name
-        ))?;
-        use std::io::Write;
-        rb_f.write_all(&rb)?;
+        // let rb = postcard::to_allocvec(&self.rb)?;
+        // let mut rb_f = File::create(format!(
+        //     "training/{}/{}_{}_rb.postcard",
+        //     self.timestamp, self.id, self.name
+        // ))?;
+        // use std::io::Write;
+        // rb_f.write_all(&rb)?;
         Ok(())
     }
 }
@@ -104,9 +97,12 @@ impl Brain<PpoThinker> {
         action
     }
 
-    pub fn learn(&mut self, frame_count: usize) {
-        self.thinker.learn(&mut self.rb);
-        let net_reward = self.rb.buf.iter().map(|s| s.reward).sum::<f32>();
+    pub fn learn(&mut self, frame_count: usize, rbs: &BTreeMap<usize, SartAdvBuffer>) {
+        // self.thinker.learn(
+        //     &SartAdvBuffer::sample_many(rbs, AGENT_OPTIM_BATCH_SIZE * AGENT_OPTIM_EPOCHS).unwrap(),
+        // );
+        self.thinker.learn(&rbs[&self.id]);
+        let net_reward = rbs[&self.id].reward.iter().sum::<f32>();
         self.writer.add_scalar("Reward", net_reward, frame_count);
         self.writer
             .add_scalar("Loss/Policy", self.thinker.recent_policy_loss, frame_count);
