@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use bevy_egui::{
     egui::{
         self,
-        plot::{Bar, BarChart},
+        plot::{Bar, BarChart, Legend},
         Color32, Layout,
     },
     EguiContexts,
@@ -54,9 +54,9 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
         });
     });
     egui::Window::new("Action Mean/Std/Entropy")
-        .default_height(200.0)
-        // .default_width(400.0)
-        .auto_sized()
+        .min_height(200.0)
+        .min_width(1200.0)
+        // .auto_sized()
         .scroll2([true, false])
         .resizable(true)
         .show(cxs.ctx_mut(), |ui| {
@@ -88,41 +88,48 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                     .thinker
                                     .recent_mu
                                     .iter()
+                                    .zip(brain.thinker.recent_std.iter())
                                     .enumerate()
-                                    .map(|(i, val)| {
-                                        Bar::new(i as f64, *val as f64).fill(Color32::RED)
+                                    .map(|(i, (mu, std))| {
+                                        let rg = Vec2::new(*std, 1.0 / *std).normalize();
+                                        Bar::new(i as f64, *mu as f64).fill(Color32::from_rgb(
+                                            (rg.x * 255.0) as u8,
+                                            (rg.y * 255.0) as u8,
+                                            0,
+                                        ))
+                                        // .width(1.0 - *std as f64 / 6.0)
                                     })
                                     .collect_vec();
-                                let stddev = brain
-                                    .thinker
-                                    .recent_std
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, val)| {
-                                        Bar::new(i as f64, *val as f64).fill(Color32::GREEN)
-                                    })
-                                    .collect_vec();
+                                // let stddev = brain
+                                //     .thinker
+                                //     .recent_std
+                                //     .iter()
+                                //     .enumerate()
+                                //     .map(|(i, val)| {
+                                //         Bar::new(i as f64, *val as f64).fill(Color32::GREEN)
+                                //     })
+                                //     .collect_vec();
                                 ui.group(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {
-                                            ui.label("Action Mean");
-                                            egui::plot::Plot::new("Mu")
+                                            ui.label("Action Space");
+                                            egui::plot::Plot::new("ActionSpace")
                                                 .center_y_axis(true)
-                                                .height(50.0)
-                                                .width(100.0)
+                                                .height(80.0)
+                                                .width(220.0)
                                                 .show(ui, |plot| plot.bar_chart(BarChart::new(mu)));
                                         });
-                                        ui.vertical(|ui| {
-                                            ui.label("Action Stddev");
-                                            egui::plot::Plot::new("Std")
-                                                .auto_bounds_y()
-                                                .data_aspect(1.0 / 6.0)
-                                                .height(50.0)
-                                                .width(100.0)
-                                                .show(ui, |plot| {
-                                                    plot.bar_chart(BarChart::new(stddev))
-                                                });
-                                        })
+                                        // ui.vertical(|ui| {
+                                        //     ui.label("Action Stddev");
+                                        //     egui::plot::Plot::new("Std")
+                                        //         .auto_bounds_y()
+                                        //         .data_aspect(1.0 / 6.0)
+                                        //         .height(50.0)
+                                        //         .width(100.0)
+                                        //         .show(ui, |plot| {
+                                        //             plot.bar_chart(BarChart::new(stddev))
+                                        //         });
+                                        // })
                                     });
                                 });
                             });
