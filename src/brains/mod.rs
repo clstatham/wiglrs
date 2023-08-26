@@ -49,6 +49,7 @@ pub struct Brain<T: Thinker> {
     pub id: u64,
     pub rb: ReplayBuffer<AGENT_RB_MAX_LEN>,
     pub fs: FrameStack,
+    pub last_action: Action,
     pub thinker: T,
     pub writer: TbWriter,
 }
@@ -69,6 +70,7 @@ impl<T: Thinker> Brain<T> {
             deaths: 0,
             rb: ReplayBuffer::default(),
             fs: FrameStack::default(),
+            last_action: Action::default(),
             thinker,
             writer,
         }
@@ -96,6 +98,7 @@ impl Brain<PpoThinker> {
     pub fn act(&mut self, obs: Observation, frame_count: usize) -> Action {
         self.fs.push(obs);
         let action = self.thinker.act(self.fs.clone());
+        self.last_action = action;
         self.writer
             .add_scalar("Entropy", self.thinker.recent_entropy, frame_count);
         action

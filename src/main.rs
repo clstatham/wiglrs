@@ -23,7 +23,7 @@ use brains::{
 };
 use hparams::{
     AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_OPTIM_EPOCHS, AGENT_RADIUS,
-    AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, NUM_AGENTS,
+    AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, AGENT_TICK_RATE, NUM_AGENTS,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -561,10 +561,14 @@ fn update(
         }
 
         all_states.insert(agent, my_state.clone());
-        let action = brains
-            .get_mut(&agent)
-            .unwrap()
-            .act(my_state, frame_count.0 as usize);
+        let action = if frame_count.0 as usize % AGENT_TICK_RATE == 0 {
+            brains
+                .get_mut(&agent)
+                .unwrap()
+                .act(my_state, frame_count.0 as usize)
+        } else {
+            brains.get(&agent).unwrap().last_action
+        };
 
         all_actions.insert(agent, action);
         all_rewards.insert(agent, 0.0);
