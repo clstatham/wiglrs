@@ -71,8 +71,8 @@ impl<T: Thinker> Brain<T> {
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let path = format!(
-            "training/{}/{}_{}K_{}D",
-            self.timestamp, self.name, self.kills, self.deaths
+            "training/{}/{}_{}_{}K_{}D",
+            self.timestamp, self.id, self.name, self.kills, self.deaths
         );
         std::fs::create_dir_all(&path).ok();
         self.thinker.save(path)?;

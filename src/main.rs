@@ -6,7 +6,6 @@ use std::{
 };
 
 use bevy::{
-    app::ScheduleRunnerPlugin,
     core::FrameCount,
     math::Vec3Swizzles,
     prelude::*,
@@ -337,8 +336,6 @@ fn check_respawn_all(
         if commands.get_entity(agent).is_none() {
             let mut brain = brains.remove(&agent).unwrap();
 
-            // brain.learn(frame_count.0 as usize);
-
             brain.deaths += 1;
 
             spawn_agent(
@@ -349,7 +346,6 @@ fn check_respawn_all(
                 &mut brains,
                 &asset_server,
             );
-            // avg_kills.0 = brains.values().map(|b| b.kills as f32).sum::<f32>() / NUM_AGENTS as f32;
         }
     }
 }
@@ -786,12 +782,6 @@ fn main() {
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
         .insert_non_send_resource(BrainBank::default())
-        .add_plugins(ScheduleRunnerPlugin {
-            run_mode: bevy::app::RunMode::Loop {
-                // wait: Some(Duration::from_secs_f64(1.0 / 60.0)),
-                wait: None,
-            },
-        })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 present_mode: bevy::window::PresentMode::AutoNoVsync,
@@ -805,7 +795,7 @@ fn main() {
             gravity: Vec2::ZERO,
             timestep_mode: TimestepMode::Fixed {
                 dt: 1.0 / 60.0,
-                substeps: 2,
+                substeps: 1,
             },
             ..Default::default()
         })

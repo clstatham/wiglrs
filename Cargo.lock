@@ -1230,6 +1230,7 @@ checksum = "a3e2c3daef883ecc1b5d58c15adae93470a91d425f3532ba1695849656af3fc1"
 [[package]]
 name = "burn"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "burn-core",
  "burn-train",
@@ -1238,6 +1239,7 @@ dependencies = [
 [[package]]
 name = "burn-autodiff"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "burn-common",
  "burn-tensor",
@@ -1249,6 +1251,7 @@ dependencies = [
 [[package]]
 name = "burn-common"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "const-random",
  "rand",
@@ -1259,6 +1262,7 @@ dependencies = [
 [[package]]
 name = "burn-core"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "bincode",
  "burn-autodiff",
@@ -1282,6 +1286,7 @@ dependencies = [
 [[package]]
 name = "burn-dataset"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "csv",
  "derive-new",
@@ -1306,6 +1311,7 @@ dependencies = [
 [[package]]
 name = "burn-derive"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1315,6 +1321,7 @@ dependencies = [
 [[package]]
 name = "burn-tch"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "burn-tensor",
  "half",
@@ -1326,6 +1333,7 @@ dependencies = [
 [[package]]
 name = "burn-tensor"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "derive-new",
  "half",
@@ -1340,6 +1348,7 @@ dependencies = [
 [[package]]
 name = "burn-tensor-testgen"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1349,6 +1358,7 @@ dependencies = [
 [[package]]
 name = "burn-train"
 version = "0.9.0"
+source = "git+https://github.com/burn-rs/burn.git#a25f8b224a8a6c14161058e62c647c474f86eb3c"
 dependencies = [
  "burn-core",
  "derive-new",

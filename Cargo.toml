@@ -20,10 +20,10 @@ tensorboard-rs = "0.5.9"
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.0.6", default-features = false, features = ["alloc"] }
 kdam = { version = "0.4.1", features = ["rich"] }
-burn = { path = "./burn/burn" }
-burn-autodiff = { path = "./burn/burn-autodiff" }
-burn-tch = { path = "./burn/burn-tch" }
-burn-tensor = { path = "./burn/burn-tensor" }
+burn = { git = "https://github.com/burn-rs/burn.git", package = "burn" }
+burn-autodiff = { git = "https://github.com/burn-rs/burn.git", package = "burn-autodiff" }
+burn-tch = { git = "https://github.com/burn-rs/burn.git", package = "burn-tch" }
+burn-tensor = { git = "https://github.com/burn-rs/burn.git", package = "burn-tensor" }
 
 [profile.dev.package."*"]
 opt-level = 3
