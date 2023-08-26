@@ -299,23 +299,26 @@ fn train_brains(
             .iter_mut()
             .find_map(|(_, v)| if v.id == id.0 as u64 { Some(v) } else { None })
             .unwrap();
-        log.push(format!(
-            "{} {} replay buffer full, training for {} epochs...",
-            brain.id, brain.name, AGENT_OPTIM_EPOCHS
-        ));
-        brain.learn(frame_count.0 as usize);
-        log.push(format!(
-            "{} {} Policy Loss: {}",
-            brain.id, &brain.name, brain.thinker.recent_policy_loss
-        ));
-        log.push(format!(
-            "{} {} Value Loss: {}",
-            brain.id, &brain.name, brain.thinker.recent_value_loss
-        ));
-        log.push(format!(
-            "{} {} Policy Clamp Ratio: {}",
-            brain.id, &brain.name, brain.thinker.recent_nclamp
-        ));
+        if brain.deaths > 0 {
+            log.push(format!(
+                "Training {} {} for {} epochs...",
+                brain.id, brain.name, AGENT_OPTIM_EPOCHS
+            ));
+
+            brain.learn(frame_count.0 as usize);
+            log.push(format!(
+                "{} {} Policy Loss: {}",
+                brain.id, &brain.name, brain.thinker.recent_policy_loss
+            ));
+            log.push(format!(
+                "{} {} Value Loss: {}",
+                brain.id, &brain.name, brain.thinker.recent_value_loss
+            ));
+            log.push(format!(
+                "{} {} Policy Clamp Ratio: {}",
+                brain.id, &brain.name, brain.thinker.recent_nclamp
+            ));
+        }
 
         tx.send(DoneTraining);
     }
