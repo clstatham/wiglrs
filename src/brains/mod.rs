@@ -89,7 +89,6 @@ impl<T: Thinker> Brain<T> {
 
 impl Brain<PpoThinker> {
     pub fn act(&mut self, obs: Observation, frame_count: usize) -> Action {
-        self.fs.push(obs);
         let action = self.thinker.act(self.fs.clone());
         self.last_action = action;
         self.writer

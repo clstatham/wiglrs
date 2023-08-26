@@ -91,7 +91,6 @@ impl Observation {
             self.left_wall_dist / 2000.0,
             self.right_wall_dist / 2000.0,
             self.health / AGENT_MAX_HEALTH,
-            // self.dt,
         ];
         for other in &self.other_states {
             out.extend_from_slice(&[
@@ -273,7 +272,6 @@ fn check_train_brains(
             tx.send(TrainBrain(text.0));
         }
         if rx.iter().next().is_some() {
-            // for ent in text_ent.iter() {
             let id = text.0;
             commands.entity(text_ent).despawn();
             if id + 1 < NUM_AGENTS {
@@ -294,8 +292,6 @@ fn check_train_brains(
                     TrainingText(id + 1, Timer::from_seconds(0.1, TimerMode::Once)),
                 ));
             }
-
-            // }
         }
     }
 }
@@ -724,28 +720,28 @@ fn update(
 
         let filter = QueryFilter::only_fixed();
         if let Some((_, toi)) =
-            cx.cast_ray(transform.translation.xy(), Vec2::Y, Real::MAX, true, filter)
+            cx.cast_ray(transform.translation.xy(), Vec2::Y, 2000.0, true, filter)
         {
             my_state.up_wall_dist = toi;
         }
         if let Some((_, toi)) = cx.cast_ray(
             transform.translation.xy(),
             Vec2::NEG_Y,
-            Real::MAX,
+            2000.0,
             true,
             filter,
         ) {
             my_state.down_wall_dist = toi;
         }
         if let Some((_, toi)) =
-            cx.cast_ray(transform.translation.xy(), Vec2::X, Real::MAX, true, filter)
+            cx.cast_ray(transform.translation.xy(), Vec2::X, 2000.0, true, filter)
         {
             my_state.right_wall_dist = toi;
         }
         if let Some((_, toi)) = cx.cast_ray(
             transform.translation.xy(),
             Vec2::NEG_X,
-            Real::MAX,
+            2000.0,
             true,
             filter,
         ) {
@@ -767,9 +763,8 @@ fn update(
             my_state.other_states[i] = other_state;
         }
 
-        // dbg!(&agent, &my_state);
-
         all_states.insert(agent, my_state.clone());
+        brains.get_mut(&agent).unwrap().fs.push(my_state.clone());
         let action = if frame_count.0 as usize % AGENT_TICK_RATE == 0 {
             brains
                 .get_mut(&agent)

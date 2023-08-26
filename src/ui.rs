@@ -104,15 +104,7 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                         // .width(1.0 - *std as f64 / 6.0)
                                     })
                                     .collect_vec();
-                                // let stddev = brain
-                                //     .thinker
-                                //     .recent_std
-                                //     .iter()
-                                //     .enumerate()
-                                //     .map(|(i, val)| {
-                                //         Bar::new(i as f64, *val as f64).fill(Color32::GREEN)
-                                //     })
-                                //     .collect_vec();
+
                                 ui.group(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {
@@ -123,17 +115,6 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                                 .width(220.0)
                                                 .show(ui, |plot| plot.bar_chart(BarChart::new(mu)));
                                         });
-                                        // ui.vertical(|ui| {
-                                        //     ui.label("Action Stddev");
-                                        //     egui::plot::Plot::new("Std")
-                                        //         .auto_bounds_y()
-                                        //         .data_aspect(1.0 / 6.0)
-                                        //         .height(50.0)
-                                        //         .width(100.0)
-                                        //         .show(ui, |plot| {
-                                        //             plot.bar_chart(BarChart::new(stddev))
-                                        //         });
-                                        // })
                                     });
                                 });
                             });

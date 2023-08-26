@@ -62,10 +62,7 @@ impl<const K: usize> MvNormal<K> {
         let f = (2.0 * PI).powf(K as f32);
         let denom = (det * f).sqrt();
         let pdf = numer / denom;
-        // let non_nans = pdf.clone().equal(pdf.clone()); // filter nans
-        // let ones = pdf.ones_like();
-        // let pdf = ones.mask_where(non_nans, pdf);
-        // pdf.log()
+
         pdf.log()
     }
 
@@ -389,8 +386,7 @@ impl Thinker for PpoThinker {
         let mut total_nclamp = 0.0;
         for _epoch in kdam::tqdm!(0..AGENT_OPTIM_EPOCHS, desc = "Training") {
             nstep += AGENT_OPTIM_BATCH_SIZE;
-            // let dsc = format!("Epoch {}", epoch + 1);
-            // for (step, returns) in kdam::tqdm!(desc = dsc, position = 1) {
+
             let step = rb.sample_batch(AGENT_OPTIM_BATCH_SIZE).unwrap();
             let returns = Tensor::from_floats(
                 step.returns
@@ -431,7 +427,6 @@ impl Thinker for PpoThinker {
                 .to_device(&self.actor.devices()[0])
                 .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
 
-            // let advantage = (returns.clone() - old_val).reshape([nbatch, 1]);
             let advantage = Tensor::from_floats(
                 step.advantage
                     .iter()
@@ -450,9 +445,7 @@ impl Thinker for PpoThinker {
             };
             let entropy = dist.entropy();
             let lp = dist.log_prob(a);
-            // dbg!(old_lp.clone().to_data(), lp.clone().to_data());
-            // let kl = (old_lp.clone() - lp.clone()).mean();
-            // total_kl += kl.into_scalar();
+
             let ratio = (lp - old_lp).exp();
             let surr1 = ratio.clone() * advantage.clone();
             let nclamp = ratio
@@ -487,7 +480,6 @@ impl Thinker for PpoThinker {
                 self.critic.clone(),
                 GradientsParams::from_grads(critic_grads, &self.critic),
             );
-            // }
         }
         self.recent_policy_loss = total_pi_loss / nstep as f32;
         self.recent_value_loss = total_val_loss / nstep as f32;
