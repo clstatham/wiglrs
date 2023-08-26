@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use bevy_egui::{
     egui::{
         self,
-        plot::{Bar, BarChart, Legend},
+        plot::{Bar, BarChart},
         Color32, Layout,
     },
     EguiContexts,
@@ -64,7 +64,8 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                 Layout::left_to_right(egui::Align::Min).with_main_wrap(false),
                 |ui| {
                     // egui::Grid::new("mean/std grid").show(ui, |ui| {
-                    for (i, (_ent, brain)) in brains.iter().sorted_by_key(|(_, b)| b.id).enumerate()
+                    for (_i, (_ent, brain)) in
+                        brains.iter().sorted_by_key(|(_, b)| b.id).enumerate()
                     {
                         ui.group(|ui| {
                             ui.vertical(|ui| {

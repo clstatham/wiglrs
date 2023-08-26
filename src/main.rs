@@ -39,7 +39,7 @@ pub struct OtherState {
     pub rel_pos: Vec2,
     pub linvel: Vec2,
     pub direction_dotprod: f32,
-    pub other_direction_dotprod: f32,
+    pub firing: bool,
 }
 
 pub const OTHER_STATE_LEN: usize = 6;
@@ -86,7 +86,7 @@ impl Observation {
                 other.linvel.x / 2000.0,
                 other.linvel.y / 2000.0,
                 other.direction_dotprod,
-                other.other_direction_dotprod,
+                if other.firing { 1.0 } else { 0.0 },
             ]);
         }
         out
@@ -217,27 +217,28 @@ impl AgentBundle {
 }
 
 #[derive(Event)]
-struct TrainBrains;
+struct TrainBrain(usize);
 
 #[derive(Event)]
 struct DoneTraining;
 
 #[derive(Component)]
-struct TrainingText;
+struct TrainingText(usize, Timer);
 
 fn check_train_brains(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut tx: EventWriter<TrainBrains>,
+    mut tx: EventWriter<TrainBrain>,
     mut rx: EventReader<DoneTraining>,
-    text: Query<Entity, With<TrainingText>>,
+    mut text: Query<(Entity, &mut TrainingText)>,
     frame_count: Res<FrameCount>,
+    time: Res<Time>,
 ) {
     if frame_count.0 as usize % AGENT_RB_MAX_LEN == AGENT_RB_MAX_LEN - 1 {
         commands.spawn((
             Text2dBundle {
                 text: Text::from_section(
-                    "Training...",
+                    format!("Training (1/{})", NUM_AGENTS),
                     TextStyle {
                         font: asset_server.load("fonts/FiraSans-Bold.ttf"),
                         font_size: 72.0,
@@ -248,13 +249,38 @@ fn check_train_brains(
                 text_anchor: Anchor::Center,
                 ..Default::default()
             },
-            TrainingText,
+            TrainingText(0, Timer::from_seconds(0.1, TimerMode::Once)),
         ));
-        tx.send(TrainBrains);
     }
-    if rx.iter().next().is_some() {
-        if let Ok(ent) = text.get_single() {
-            commands.entity(ent).despawn();
+    for (text_ent, mut text) in text.iter_mut() {
+        text.1.tick(time.delta());
+        if text.1.just_finished() {
+            tx.send(TrainBrain(text.0));
+        }
+        if rx.iter().next().is_some() {
+            // for ent in text_ent.iter() {
+            let id = text.0;
+            commands.entity(text_ent).despawn();
+            if id + 1 < NUM_AGENTS {
+                commands.spawn((
+                    Text2dBundle {
+                        text: Text::from_section(
+                            format!("Training ({}/{})", id + 2, NUM_AGENTS),
+                            TextStyle {
+                                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+                                font_size: 72.0,
+                                color: Color::YELLOW,
+                            },
+                        ),
+                        transform: Transform::from_translation(Vec3::splat(0.0)),
+                        text_anchor: Anchor::Center,
+                        ..Default::default()
+                    },
+                    TrainingText(id + 1, Timer::from_seconds(0.1, TimerMode::Once)),
+                ));
+            }
+
+            // }
         }
     }
 }
@@ -263,36 +289,40 @@ fn train_brains(
     mut brains: NonSendMut<BrainBank>,
     mut log: ResMut<LogText>,
     frame_count: Res<FrameCount>,
-    mut rx: EventReader<TrainBrains>,
+    mut rx: EventReader<TrainBrain>,
     mut tx: EventWriter<DoneTraining>,
 ) {
-    if rx.iter().next().is_some() {
-        for brain in brains.values_mut() {
-            // if brain.rb.buf.len() >= AGENT_RB_MAX_LEN {
-            log.push(format!(
-                "{} {} replay buffer full, training for {} epochs...",
-                brain.id, brain.name, AGENT_OPTIM_EPOCHS
-            ));
-            brain.learn(frame_count.0 as usize);
-            log.push(format!(
-                "{} {} Policy Loss: {}",
-                brain.id, &brain.name, brain.thinker.recent_policy_loss
-            ));
-            log.push(format!(
-                "{} {} Value Loss: {}",
-                brain.id, &brain.name, brain.thinker.recent_value_loss
-            ));
-            log.push(format!(
-                "{} {} Policy Clamp Ratio: {}",
-                brain.id, &brain.name, brain.thinker.recent_nclamp
-            ));
-            // log.push(format!(
-            //     "{} {} Policy KL Divergence: {}",
-            //     brain.id, &brain.name, brain.thinker.recent_kl
-            // ));
-            brain.rb.buf.clear();
-            // }
-        }
+    if let Some(id) = rx.iter().next() {
+        // for brain in brains.values_mut() {
+        // if brain.rb.buf.len() >= AGENT_RB_MAX_LEN {
+        let brain = brains
+            .iter_mut()
+            .find_map(|(_, v)| if v.id == id.0 as u64 { Some(v) } else { None })
+            .unwrap();
+        log.push(format!(
+            "{} {} replay buffer full, training for {} epochs...",
+            brain.id, brain.name, AGENT_OPTIM_EPOCHS
+        ));
+        brain.learn(frame_count.0 as usize);
+        log.push(format!(
+            "{} {} Policy Loss: {}",
+            brain.id, &brain.name, brain.thinker.recent_policy_loss
+        ));
+        log.push(format!(
+            "{} {} Value Loss: {}",
+            brain.id, &brain.name, brain.thinker.recent_value_loss
+        ));
+        log.push(format!(
+            "{} {} Policy Clamp Ratio: {}",
+            brain.id, &brain.name, brain.thinker.recent_nclamp
+        ));
+        // log.push(format!(
+        //     "{} {} Policy KL Divergence: {}",
+        //     brain.id, &brain.name, brain.thinker.recent_kl
+        // ));
+        brain.rb.buf.clear();
+        // }
+        // }
         tx.send(DoneTraining);
     }
 }
@@ -541,7 +571,7 @@ fn update(
             other_states: vec![OtherState::default(); NUM_AGENTS - 1],
         };
 
-        for (i, (_, _, other_vel, other_transform)) in agents
+        for (i, (other, _, other_vel, other_transform)) in agents
             .iter()
             .filter(|a| a.0 != agent)
             .sorted_by_key(|a| a.3.translation.distance(transform.translation) as i64)
@@ -550,12 +580,8 @@ fn update(
             let other_state = OtherState {
                 rel_pos: transform.translation.xy() - other_transform.translation.xy(),
                 linvel: other_vel.linvel,
-                direction_dotprod: transform.local_y().xy().dot(
-                    (transform.translation.xy() - other_transform.translation.xy()).normalize(),
-                ),
-                other_direction_dotprod: other_transform.local_y().xy().dot(
-                    (transform.translation.xy() - other_transform.translation.xy()).normalize(),
-                ),
+                direction_dotprod: transform.local_y().xy().dot(other_transform.local_y().xy()),
+                firing: brains[&other].last_action.shoot > 0.0,
             };
             my_state.other_states[i] = other_state;
         }
@@ -780,11 +806,11 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(Update, update)
         .add_systems(Update, check_respawn_all)
-        .add_systems(Update, check_train_brains)
+        .add_systems(PostUpdate, check_train_brains)
         .add_systems(Update, train_brains)
         .add_systems(Update, ui)
         .add_systems(Update, handle_input)
-        .add_event::<TrainBrains>()
+        .add_event::<TrainBrain>()
         .add_event::<DoneTraining>()
         .run();
 }

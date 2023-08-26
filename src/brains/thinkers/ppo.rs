@@ -404,7 +404,6 @@ impl Thinker for PpoThinker {
         let mut total_val_loss = 0.0;
         let mut total_entropy_loss = 0.0;
         let mut total_nclamp = 0.0;
-        let mut total_kl = 0.0;
         let total_batches =
             (nstep as f32 / AGENT_OPTIM_BATCH_SIZE as f32).ceil() as usize * AGENT_OPTIM_EPOCHS;
         let rb: Vec<_> = rb.buf.clone().into();
@@ -505,7 +504,6 @@ impl Thinker for PpoThinker {
         self.recent_value_loss = total_val_loss / total_batches as f32;
         self.recent_entropy_loss = total_entropy_loss / total_batches as f32;
         self.recent_nclamp = total_nclamp / total_batches as f32;
-        self.recent_kl = total_kl / total_batches as f32;
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
