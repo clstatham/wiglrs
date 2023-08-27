@@ -37,7 +37,6 @@ impl From<Polarity> for f32 {
 pub struct Wiring<B: Backend> {
     adj_matrix: Tensor<B, 2>,
     sensory_adj_matrix: Tensor<B, 2>,
-    num_layers: usize,
 }
 
 impl<B: Backend> Wiring<B> {
@@ -45,7 +44,6 @@ impl<B: Backend> Wiring<B> {
         let mut this = Self {
             adj_matrix: Tensor::zeros([output_dim, output_dim]),
             sensory_adj_matrix: Tensor::zeros([input_dim, output_dim]),
-            num_layers: 1,
         };
         for from in 0..output_dim {
             for to in 0..output_dim {
@@ -182,7 +180,6 @@ impl<B: Backend> Ncp<B> {
         let mut this = Wiring {
             adj_matrix: Tensor::zeros([units, units]),
             sensory_adj_matrix: Tensor::zeros([sensory_neurons, units]),
-            num_layers: 3,
         };
 
         let sensory = (0..sensory_neurons).collect_vec();
@@ -390,7 +387,7 @@ impl<B: Backend> LtcCell<B> {
             let numerator = cm_t.clone().unsqueeze() * v_pre.clone()
                 + gleak.clone().unsqueeze() * self.vleak.val().unsqueeze()
                 + w_numerator;
-            let denominator = cm_t.clone().unsqueeze() + gleak.clone().unsqueeze() * w_denominator;
+            let denominator = cm_t.clone().unsqueeze() + gleak.clone().unsqueeze() + w_denominator;
             v_pre = numerator / (denominator + 1e-7);
         }
 
@@ -415,17 +412,19 @@ impl<B: Backend> LtcCell<B> {
 
 #[derive(Debug, Config)]
 pub struct LtcCellConfig {
-    pub input_len: usize,
-    pub hidden_len: usize,
-    pub output_len: usize,
+    #[config(default = "6")]
     pub ode_unfolds: usize,
 }
 
 impl LtcCellConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self, wiring: Ncp<B>) -> LtcCell<B> {
-        let Ncp { wiring, .. } = wiring;
+        let Ncp {
+            wiring,
+            motor_neurons,
+            ..
+        } = wiring;
         LtcCell {
-            output_len: self.output_len,
+            output_len: motor_neurons.len(),
             gleak: Param::new(
                 ParamId::new(),
                 Tensor::random([wiring.units()], Distribution::Uniform(0.001, 1.0)),
@@ -489,7 +488,6 @@ impl LtcCellConfig {
             output_w: Param::new(ParamId::new(), Tensor::ones([wiring.output_dim()])),
             output_b: Param::new(ParamId::new(), Tensor::zeros([wiring.output_dim()])),
             ode_unfolds: self.ode_unfolds,
-            // wiring,
             units: wiring.units(),
         }
     }
@@ -587,19 +585,16 @@ impl<B: Backend> WiredCfcCell<B> {
         timespans: Tensor<B, 1>,
     ) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let [nbatch, _] = hx.shape().dims;
-        let layer_sizes = [
+        let (ninter, ncommand, nmotor) = (
             self.inter_neurons.len(),
             self.command_neurons.len(),
             self.motor_neurons.len(),
-        ];
+        );
         let h_state = vec![
-            hx.clone().slice([0..nbatch, 0..layer_sizes[0]]),
+            hx.clone().slice([0..nbatch, 0..ninter]),
+            hx.clone().slice([0..nbatch, ninter..ninter + ncommand]),
             hx.clone()
-                .slice([0..nbatch, layer_sizes[0]..layer_sizes[0] + layer_sizes[1]]),
-            hx.clone().slice([
-                0..nbatch,
-                layer_sizes[0] + layer_sizes[1]..layer_sizes[0] + layer_sizes[1] + layer_sizes[2],
-            ]),
+                .slice([0..nbatch, ninter + ncommand..ninter + ncommand + nmotor]),
         ];
         let mut new_h_state = vec![];
         for (layer, h) in self.layers.iter().zip(h_state.into_iter()) {
@@ -707,7 +702,10 @@ impl<B: Backend> Cfc<B> {
         let dev = &self.devices()[0];
         let [nbatch, nseq, nfeat] = xs.shape().dims;
         let nout = self.cell.motor_neurons.len();
-        let mut h = h.unwrap_or(Tensor::zeros([nbatch, nout])).to_device(dev);
+        let nhidden = self.cell.command_neurons.len()
+            + self.cell.motor_neurons.len()
+            + self.cell.inter_neurons.len();
+        let mut h = h.unwrap_or(Tensor::zeros([nbatch, nhidden])).to_device(dev);
         let mut outputs = Tensor::zeros([nbatch, nseq, nout]).to_device(dev);
 
         for i in 0..nseq {

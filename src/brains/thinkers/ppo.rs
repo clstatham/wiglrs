@@ -3,7 +3,10 @@
 use burn::{
     config::Config,
     module::{ADModule, Module, Param, ParamId},
-    nn::{Initializer, Linear, LinearConfig},
+    nn::{
+        transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
+        Initializer, Linear, LinearConfig,
+    },
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -201,7 +204,9 @@ impl<B: Backend> Gru<B> {
 
 #[derive(Module, Debug)]
 pub struct PpoActor<B: Backend> {
-    common: Ltc<B>,
+    common: TransformerEncoder<B>,
+    mu_head: Ltc<B>,
+    std_head: Ltc<B>,
 }
 
 #[derive(Config, Debug)]
@@ -213,21 +218,15 @@ pub struct PpoActorConfig {
 
 impl PpoActorConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoActor<B> {
-        let wiring = Ncp::new(
-            self.obs_len,
-            self.hidden_len,
-            self.hidden_len,
-            self.action_len * 2,
-            6,
-            6,
-            6,
-            6,
-        );
-        wiring.wiring.write_dot("foo.dot").unwrap();
+        let wiring1 = Ncp::auto(self.obs_len, self.hidden_len, self.action_len, None);
+        let wiring2 = Ncp::auto(self.obs_len, self.hidden_len, self.action_len, None);
         PpoActor {
-            common: Ltc {
-                cell: LtcCellConfig::new(self.obs_len, self.hidden_len, self.action_len * 2, 6)
-                    .init(wiring),
+            common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 2, 1).init(),
+            mu_head: Ltc {
+                cell: LtcCellConfig::new().init(wiring1),
+            },
+            std_head: Ltc {
+                cell: LtcCellConfig::new().init(wiring2),
             },
         }
     }
@@ -236,19 +235,19 @@ impl<B: Backend> PpoActor<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let x = x.to_device(&self.devices()[0]);
 
-        let (x, _) = self.common.forward(x, None);
+        let x = self.common.forward(TransformerEncoderInput::new(x));
 
-        // let mu = self.mu_head.forward(x.clone());
-        let [nbatch, nstack, nfeat] = x.shape().dims;
-        let mu = x
+        let (mu, _) = self.mu_head.forward(x.clone(), None);
+        let [nbatch, nstack, nfeat] = mu.shape().dims;
+        let mu = mu
             .clone()
-            .slice([0..nbatch, nstack - 1..nstack, 0..ACTION_LEN])
+            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1)
             .tanh();
 
-        // let std = self.std_head.forward(x);
-        let std = x
-            .slice([0..nbatch, nstack - 1..nstack, ACTION_LEN..nfeat])
+        let (std, _) = self.std_head.forward(x, None);
+        let std = std
+            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1);
         // softplus
         let std: Tensor<B, 2> = (std.exp() + 1.0).log();
@@ -259,7 +258,7 @@ impl<B: Backend> PpoActor<B> {
 
 #[derive(Module, Debug)]
 pub struct PpoCritic<B: Backend> {
-    rnn: Ltc<B>,
+    rnn: Cfc<B>,
     // head: Linear<B>,
 }
 
@@ -271,15 +270,11 @@ pub struct PpoCriticConfig {
 
 impl PpoCriticConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoCritic<B> {
+        let wiring = Ncp::auto(self.obs_len, self.hidden_len, 1, None);
         PpoCritic {
             // rnn: GruConfig::new(self.obs_len, self.hidden_len).init(),
-            rnn: Ltc {
-                cell: LtcCellConfig::new(self.obs_len, self.hidden_len, 1, 2).init(Ncp::auto(
-                    self.obs_len,
-                    self.hidden_len,
-                    1,
-                    None,
-                )),
+            rnn: Cfc {
+                cell: WiredCfcCellConfig::new().init(wiring),
             },
             // head: LinearConfig::new(self.hidden_len, 1).init(),
         }
@@ -442,7 +437,8 @@ impl Thinker for PpoThinker {
             )
             .to_device(&self.actor.devices()[0])
             .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
-            let s = s.require_grad();
+
+            // let s = s.require_grad();
             let (mu, std) = self.actor.forward(s.clone());
             let dist = MvNormal::<Be, ACTION_LEN> {
                 mu,
