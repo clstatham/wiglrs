@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{atomic::AtomicUsize, Arc, Mutex},
+    sync::atomic::AtomicUsize,
 };
 
 use self::{
@@ -145,4 +145,5 @@ impl Brain<SharedThinker<PpoThinker>> {
     }
 }
 
-pub type BrainBank = BTreeMap<Entity, Brain<SharedThinker<PpoThinker>>>;
+pub type AgentThinker = PpoThinker;
+pub type BrainBank = BTreeMap<Entity, Brain<AgentThinker>>;

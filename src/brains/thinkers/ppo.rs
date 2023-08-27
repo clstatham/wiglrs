@@ -4,8 +4,7 @@ use burn::{
     config::Config,
     module::{ADModule, Module, Param, ParamId},
     nn::{
-        transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
-        Initializer, Linear, LinearConfig,
+        Initializer, LinearConfig,
     },
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
@@ -25,7 +24,7 @@ use crate::{brains::replay_buffer::SartAdvBuffer, hparams::AGENT_ENTROPY_BETA};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::{
-    ncp::{Cfc, Ltc, LtcCellConfig, Ncp, WiredCfcCellConfig, WiringConfig},
+    ncp::{Cfc, Ncp, WiredCfcCellConfig, WiringConfig},
     Thinker,
 };
 
@@ -393,6 +392,16 @@ impl PpoThinker {
             recent_kl: 0.0,
         }
     }
+
+    fn init_hidden_train(&self, batch_size: usize) -> HiddenStates<Be> {
+        let dev = self.actor.devices()[0];
+        HiddenStates {
+            actor_com_h: Tensor::zeros_device([batch_size, self.actor.com_units], &dev),
+            actor_mu_h: Tensor::zeros_device([batch_size, self.actor.mustd_units], &dev),
+            actor_std_h: Tensor::zeros_device([batch_size, self.actor.mustd_units], &dev),
+            critic_h: Tensor::zeros_device([batch_size, self.critic.rnn_units], &dev),
+        }
+    }
 }
 
 impl Default for PpoThinker {
@@ -402,7 +411,7 @@ impl Default for PpoThinker {
 }
 
 impl Thinker for PpoThinker {
-    type Metadata = HiddenStates<Be>;
+    type Metadata = HiddenStates<TchBackend<f32>>;
 
     fn init_metadata(&self, batch_size: usize) -> Self::Metadata {
         let dev = self.actor.devices()[0];
@@ -421,7 +430,7 @@ impl Thinker for PpoThinker {
             .map(|o| Tensor::from_floats(o.as_vec().as_slice()).unsqueeze::<2>())
             .collect::<Vec<_>>();
         let obs = Tensor::cat(obs, 0).unsqueeze();
-        let (mu, std) = self.actor.forward(
+        let (mu, std) = self.actor.valid().forward(
             obs.clone(),
             &mut metadata.actor_com_h,
             &mut metadata.actor_mu_h,
@@ -435,7 +444,7 @@ impl Thinker for PpoThinker {
         };
         self.recent_entropy = dist.entropy().into_scalar();
         let action = dist.sample().clamp(-1.0, 1.0);
-        let val = self.critic.forward(obs, &mut metadata.critic_h);
+        let val = self.critic.valid().forward(obs, &mut metadata.critic_h);
 
         Action::from_slice(
             action.to_data().value.as_slice(),
@@ -466,6 +475,8 @@ impl Thinker for PpoThinker {
                     .as_slice(),
             )
             .to_device(&self.actor.devices()[0]);
+            let returns =
+                (returns.clone() - returns.clone().mean().unsqueeze()) / (returns.var(0) + 1e-7);
             let s = step
                 .obs
                 .iter()
@@ -506,10 +517,12 @@ impl Thinker for PpoThinker {
             )
             .to_device(&self.actor.devices()[0])
             .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
+            let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
+                / (advantage.var(0) + 1e-7);
 
             // let s = s.require_grad();
             // self.actor.reset_h(AGENT_OPTIM_BATCH_SIZE);
-            let mut meta = self.init_metadata(AGENT_OPTIM_BATCH_SIZE);
+            let mut meta = self.init_hidden_train(AGENT_OPTIM_BATCH_SIZE);
             let (mu, std) = self.actor.forward(
                 s.clone(),
                 &mut meta.actor_com_h,

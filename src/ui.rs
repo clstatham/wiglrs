@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use bevy_egui::{
     egui::{
         self,
-        plot::{Bar, BarChart, Line, PlotPoint},
+        plot::{Bar, BarChart, Line},
         Color32, Layout, Stroke,
     },
     EguiContexts,
@@ -72,29 +72,30 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                 ui.heading(&brain.name);
                                 // ui.group(|ui| {
                                 let mut mu = "mu:".to_owned();
-                                for m in brain.thinker.lock().recent_mu.iter() {
+                                for m in brain.thinker.recent_mu.iter() {
                                     mu.push_str(&format!(" {:.4}", m));
                                 }
                                 ui.label(mu);
                                 let mut std = "std:".to_owned();
-                                for s in brain.thinker.lock().recent_std.iter() {
+                                for s in brain.thinker.recent_std.iter() {
                                     std.push_str(&format!(" {:.4}", s));
                                 }
                                 ui.label(std);
-                                ui.label(format!("ent: {}", brain.thinker.lock().recent_entropy));
+                                ui.label(format!("ent: {}", brain.thinker.recent_entropy));
                                 // });
 
                                 // ui.horizontal_top(|ui| {
-                                let thinker = brain.thinker.lock();
-                                let ms = thinker
+
+                                let ms = brain
+                                    .thinker
                                     .recent_mu
                                     .iter()
-                                    .zip(thinker.recent_std.iter())
+                                    .zip(brain.thinker.recent_std.iter())
                                     .enumerate()
                                     .map(|(i, (mu, std))| {
                                         // https://www.desmos.com/calculator/rkoehr8rve
                                         let scale = std * 3.0;
-                                        let rg =
+                                        let _rg =
                                             Vec2::new(scale.exp(), (1.0 / scale).exp()).normalize();
                                         let m = Bar::new(i as f64, *mu as f64)
                                             // .fill(Color32::from_rgb(
@@ -112,7 +113,7 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                         // .width(1.0 - *std as f64 / 6.0)
                                     })
                                     .collect_vec();
-                                drop(thinker);
+
                                 ui.group(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {

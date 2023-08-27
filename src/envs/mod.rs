@@ -27,19 +27,19 @@ impl Env for Ffa {
     type SetupResources = ();
     fn setup(
         &mut self,
-        commands: Commands,
-        asset_server: Res<AssetServer>,
-        resources: Self::SetupResources,
+        _commands: Commands,
+        _asset_server: Res<AssetServer>,
+        _resources: Self::SetupResources,
     ) {
     }
 
     type RewardResources = ();
     fn reward(
         &mut self,
-        for_ent: Entity,
-        commands: Commands,
-        asset_server: Res<AssetServer>,
-        resources: Self::RewardResources,
+        _for_ent: Entity,
+        _commands: Commands,
+        _asset_server: Res<AssetServer>,
+        _resources: Self::RewardResources,
     ) -> f32 {
         todo!()
     }

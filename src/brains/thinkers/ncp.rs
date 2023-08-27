@@ -1,6 +1,6 @@
 //! implementation of https://github.com/mlech26l/ncps/
 
-use std::{collections::BTreeMap, fs::File, path::Path};
+
 
 use burn::{
     config::Config,
@@ -11,7 +11,7 @@ use burn::{
 
 use burn_tensor::Distribution;
 use itertools::Itertools;
-use petgraph::dot::Dot;
+
 use rand::{seq::SliceRandom, thread_rng};
 
 use super::ppo::sigmoid;

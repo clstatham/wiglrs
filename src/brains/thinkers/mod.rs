@@ -44,7 +44,7 @@ impl Thinker for RandomThinker {
 }
 
 pub struct SharedThinker<T: Thinker> {
-    pub thinker: Arc<Mutex<T>>,
+    thinker: Arc<Mutex<T>>,
 }
 
 impl<T: Thinker> Clone for SharedThinker<T> {
@@ -63,22 +63,22 @@ impl<T: Thinker> SharedThinker<T> {
     }
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        self.thinker.lock().unwrap()
+        self.thinker.try_lock().unwrap()
     }
 }
 
 impl<T: Thinker> Thinker for SharedThinker<T> {
     type Metadata = T::Metadata;
     fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action {
-        self.thinker.lock().unwrap().act(obs, metadata)
+        self.lock().act(obs, metadata)
     }
     fn learn(&mut self, b: &SartAdvBuffer) {
-        self.thinker.lock().unwrap().learn(b)
+        self.lock().learn(b)
     }
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
-        self.thinker.lock().unwrap().save(path)
+        self.lock().save(path)
     }
     fn init_metadata(&self, batch_size: usize) -> Self::Metadata {
-        self.thinker.lock().unwrap().init_metadata(batch_size)
+        self.lock().init_metadata(batch_size)
     }
 }

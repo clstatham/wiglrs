@@ -14,5 +14,5 @@ pub const AGENT_RADIUS: f32 = 20.0;
 pub const AGENT_LIN_MOVE_FORCE: f32 = 600.0;
 pub const AGENT_ANG_MOVE_FORCE: f32 = 1.0;
 
-pub const AGENT_MAX_HEALTH: f32 = 100.0;
-pub const AGENT_SHOOT_DISTANCE: f32 = 1000.0;
+pub const AGENT_MAX_HEALTH: f32 = 50.0;
+pub const AGENT_SHOOT_DISTANCE: f32 = 100.0;
