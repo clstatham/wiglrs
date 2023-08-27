@@ -145,7 +145,7 @@ pub fn lu(x: Tensor<Be, 2>) -> (Tensor<Be, 2>, Tensor<Be, 2>) {
     (l.transpose(), u.transpose())
 }
 
-fn print_matrix(x: &Tensor<Be, 2>) {
+pub fn print_matrix(x: &Tensor<Be, 2>) {
     let [rows, cols] = x.shape().dims;
     for i in 0..rows {
         println!("{:?}", x.clone().slice([i..i + 1, 0..cols]).to_data().value);

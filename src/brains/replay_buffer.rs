@@ -127,9 +127,9 @@ impl SartAdvBuffer {
         use rand::prelude::*;
 
         let end_of_last_traj = self.obs.len() - self.current_trajectory_start;
-        if end_of_last_traj <= batch_size {
-            return None;
-        }
+        // if end_of_last_traj <= batch_size {
+        //     return None;
+        // }
         let mut idxs = vec![0; batch_size];
         (0..end_of_last_traj).choose_multiple_fill(&mut thread_rng(), &mut idxs);
         let mut batch = SartAdvBuffer::default();

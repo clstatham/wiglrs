@@ -109,11 +109,14 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {
                                             ui.label("Action Space");
-                                            egui::plot::Plot::new("ActionSpace")
-                                                .center_y_axis(true)
-                                                .height(80.0)
-                                                .width(220.0)
-                                                .show(ui, |plot| plot.bar_chart(BarChart::new(mu)));
+                                            egui::plot::Plot::new(format!(
+                                                "ActionSpace{}",
+                                                brain.id
+                                            ))
+                                            .center_y_axis(true)
+                                            .height(80.0)
+                                            .width(220.0)
+                                            .show(ui, |plot| plot.bar_chart(BarChart::new(mu)));
                                         });
                                     });
                                 });

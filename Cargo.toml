@@ -24,6 +24,7 @@ burn = { git = "https://github.com/burn-rs/burn.git", package = "burn" }
 burn-autodiff = { git = "https://github.com/burn-rs/burn.git", package = "burn-autodiff" }
 burn-tch = { git = "https://github.com/burn-rs/burn.git", package = "burn-tch" }
 burn-tensor = { git = "https://github.com/burn-rs/burn.git", package = "burn-tensor" }
+petgraph = "0.6.4"
 
 [profile.dev.package."*"]
 opt-level = 3

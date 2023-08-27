@@ -19,7 +19,7 @@ use bevy_rapier2d::prelude::*;
 use brains::{
     replay_buffer::{Sart, SartAdvBuffer},
     thinkers::{self, ppo::PpoThinker, Thinker},
-    Brain, BrainBank,
+    Brain, BrainBank, FrameStack,
 };
 use burn_tensor::backend::Backend;
 use hparams::{
@@ -867,9 +867,12 @@ fn update(
     }
 
     for agent in dead_agents {
-        if let Some(rb) = rbs.0.get_mut(&brains.get(&agent).unwrap().id) {
+        let brain = brains.get_mut(&agent).unwrap();
+        brain.fs = FrameStack::default();
+        if let Some(rb) = rbs.0.get_mut(&brain.id) {
             rb.finish_trajectory();
         }
+
         commands.entity(agent).despawn_recursive();
     }
 }

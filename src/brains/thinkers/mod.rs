@@ -6,6 +6,7 @@ use crate::Action;
 
 use super::{replay_buffer::SartAdvBuffer, FrameStack};
 
+pub mod ncp;
 pub mod ppo;
 pub mod stats;
 

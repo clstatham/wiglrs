@@ -5791,6 +5791,7 @@ dependencies = [
  "lazy_static",
  "nalgebra",
  "num-traits",
+ "petgraph",
  "postcard",
  "rand",
  "rand_distr",

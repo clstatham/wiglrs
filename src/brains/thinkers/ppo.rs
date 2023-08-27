@@ -2,11 +2,8 @@
 
 use burn::{
     config::Config,
-    module::{Module, Param, ParamId},
-    nn::{
-        transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
-        Initializer, Linear, LinearConfig,
-    },
+    module::{ADModule, Module, Param, ParamId},
+    nn::{Initializer, Linear, LinearConfig},
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -14,7 +11,6 @@ use burn::{
 
 use burn_tch::{TchBackend, TchDevice};
 
-use burn_tensor::backend::ADBackend;
 use itertools::Itertools;
 use std::f32::consts::PI;
 
@@ -25,17 +21,20 @@ use crate::hparams::{
 use crate::{brains::replay_buffer::SartAdvBuffer, hparams::AGENT_ENTROPY_BETA};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
-use super::Thinker;
+use super::{
+    ncp::{Cfc, Ltc, LtcCellConfig, Ncp, WiredCfcCellConfig},
+    Thinker,
+};
 
 pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
 
-pub struct MvNormal<const K: usize> {
-    pub mu: Tensor<Be, 2>,
-    pub cov_diag: Tensor<Be, 2>,
+pub struct MvNormal<B: Backend<FloatElem = f32>, const K: usize> {
+    pub mu: Tensor<B, 2>,
+    pub cov_diag: Tensor<B, 2>,
 }
 
-impl<const K: usize> MvNormal<K> {
-    pub fn sample(&self) -> Tensor<Be, 2> {
+impl<B: Backend<FloatElem = f32>, const K: usize> MvNormal<B, K> {
+    pub fn sample(&self) -> Tensor<B, 2> {
         let std = self.cov_diag.clone().sqrt();
         let cov = std.to_data().value;
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
@@ -45,7 +44,7 @@ impl<const K: usize> MvNormal<K> {
         self.mu.clone() + z * std
     }
 
-    pub fn log_prob(self, x: Tensor<Be, 2>) -> Tensor<Be, 2> {
+    pub fn log_prob(self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         let x = x.to_device(&self.mu.device());
         let a = x.clone() - self.mu.clone();
         let cov = self.cov_diag.to_data().value;
@@ -66,7 +65,7 @@ impl<const K: usize> MvNormal<K> {
         pdf.log()
     }
 
-    pub fn entropy(&self) -> Tensor<Be, 2> {
+    pub fn entropy(&self) -> Tensor<B, 2> {
         let cov = self.cov_diag.to_data().value;
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
@@ -103,7 +102,7 @@ pub struct GruConfig {
 }
 
 impl GruConfig {
-    pub fn init<B: ADBackend>(&self) -> Gru<B> {
+    pub fn init<B: Backend>(&self) -> Gru<B> {
         let initializer = Initializer::XavierNormal { gain: 1.0 };
         Gru {
             w_xz: Param::new(
@@ -202,11 +201,7 @@ impl<B: Backend> Gru<B> {
 
 #[derive(Module, Debug)]
 pub struct PpoActor<B: Backend> {
-    common: Gru<B>,
-    mu_head1: TransformerEncoder<B>,
-    mu_head2: Linear<B>,
-    std_head1: TransformerEncoder<B>,
-    std_head2: Linear<B>,
+    common: Ltc<B>,
 }
 
 #[derive(Config, Debug)]
@@ -217,13 +212,23 @@ pub struct PpoActorConfig {
 }
 
 impl PpoActorConfig {
-    pub fn init<B: ADBackend>(&self) -> PpoActor<B> {
+    pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoActor<B> {
+        let wiring = Ncp::new(
+            self.obs_len,
+            self.hidden_len,
+            self.hidden_len,
+            self.action_len * 2,
+            6,
+            6,
+            6,
+            6,
+        );
+        wiring.wiring.write_dot("foo.dot").unwrap();
         PpoActor {
-            common: GruConfig::new(self.obs_len, self.hidden_len).init(),
-            mu_head1: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 1, 1).init(),
-            mu_head2: LinearConfig::new(self.hidden_len, self.action_len).init(),
-            std_head1: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 1, 1).init(),
-            std_head2: LinearConfig::new(self.hidden_len, self.action_len).init(),
+            common: Ltc {
+                cell: LtcCellConfig::new(self.obs_len, self.hidden_len, self.action_len * 2, 6)
+                    .init(wiring),
+            },
         }
     }
 }
@@ -233,21 +238,18 @@ impl<B: Backend> PpoActor<B> {
 
         let (x, _) = self.common.forward(x, None);
 
-        let mu = self
-            .mu_head1
-            .forward(TransformerEncoderInput::new(x.clone()));
-        let [nbatch, nstack, nfeat] = mu.shape().dims;
-        let mu = mu
-            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
-            .squeeze(1);
-        let mu = self.mu_head2.forward(mu).tanh();
+        // let mu = self.mu_head.forward(x.clone());
+        let [nbatch, nstack, nfeat] = x.shape().dims;
+        let mu = x
+            .clone()
+            .slice([0..nbatch, nstack - 1..nstack, 0..ACTION_LEN])
+            .squeeze(1)
+            .tanh();
 
-        let std = self.std_head1.forward(TransformerEncoderInput::new(x));
-        let [nbatch, nstack, nfeat] = std.shape().dims;
-        let std = std
-            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
+        // let std = self.std_head.forward(x);
+        let std = x
+            .slice([0..nbatch, nstack - 1..nstack, ACTION_LEN..nfeat])
             .squeeze(1);
-        let std = self.std_head2.forward(std);
         // softplus
         let std: Tensor<B, 2> = (std.exp() + 1.0).log();
 
@@ -257,9 +259,8 @@ impl<B: Backend> PpoActor<B> {
 
 #[derive(Module, Debug)]
 pub struct PpoCritic<B: Backend> {
-    rnn: Gru<B>,
-    transformer: TransformerEncoder<B>,
-    head: Linear<B>,
+    rnn: Ltc<B>,
+    // head: Linear<B>,
 }
 
 #[derive(Debug, Config)]
@@ -269,12 +270,18 @@ pub struct PpoCriticConfig {
 }
 
 impl PpoCriticConfig {
-    pub fn init<B: ADBackend>(&self) -> PpoCritic<B> {
+    pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoCritic<B> {
         PpoCritic {
-            rnn: GruConfig::new(self.obs_len, self.hidden_len).init(),
-            transformer: TransformerEncoderConfig::new(self.hidden_len, self.hidden_len, 1, 1)
-                .init(),
-            head: LinearConfig::new(self.hidden_len, 1).init(),
+            // rnn: GruConfig::new(self.obs_len, self.hidden_len).init(),
+            rnn: Ltc {
+                cell: LtcCellConfig::new(self.obs_len, self.hidden_len, 1, 2).init(Ncp::auto(
+                    self.obs_len,
+                    self.hidden_len,
+                    1,
+                    None,
+                )),
+            },
+            // head: LinearConfig::new(self.hidden_len, 1).init(),
         }
     }
 }
@@ -283,12 +290,11 @@ impl<B: Backend> PpoCritic<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 1> {
         let x = x.to_device(&self.devices()[0]);
         let (x, _) = self.rnn.forward(x, None);
-        let x = self.transformer.forward(TransformerEncoderInput::new(x));
         let [nbatch, nstack, nfeat] = x.shape().dims;
         let x: Tensor<B, 2> = x
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1);
-        let x = self.head.forward(x);
+        // let x = self.head.forward(x);
         x.squeeze(1)
     }
 }
@@ -356,17 +362,16 @@ impl Thinker for PpoThinker {
             .map(|o| Tensor::from_floats(o.as_vec().as_slice()).unsqueeze::<2>())
             .collect::<Vec<_>>();
         let obs = Tensor::cat(obs, 0).unsqueeze();
-        let (mu, std) = self.actor.forward(obs.clone());
-
+        let (mu, std) = self.actor.valid().forward(obs.clone());
         self.recent_mu = mu.to_data().value;
         self.recent_std = std.to_data().value;
-        let dist: MvNormal<ACTION_LEN> = MvNormal {
+        let dist: MvNormal<_, ACTION_LEN> = MvNormal {
             mu,
             cov_diag: std.clone() * std,
         };
         self.recent_entropy = dist.entropy().into_scalar();
         let action = dist.sample().clamp(-1.0, 1.0);
-        let val = self.critic.forward(obs);
+        let val = self.critic.valid().forward(obs);
 
         Action::from_slice(
             action.to_data().value.as_slice(),
@@ -437,9 +442,9 @@ impl Thinker for PpoThinker {
             )
             .to_device(&self.actor.devices()[0])
             .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
-
+            let s = s.require_grad();
             let (mu, std) = self.actor.forward(s.clone());
-            let dist = MvNormal::<ACTION_LEN> {
+            let dist = MvNormal::<Be, ACTION_LEN> {
                 mu,
                 cov_diag: std.clone() * std,
             };
