@@ -1,12 +1,12 @@
 use bevy::prelude::*;
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::atomic::AtomicUsize,
+    sync::{atomic::AtomicUsize, Arc, Mutex},
 };
 
 use self::{
     replay_buffer::SartAdvBuffer,
-    thinkers::{ppo::PpoThinker, Thinker},
+    thinkers::{ppo::PpoThinker, SharedThinker, Thinker},
 };
 use crate::{hparams::N_FRAME_STACK, Action, Observation, TbWriter, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -107,4 +107,40 @@ impl Brain<PpoThinker> {
     }
 }
 
-pub type BrainBank = BTreeMap<Entity, Brain<PpoThinker>>;
+impl Brain<SharedThinker<PpoThinker>> {
+    pub fn act(&mut self, _obs: Observation, frame_count: usize) -> Action {
+        let action = self.thinker.act(self.fs.clone());
+        self.last_action = action;
+        self.writer
+            .add_scalar("Entropy", self.thinker.lock().recent_entropy, frame_count);
+        action
+    }
+
+    pub fn learn(&mut self, frame_count: usize, rbs: &BTreeMap<usize, SartAdvBuffer>) {
+        self.thinker.learn(&rbs[&self.id]);
+        let net_reward = rbs[&self.id].reward.iter().sum::<f32>();
+        self.writer.add_scalar("Reward", net_reward, frame_count);
+        self.writer.add_scalar(
+            "Loss/Policy",
+            self.thinker.lock().recent_policy_loss,
+            frame_count,
+        );
+        self.writer.add_scalar(
+            "Loss/Value",
+            self.thinker.lock().recent_value_loss,
+            frame_count,
+        );
+        self.writer.add_scalar(
+            "Loss/EntropyPenalty",
+            self.thinker.lock().recent_entropy_loss,
+            frame_count,
+        );
+        self.writer.add_scalar(
+            "PolicyClampRatio",
+            self.thinker.lock().recent_nclamp,
+            frame_count,
+        );
+    }
+}
+
+pub type BrainBank = BTreeMap<Entity, Brain<SharedThinker<PpoThinker>>>;

@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 use bevy::prelude::Vec2;
 
@@ -33,5 +36,41 @@ impl Thinker for RandomThinker {
     fn learn(&mut self, _b: &SartAdvBuffer) {}
     fn save(&self, _path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
+    }
+}
+
+pub struct SharedThinker<T: Thinker> {
+    pub thinker: Arc<Mutex<T>>,
+}
+
+impl<T: Thinker> Clone for SharedThinker<T> {
+    fn clone(&self) -> Self {
+        Self {
+            thinker: self.thinker.clone(),
+        }
+    }
+}
+
+impl<T: Thinker> SharedThinker<T> {
+    pub fn new(thinker: T) -> Self {
+        Self {
+            thinker: Arc::new(Mutex::new(thinker)),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        self.thinker.lock().unwrap()
+    }
+}
+
+impl<T: Thinker> Thinker for SharedThinker<T> {
+    fn act(&mut self, obs: FrameStack) -> Action {
+        self.thinker.lock().unwrap().act(obs)
+    }
+    fn learn(&mut self, b: &SartAdvBuffer) {
+        self.thinker.lock().unwrap().learn(b)
+    }
+    fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+        self.thinker.lock().unwrap().save(path)
     }
 }

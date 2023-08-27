@@ -18,7 +18,7 @@ use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 use brains::{
     replay_buffer::{Sart, SartAdvBuffer},
-    thinkers::{self, ppo::PpoThinker, Thinker},
+    thinkers::{self, ppo::PpoThinker, SharedThinker, Thinker},
     Brain, BrainBank, FrameStack,
 };
 use burn_tensor::backend::Backend;
@@ -321,15 +321,21 @@ fn train_brains(
             brain.learn(frame_count.0 as usize, &rbs.0);
             log.push(format!(
                 "{} {} Policy Loss: {}",
-                brain.id, &brain.name, brain.thinker.recent_policy_loss
+                brain.id,
+                &brain.name,
+                brain.thinker.lock().recent_policy_loss
             ));
             log.push(format!(
                 "{} {} Value Loss: {}",
-                brain.id, &brain.name, brain.thinker.recent_value_loss
+                brain.id,
+                &brain.name,
+                brain.thinker.lock().recent_value_loss
             ));
             log.push(format!(
                 "{} {} Policy Clamp Ratio: {}",
-                brain.id, &brain.name, brain.thinker.recent_nclamp
+                brain.id,
+                &brain.name,
+                brain.thinker.lock().recent_nclamp
             ));
         }
 
@@ -366,7 +372,7 @@ fn check_respawn_all(
 pub struct Wall;
 
 fn spawn_agent(
-    brain: Brain<PpoThinker>,
+    brain: Brain<SharedThinker<PpoThinker>>,
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
@@ -639,7 +645,8 @@ fn setup(
         ));
 
     for _ in 0..NUM_AGENTS {
-        let brain = Brain::new(thinkers::ppo::PpoThinker::default(), &timestamp);
+        let thinker = SharedThinker::new(PpoThinker::default());
+        let brain = Brain::new(thinker.clone(), &timestamp);
         rbs.0.insert(brain.id, SartAdvBuffer::default());
         spawn_agent(
             brain,
