@@ -33,7 +33,63 @@ impl From<Polarity> for f32 {
     }
 }
 
-#[derive(Debug)]
+pub trait WiringConfig<B: Backend>
+where
+    Self: Send + Sync,
+{
+    fn input_dim(&self) -> usize;
+    fn output_dim(&self) -> usize;
+    fn units(&self) -> usize;
+
+    fn num_layers(&self) -> usize;
+    fn dim_for_layer(&self, l: usize) -> Option<usize> {
+        self.neurons_for_layer(l).map(|l| l.len())
+    }
+    fn neurons_for_layer(&self, l: usize) -> Option<Vec<Neuron>>;
+    fn adj_matrix(&self) -> &Tensor<B, 2>;
+    fn sensory_adj_matrix(&self) -> &Tensor<B, 2>;
+}
+
+#[derive(Debug, Clone)]
+pub struct FullyConnected<B: Backend> {
+    pub wiring: Wiring<B>,
+    pub input_dim: usize,
+    pub output_dim: usize,
+}
+impl<B: Backend> WiringConfig<B> for FullyConnected<B> {
+    fn input_dim(&self) -> usize {
+        self.input_dim
+    }
+
+    fn output_dim(&self) -> usize {
+        self.output_dim
+    }
+
+    fn units(&self) -> usize {
+        self.output_dim
+    }
+
+    fn num_layers(&self) -> usize {
+        1
+    }
+
+    fn neurons_for_layer(&self, l: usize) -> Option<Vec<Neuron>> {
+        match l {
+            0 => Some((0..self.output_dim).collect()),
+            _ => None,
+        }
+    }
+
+    fn adj_matrix(&self) -> &Tensor<B, 2> {
+        &self.wiring.adj_matrix
+    }
+
+    fn sensory_adj_matrix(&self) -> &Tensor<B, 2> {
+        &self.wiring.sensory_adj_matrix
+    }
+}
+
+#[derive(Debug, Module)]
 pub struct Wiring<B: Backend> {
     adj_matrix: Tensor<B, 2>,
     sensory_adj_matrix: Tensor<B, 2>,
@@ -84,85 +140,50 @@ impl<B: Backend> Wiring<B> {
             Tensor::full_device::<_, f32>([1, 1], polarity.into(), &dev),
         );
     }
-
-    pub fn input_dim(&self) -> usize {
-        self.sensory_adj_matrix.shape().dims[0]
-    }
-
-    pub fn output_dim(&self) -> usize {
-        self.adj_matrix.shape().dims[1]
-    }
-
-    pub fn units(&self) -> usize {
-        self.output_dim()
-    }
-
-    pub fn to_petgraph(&self) -> petgraph::prelude::DiGraph<&'static str, f32>
-    where
-        B::FloatElem: PartialEq<f32> + Into<f32>,
-    {
-        use petgraph::prelude::*;
-        let mut g = DiGraph::new();
-        let mut my_adj_to_g_idx = BTreeMap::default();
-        let mut my_sens_adj_to_g_idx = BTreeMap::default();
-        for i in 0..self.units() {
-            my_adj_to_g_idx.insert(i, g.add_node("n"));
-        }
-        for i in 0..self.input_dim() {
-            my_sens_adj_to_g_idx.insert(i, g.add_node("s"));
-        }
-        for src in 0..self.input_dim() {
-            for dest in 0..self.units() {
-                let weight = self
-                    .sensory_adj_matrix
-                    .clone()
-                    .slice([src..src + 1, dest..dest + 1])
-                    .into_scalar();
-                if weight != 0.0 {
-                    g.add_edge(
-                        my_sens_adj_to_g_idx[&src],
-                        my_adj_to_g_idx[&dest],
-                        weight.into(),
-                    );
-                }
-            }
-        }
-        for src in 0..self.units() {
-            for dest in 0..self.units() {
-                let weight = self
-                    .adj_matrix
-                    .clone()
-                    .slice([src..src + 1, dest..dest + 1])
-                    .into_scalar();
-                if weight != 0.0 {
-                    g.add_edge(my_adj_to_g_idx[&src], my_adj_to_g_idx[&dest], weight.into());
-                }
-            }
-        }
-
-        g
-    }
-
-    pub fn write_dot(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>
-    where
-        B::FloatElem: PartialEq<f32> + Into<f32>,
-    {
-        let g = self.to_petgraph();
-        let dot = Dot::new(&g);
-        let mut f = File::create(path.as_ref())?;
-        use std::io::Write;
-        write!(f, "{:?}", dot)?;
-        Ok(())
-    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Ncp<B: Backend> {
     pub wiring: Wiring<B>,
     pub sensory_neurons: Vec<Neuron>,
     pub command_neurons: Vec<Neuron>,
     pub inter_neurons: Vec<Neuron>,
     pub motor_neurons: Vec<Neuron>,
+}
+
+impl<B: Backend> WiringConfig<B> for Ncp<B> {
+    fn input_dim(&self) -> usize {
+        self.sensory_neurons.len()
+    }
+
+    fn output_dim(&self) -> usize {
+        self.motor_neurons.len()
+    }
+
+    fn units(&self) -> usize {
+        self.inter_neurons.len() + self.command_neurons.len() + self.motor_neurons.len()
+    }
+
+    fn num_layers(&self) -> usize {
+        3
+    }
+
+    fn neurons_for_layer(&self, l: usize) -> Option<Vec<Neuron>> {
+        match l {
+            0 => Some(self.inter_neurons.clone()),
+            1 => Some(self.command_neurons.clone()),
+            2 => Some(self.motor_neurons.clone()),
+            _ => None,
+        }
+    }
+
+    fn adj_matrix(&self) -> &Tensor<B, 2> {
+        &self.wiring.adj_matrix
+    }
+
+    fn sensory_adj_matrix(&self) -> &Tensor<B, 2> {
+        &self.wiring.sensory_adj_matrix
+    }
 }
 
 impl<B: Backend> Ncp<B> {
@@ -175,19 +196,18 @@ impl<B: Backend> Ncp<B> {
         inter_fanout: usize,
         recurrent_command_synapses: usize,
         motor_fanin: usize,
-    ) -> Self {
+    ) -> Ncp<B> {
         let units = inter_neurons + command_neurons + motor_neurons;
-        let mut this = Wiring {
-            adj_matrix: Tensor::zeros([units, units]),
-            sensory_adj_matrix: Tensor::zeros([sensory_neurons, units]),
-        };
-
         let sensory = (0..sensory_neurons).collect_vec();
         let motor = (0..motor_neurons).collect_vec();
         let command = (motor_neurons..motor_neurons + command_neurons).collect_vec();
         let inter = (motor_neurons + command_neurons
             ..motor_neurons + command_neurons + inter_neurons)
             .collect_vec();
+        let mut this = Wiring {
+            adj_matrix: Tensor::zeros([units, units]),
+            sensory_adj_matrix: Tensor::zeros([sensory_neurons, units]),
+        };
 
         // sensory -> inter layer
         let mut unreachable_inter_neurons = inter.clone();
@@ -274,7 +294,7 @@ impl<B: Backend> Ncp<B> {
             }
         }
 
-        Self {
+        Ncp {
             wiring: this,
             sensory_neurons: sensory,
             command_neurons: command,
@@ -288,7 +308,7 @@ impl<B: Backend> Ncp<B> {
         units: usize,
         output_dim: usize,
         sparsity_level: Option<f32>,
-    ) -> Self {
+    ) -> Ncp<B> {
         let sparsity_level = sparsity_level.unwrap_or(0.5);
         let density_level = 1.0 - sparsity_level;
         let inter_and_command_neurons = units - output_dim;
@@ -417,14 +437,12 @@ pub struct LtcCellConfig {
 }
 
 impl LtcCellConfig {
-    pub fn init<B: Backend<FloatElem = f32>>(&self, wiring: Ncp<B>) -> LtcCell<B> {
-        let Ncp {
-            wiring,
-            motor_neurons,
-            ..
-        } = wiring;
+    pub fn init<B: Backend<FloatElem = f32>, C: WiringConfig<B>>(
+        &self,
+        wiring: impl WiringConfig<B>,
+    ) -> LtcCell<B> {
         LtcCell {
-            output_len: motor_neurons.len(),
+            output_len: wiring.output_dim(),
             gleak: Param::new(
                 ParamId::new(),
                 Tensor::random([wiring.units()], Distribution::Uniform(0.001, 1.0)),
@@ -458,7 +476,7 @@ impl LtcCellConfig {
                     Distribution::Uniform(0.001, 1.0),
                 ),
             ),
-            erev: Param::new(ParamId::new(), wiring.adj_matrix.clone()),
+            erev: Param::new(ParamId::new(), wiring.adj_matrix().clone()),
             sensory_sigma: Param::new(
                 ParamId::new(),
                 Tensor::random(
@@ -480,9 +498,9 @@ impl LtcCellConfig {
                     Distribution::Uniform(0.001, 1.0),
                 ),
             ),
-            sensory_erev: Param::new(ParamId::new(), wiring.sensory_adj_matrix.clone()),
-            sparsity_mask: wiring.adj_matrix.clone().abs(),
-            sensory_sparsity_mask: wiring.sensory_adj_matrix.clone().abs(),
+            sensory_erev: Param::new(ParamId::new(), wiring.sensory_adj_matrix().clone()),
+            sparsity_mask: wiring.adj_matrix().clone().abs(),
+            sensory_sparsity_mask: wiring.sensory_adj_matrix().clone().abs(),
             input_w: Param::new(ParamId::new(), Tensor::ones([wiring.input_dim()])),
             input_b: Param::new(ParamId::new(), Tensor::zeros([wiring.input_dim()])),
             output_w: Param::new(ParamId::new(), Tensor::ones([wiring.output_dim()])),
@@ -533,6 +551,8 @@ pub struct CfcCell<B: Backend> {
     pub time_a: Linear<B>,
     pub time_b: Linear<B>,
     pub sparsity_mask: Tensor<B, 2>,
+    pub ninputs: usize,
+    pub nhidden: usize,
 }
 
 impl<B: Backend> CfcCell<B> {
@@ -564,20 +584,9 @@ impl<B: Backend> CfcCell<B> {
 #[derive(Debug, Module)]
 pub struct WiredCfcCell<B: Backend> {
     pub layers: Vec<CfcCell<B>>,
-    pub inter_neurons: Vec<Neuron>,
-    pub command_neurons: Vec<Neuron>,
-    pub motor_neurons: Vec<Neuron>,
 }
 
 impl<B: Backend> WiredCfcCell<B> {
-    pub fn layer_sizes(&self) -> Vec<usize> {
-        vec![
-            self.inter_neurons.len(),
-            self.command_neurons.len(),
-            self.motor_neurons.len(),
-        ]
-    }
-
     pub fn forward(
         &self,
         mut input: Tensor<B, 2>,
@@ -585,17 +594,13 @@ impl<B: Backend> WiredCfcCell<B> {
         timespans: Tensor<B, 1>,
     ) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let [nbatch, _] = hx.shape().dims;
-        let (ninter, ncommand, nmotor) = (
-            self.inter_neurons.len(),
-            self.command_neurons.len(),
-            self.motor_neurons.len(),
-        );
-        let h_state = vec![
-            hx.clone().slice([0..nbatch, 0..ninter]),
-            hx.clone().slice([0..nbatch, ninter..ninter + ncommand]),
-            hx.clone()
-                .slice([0..nbatch, ninter + ncommand..ninter + ncommand + nmotor]),
-        ];
+        let mut h_state = vec![];
+        let mut accum = 0;
+        for layer in self.layers.iter() {
+            let nhidden = layer.ff1.weight.shape().dims[1];
+            h_state.push(hx.clone().slice([0..nbatch, accum..accum + nhidden]));
+            accum += nhidden;
+        }
         let mut new_h_state = vec![];
         for (layer, h) in self.layers.iter().zip(h_state.into_iter()) {
             let (h_new, _) = layer.forward(input, h, timespans.clone());
@@ -612,40 +617,28 @@ impl<B: Backend> WiredCfcCell<B> {
 pub struct WiredCfcCellConfig;
 
 impl WiredCfcCellConfig {
-    pub fn init<B: Backend>(&self, wiring: Ncp<B>) -> WiredCfcCell<B> {
+    pub fn init<B: Backend>(&self, wiring: impl WiringConfig<B>) -> WiredCfcCell<B> {
         let mut layers = vec![];
-        let mut in_features = wiring.wiring.input_dim();
-        for (i, neurons) in [
-            wiring.inter_neurons.clone(),
-            wiring.command_neurons.clone(),
-            wiring.motor_neurons.clone(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        let mut in_features = wiring.input_dim();
+        for l in 0..wiring.num_layers() {
+            let neurons = wiring.neurons_for_layer(l).unwrap();
             let hidden_units = neurons
                 .iter()
                 .map(|n| Tensor::from_ints([*n as i32]))
                 .collect_vec();
-            let input_sparsity = if i == 0 {
+            let input_sparsity = if l == 0 {
                 wiring
-                    .wiring
-                    .sensory_adj_matrix
+                    .sensory_adj_matrix()
                     .clone()
                     .select(1, Tensor::cat(hidden_units, 0))
             } else {
-                let prev_neurons = match i - 1 {
-                    0 => wiring.inter_neurons.clone(),
-                    1 => wiring.command_neurons.clone(),
-                    _ => unreachable!(),
-                };
+                let prev_neurons = wiring.neurons_for_layer(l - 1).unwrap();
                 let prev_hidden_units = prev_neurons
                     .into_iter()
                     .map(|n| Tensor::from_ints([n as i32]))
                     .collect_vec();
                 let input_sparsity = wiring
-                    .wiring
-                    .adj_matrix
+                    .adj_matrix()
                     .clone()
                     .select(1, Tensor::cat(hidden_units, 0));
                 input_sparsity.select(0, Tensor::cat(prev_hidden_units, 0))
@@ -657,6 +650,8 @@ impl WiredCfcCellConfig {
 
             let cell = CfcCell {
                 sparsity_mask: input_sparsity,
+                ninputs: in_features,
+                nhidden: neurons.len(),
                 ff1: LinearConfig::new(in_features + neurons.len(), neurons.len())
                     .with_initializer(burn::nn::Initializer::XavierUniform { gain: 1.0 })
                     .init(),
@@ -673,18 +668,7 @@ impl WiredCfcCellConfig {
             layers.push(cell);
             in_features = neurons.len();
         }
-        let Ncp {
-            inter_neurons,
-            command_neurons,
-            motor_neurons,
-            ..
-        } = wiring;
-        WiredCfcCell {
-            layers,
-            inter_neurons,
-            command_neurons,
-            motor_neurons,
-        }
+        WiredCfcCell { layers }
     }
 }
 
@@ -703,9 +687,15 @@ impl<B: Backend> Cfc<B> {
         let dev = &self.devices()[0];
         let [nbatch, nseq, nfeat] = xs.shape().dims;
         let nout = self.fc.weight.shape().dims[1];
-        let nhidden = self.cell.command_neurons.len()
-            + self.cell.motor_neurons.len()
-            + self.cell.inter_neurons.len();
+        // let nhidden = self.cell.command_neurons.len()
+        //     + self.cell.motor_neurons.len()
+        //     + self.cell.inter_neurons.len();
+        let nhidden = self
+            .cell
+            .layers
+            .iter()
+            .map(|l| l.ff1.weight.shape().dims[1])
+            .sum::<usize>();
         let mut h = h.unwrap_or(Tensor::zeros([nbatch, nhidden])).to_device(dev);
         let mut outputs = Tensor::zeros([nbatch, nseq, nout]).to_device(dev);
 

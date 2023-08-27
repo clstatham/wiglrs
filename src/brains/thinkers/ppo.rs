@@ -25,7 +25,7 @@ use crate::{brains::replay_buffer::SartAdvBuffer, hparams::AGENT_ENTROPY_BETA};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::{
-    ncp::{Cfc, Ltc, LtcCellConfig, Ncp, WiredCfcCellConfig},
+    ncp::{Cfc, Ltc, LtcCellConfig, Ncp, WiredCfcCellConfig, WiringConfig},
     Thinker,
 };
 
@@ -240,13 +240,13 @@ impl PpoActorConfig {
             Some(0.0),
         );
         PpoActor {
-            common_h: Tensor::zeros([1, wiring_com.wiring.units()]),
+            common_h: Tensor::zeros([1, wiring_com.units()]),
             common: Cfc {
                 cell: WiredCfcCellConfig::new().init(wiring_com),
                 fc: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
             },
-            mu_h: Tensor::zeros([1, wiring_mu.wiring.units()]),
-            std_h: Tensor::zeros([1, wiring_std.wiring.units()]),
+            mu_h: Tensor::zeros([1, wiring_mu.units()]),
+            std_h: Tensor::zeros([1, wiring_std.units()]),
             mu_head: Cfc {
                 cell: WiredCfcCellConfig::new().init(wiring_mu),
                 fc: LinearConfig::new(self.hidden_len, self.action_len).init(),
@@ -263,10 +263,10 @@ impl<B: Backend> PpoActor<B> {
         let x = x.to_device(&self.devices()[0]);
 
         let (x, common_h) = self.common.forward(x, Some(self.common_h.clone()));
-        self.common_h = common_h;
+        // self.common_h = common_h; // todo: store `h` in Brain, not Thinker
 
         let (mu, mu_h) = self.mu_head.forward(x.clone(), Some(self.mu_h.clone()));
-        self.mu_h = mu_h;
+        // self.mu_h = mu_h; // todo: store `h` in Brain, not Thinker
         let [nbatch, nstack, nfeat] = mu.shape().dims;
         let mu = mu
             .clone()
@@ -275,7 +275,7 @@ impl<B: Backend> PpoActor<B> {
         let mu = mu.tanh();
 
         let (std, std_h) = self.std_head.forward(x, Some(self.std_h.clone()));
-        self.std_h = std_h;
+        // self.std_h = std_h; // todo: store `h` in Brain, not Thinker
         let [nbatch, nstack, nfeat] = std.shape().dims;
         let std = std
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
@@ -304,7 +304,6 @@ impl<B: Backend> PpoActor<B> {
 pub struct PpoCritic<B: Backend> {
     rnn: Cfc<B>,
     h: Tensor<B, 2>,
-    // head: Linear<B>,
 }
 
 #[derive(Debug, Config)]
@@ -322,7 +321,7 @@ impl PpoCriticConfig {
             Some(0.0),
         );
         PpoCritic {
-            h: Tensor::zeros([1, wiring.wiring.units()]),
+            h: Tensor::zeros([1, wiring.units()]),
             rnn: Cfc {
                 cell: WiredCfcCellConfig::new().init(wiring),
                 fc: LinearConfig::new(self.hidden_len, 1).init(),
@@ -335,7 +334,7 @@ impl<B: Backend> PpoCritic<B> {
     pub fn forward(&mut self, x: Tensor<B, 3>) -> Tensor<B, 1> {
         let x = x.to_device(&self.devices()[0]);
         let (x, h) = self.rnn.forward(x, Some(self.h.clone()));
-        self.h = h;
+        // self.h = h; // todo: store `h` in Brain, not Thinker
         let [nbatch, nstack, nfeat] = x.shape().dims;
         let x: Tensor<B, 2> = x
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
