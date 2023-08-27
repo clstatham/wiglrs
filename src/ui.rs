@@ -4,8 +4,8 @@ use bevy::prelude::*;
 use bevy_egui::{
     egui::{
         self,
-        plot::{Bar, BarChart},
-        Color32, Layout,
+        plot::{Bar, BarChart, Line, PlotPoint},
+        Color32, Layout, Stroke,
     },
     EguiContexts,
 };
@@ -85,7 +85,7 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                 // });
 
                                 // ui.horizontal_top(|ui| {
-                                let mu = brain
+                                let ms = brain
                                     .thinker
                                     .recent_mu
                                     .iter()
@@ -96,11 +96,19 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                         let scale = std * 3.0;
                                         let rg =
                                             Vec2::new(scale.exp(), (1.0 / scale).exp()).normalize();
-                                        Bar::new(i as f64, *mu as f64).fill(Color32::from_rgb(
-                                            (rg.x * 255.0) as u8,
-                                            (rg.y * 255.0) as u8,
-                                            0,
-                                        ))
+                                        let m = Bar::new(i as f64, *mu as f64)
+                                            // .fill(Color32::from_rgb(
+                                            //     (rg.x * 255.0) as u8,
+                                            //     (rg.y * 255.0) as u8,
+                                            //     0,
+                                            // ));
+                                            .fill(Color32::RED);
+                                        let s = Line::new(vec![
+                                            [i as f64, *mu as f64 - *std as f64],
+                                            [i as f64, *mu as f64 + *std as f64],
+                                        ])
+                                        .stroke(Stroke::new(4.0, Color32::LIGHT_GREEN));
+                                        (m, s)
                                         // .width(1.0 - *std as f64 / 6.0)
                                     })
                                     .collect_vec();
@@ -114,9 +122,20 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                                 brain.id
                                             ))
                                             .center_y_axis(true)
+                                            .data_aspect(1.0 / 2.0)
                                             .height(80.0)
                                             .width(220.0)
-                                            .show(ui, |plot| plot.bar_chart(BarChart::new(mu)));
+                                            .show(
+                                                ui,
+                                                |plot| {
+                                                    let (mu, std): (Vec<Bar>, Vec<Line>) =
+                                                        ms.into_iter().multiunzip();
+                                                    plot.bar_chart(BarChart::new(mu));
+                                                    for std in std {
+                                                        plot.line(std);
+                                                    }
+                                                },
+                                            );
                                         });
                                     });
                                 });
