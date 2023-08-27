@@ -14,15 +14,18 @@ pub mod ppo;
 pub mod stats;
 
 pub trait Thinker {
-    fn act(&mut self, obs: FrameStack) -> Action;
+    type Metadata;
+    fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action;
     fn learn(&mut self, b: &SartAdvBuffer);
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>;
+    fn init_metadata(&self, batch_size: usize) -> Self::Metadata;
 }
 
 pub struct RandomThinker;
 
 impl Thinker for RandomThinker {
-    fn act(&mut self, _obs: FrameStack) -> Action {
+    type Metadata = ();
+    fn act(&mut self, _obs: FrameStack, _metadata: &mut ()) -> Action {
         Action {
             lin_force: Vec2::new(
                 rand::random::<f32>() * 2.0 - 1.0,
@@ -37,6 +40,7 @@ impl Thinker for RandomThinker {
     fn save(&self, _path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
+    fn init_metadata(&self, _batch_size: usize) -> Self::Metadata {}
 }
 
 pub struct SharedThinker<T: Thinker> {
@@ -64,13 +68,17 @@ impl<T: Thinker> SharedThinker<T> {
 }
 
 impl<T: Thinker> Thinker for SharedThinker<T> {
-    fn act(&mut self, obs: FrameStack) -> Action {
-        self.thinker.lock().unwrap().act(obs)
+    type Metadata = T::Metadata;
+    fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action {
+        self.thinker.lock().unwrap().act(obs, metadata)
     }
     fn learn(&mut self, b: &SartAdvBuffer) {
         self.thinker.lock().unwrap().learn(b)
     }
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         self.thinker.lock().unwrap().save(path)
+    }
+    fn init_metadata(&self, batch_size: usize) -> Self::Metadata {
+        self.thinker.lock().unwrap().init_metadata(batch_size)
     }
 }

@@ -207,9 +207,9 @@ pub struct PpoActor<B: Backend> {
     common: Cfc<B>,
     mu_head: Cfc<B>,
     std_head: Cfc<B>,
-    common_h: Tensor<B, 2>,
-    mu_h: Tensor<B, 2>,
-    std_h: Tensor<B, 2>,
+    obs_len: usize,
+    com_units: usize,
+    mustd_units: usize,
 }
 
 #[derive(Config, Debug)]
@@ -240,13 +240,13 @@ impl PpoActorConfig {
             Some(0.0),
         );
         PpoActor {
-            common_h: Tensor::zeros([1, wiring_com.units()]),
+            obs_len: self.obs_len,
+            com_units: wiring_com.units(),
+            mustd_units: wiring_mu.units(),
             common: Cfc {
                 cell: WiredCfcCellConfig::new().init(wiring_com),
                 fc: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
             },
-            mu_h: Tensor::zeros([1, wiring_mu.units()]),
-            std_h: Tensor::zeros([1, wiring_std.units()]),
             mu_head: Cfc {
                 cell: WiredCfcCellConfig::new().init(wiring_mu),
                 fc: LinearConfig::new(self.hidden_len, self.action_len).init(),
@@ -259,14 +259,19 @@ impl PpoActorConfig {
     }
 }
 impl<B: Backend> PpoActor<B> {
-    pub fn forward(&mut self, x: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 2>) {
+    pub fn forward(
+        &mut self,
+        x: Tensor<B, 3>,
+        common_h: &mut Tensor<B, 2>,
+        mu_h: &mut Tensor<B, 2>,
+        std_h: &mut Tensor<B, 2>,
+    ) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let x = x.to_device(&self.devices()[0]);
 
-        let (x, common_h) = self.common.forward(x, Some(self.common_h.clone()));
-        // self.common_h = common_h; // todo: store `h` in Brain, not Thinker
-
-        let (mu, mu_h) = self.mu_head.forward(x.clone(), Some(self.mu_h.clone()));
-        // self.mu_h = mu_h; // todo: store `h` in Brain, not Thinker
+        let (x, ch) = self.common.forward(x, Some(common_h.clone()));
+        *common_h = ch;
+        let (mu, mh) = self.mu_head.forward(x.clone(), Some(mu_h.clone()));
+        *mu_h = mh;
         let [nbatch, nstack, nfeat] = mu.shape().dims;
         let mu = mu
             .clone()
@@ -274,8 +279,8 @@ impl<B: Backend> PpoActor<B> {
             .squeeze(1);
         let mu = mu.tanh();
 
-        let (std, std_h) = self.std_head.forward(x, Some(self.std_h.clone()));
-        // self.std_h = std_h; // todo: store `h` in Brain, not Thinker
+        let (std, sh) = self.std_head.forward(x, Some(std_h.clone()));
+        *std_h = sh;
         let [nbatch, nstack, nfeat] = std.shape().dims;
         let std = std
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
@@ -285,25 +290,13 @@ impl<B: Backend> PpoActor<B> {
 
         (mu, std)
     }
-
-    pub fn reset_h(&mut self, batch_len: usize) {
-        self.mu_h =
-            Tensor::zeros_device([batch_len, self.mu_h.shape().dims[1]], &self.mu_h.device());
-        self.std_h = Tensor::zeros_device(
-            [batch_len, self.std_h.shape().dims[1]],
-            &self.std_h.device(),
-        );
-        self.common_h = Tensor::zeros_device(
-            [batch_len, self.common_h.shape().dims[1]],
-            &self.common_h.device(),
-        );
-    }
 }
 
 #[derive(Module, Debug)]
 pub struct PpoCritic<B: Backend> {
     rnn: Cfc<B>,
-    h: Tensor<B, 2>,
+    obs_len: usize,
+    rnn_units: usize,
 }
 
 #[derive(Debug, Config)]
@@ -321,7 +314,8 @@ impl PpoCriticConfig {
             Some(0.0),
         );
         PpoCritic {
-            h: Tensor::zeros([1, wiring.units()]),
+            obs_len: self.obs_len,
+            rnn_units: wiring.units(),
             rnn: Cfc {
                 cell: WiredCfcCellConfig::new().init(wiring),
                 fc: LinearConfig::new(self.hidden_len, 1).init(),
@@ -331,21 +325,23 @@ impl PpoCriticConfig {
 }
 
 impl<B: Backend> PpoCritic<B> {
-    pub fn forward(&mut self, x: Tensor<B, 3>) -> Tensor<B, 1> {
+    pub fn forward(&mut self, x: Tensor<B, 3>, h: &mut Tensor<B, 2>) -> Tensor<B, 1> {
         let x = x.to_device(&self.devices()[0]);
-        let (x, h) = self.rnn.forward(x, Some(self.h.clone()));
-        // self.h = h; // todo: store `h` in Brain, not Thinker
+        let (x, h_new) = self.rnn.forward(x, Some(h.clone()));
+        *h = h_new;
         let [nbatch, nstack, nfeat] = x.shape().dims;
         let x: Tensor<B, 2> = x
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1);
-        // let x = self.head.forward(x);
         x.squeeze(1)
     }
+}
 
-    pub fn reset_h(&mut self, batch_len: usize) {
-        self.h = Tensor::zeros_device([batch_len, self.h.shape().dims[1]], &self.h.device());
-    }
+pub struct HiddenStates<B: Backend> {
+    pub actor_com_h: Tensor<B, 2>,
+    pub actor_mu_h: Tensor<B, 2>,
+    pub actor_std_h: Tensor<B, 2>,
+    pub critic_h: Tensor<B, 2>,
 }
 
 pub struct PpoThinker {
@@ -406,14 +402,31 @@ impl Default for PpoThinker {
 }
 
 impl Thinker for PpoThinker {
-    fn act(&mut self, obs: FrameStack) -> Action {
+    type Metadata = HiddenStates<Be>;
+
+    fn init_metadata(&self, batch_size: usize) -> Self::Metadata {
+        let dev = self.actor.devices()[0];
+        HiddenStates {
+            actor_com_h: Tensor::zeros_device([batch_size, self.actor.com_units], &dev),
+            actor_mu_h: Tensor::zeros_device([batch_size, self.actor.mustd_units], &dev),
+            actor_std_h: Tensor::zeros_device([batch_size, self.actor.mustd_units], &dev),
+            critic_h: Tensor::zeros_device([batch_size, self.critic.rnn_units], &dev),
+        }
+    }
+
+    fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action {
         let obs = obs
             .as_vec()
             .into_iter()
             .map(|o| Tensor::from_floats(o.as_vec().as_slice()).unsqueeze::<2>())
             .collect::<Vec<_>>();
         let obs = Tensor::cat(obs, 0).unsqueeze();
-        let (mu, std) = self.actor.valid().forward(obs.clone());
+        let (mu, std) = self.actor.forward(
+            obs.clone(),
+            &mut metadata.actor_com_h,
+            &mut metadata.actor_mu_h,
+            &mut metadata.actor_std_h,
+        );
         self.recent_mu = mu.to_data().value;
         self.recent_std = std.to_data().value;
         let dist: MvNormal<_, ACTION_LEN> = MvNormal {
@@ -422,7 +435,7 @@ impl Thinker for PpoThinker {
         };
         self.recent_entropy = dist.entropy().into_scalar();
         let action = dist.sample().clamp(-1.0, 1.0);
-        let val = self.critic.valid().forward(obs);
+        let val = self.critic.forward(obs, &mut metadata.critic_h);
 
         Action::from_slice(
             action.to_data().value.as_slice(),
@@ -495,8 +508,14 @@ impl Thinker for PpoThinker {
             .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
 
             // let s = s.require_grad();
-            self.actor.reset_h(AGENT_OPTIM_BATCH_SIZE);
-            let (mu, std) = self.actor.forward(s.clone());
+            // self.actor.reset_h(AGENT_OPTIM_BATCH_SIZE);
+            let mut meta = self.init_metadata(AGENT_OPTIM_BATCH_SIZE);
+            let (mu, std) = self.actor.forward(
+                s.clone(),
+                &mut meta.actor_com_h,
+                &mut meta.actor_mu_h,
+                &mut meta.actor_std_h,
+            );
             let dist = MvNormal::<Be, ACTION_LEN> {
                 mu,
                 cov_diag: std.clone() * std,
@@ -528,8 +547,7 @@ impl Thinker for PpoThinker {
                 self.actor.clone(),
                 GradientsParams::from_grads(actor_grads, &self.actor),
             );
-            self.critic.reset_h(AGENT_OPTIM_BATCH_SIZE);
-            let val = self.critic.forward(s);
+            let val = self.critic.forward(s, &mut meta.critic_h);
             let val_err = val - returns;
             let value_loss = (val_err.clone() * val_err).mean();
             total_val_loss += value_loss.clone().into_scalar();
@@ -540,8 +558,7 @@ impl Thinker for PpoThinker {
                 GradientsParams::from_grads(critic_grads, &self.critic),
             );
         }
-        self.actor.reset_h(1);
-        self.critic.reset_h(1);
+
         self.recent_policy_loss = total_pi_loss / nstep as f32;
         self.recent_value_loss = total_val_loss / nstep as f32;
         self.recent_entropy_loss = total_entropy_loss / nstep as f32;

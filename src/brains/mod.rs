@@ -47,6 +47,7 @@ pub struct Brain<T: Thinker> {
     pub last_action: Action,
     pub thinker: T,
     pub writer: TbWriter,
+    pub metadata: T::Metadata,
 }
 
 impl<T: Thinker> Brain<T> {
@@ -56,6 +57,7 @@ impl<T: Thinker> Brain<T> {
         let mut writer = TbWriter::default();
         writer.init(Some(name.as_str()), timestamp);
         Self {
+            metadata: thinker.init_metadata(1),
             name,
             timestamp: timestamp.to_owned(),
             color: Color::rgb(rand::random(), rand::random(), rand::random()),
@@ -82,7 +84,7 @@ impl<T: Thinker> Brain<T> {
 
 impl Brain<PpoThinker> {
     pub fn act(&mut self, _obs: Observation, frame_count: usize) -> Action {
-        let action = self.thinker.act(self.fs.clone());
+        let action = self.thinker.act(self.fs.clone(), &mut self.metadata);
         self.last_action = action;
         self.writer
             .add_scalar("Entropy", self.thinker.recent_entropy, frame_count);
@@ -109,7 +111,7 @@ impl Brain<PpoThinker> {
 
 impl Brain<SharedThinker<PpoThinker>> {
     pub fn act(&mut self, _obs: Observation, frame_count: usize) -> Action {
-        let action = self.thinker.act(self.fs.clone());
+        let action = self.thinker.act(self.fs.clone(), &mut self.metadata);
         self.last_action = action;
         self.writer
             .add_scalar("Entropy", self.thinker.lock().recent_entropy, frame_count);
