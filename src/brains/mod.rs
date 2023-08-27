@@ -76,19 +76,12 @@ impl<T: Thinker> Brain<T> {
         );
         std::fs::create_dir_all(&path).ok();
         self.thinker.save(path)?;
-        // let rb = postcard::to_allocvec(&self.rb)?;
-        // let mut rb_f = File::create(format!(
-        //     "training/{}/{}_{}_rb.postcard",
-        //     self.timestamp, self.id, self.name
-        // ))?;
-        // use std::io::Write;
-        // rb_f.write_all(&rb)?;
         Ok(())
     }
 }
 
 impl Brain<PpoThinker> {
-    pub fn act(&mut self, obs: Observation, frame_count: usize) -> Action {
+    pub fn act(&mut self, _obs: Observation, frame_count: usize) -> Action {
         let action = self.thinker.act(self.fs.clone());
         self.last_action = action;
         self.writer
@@ -97,9 +90,6 @@ impl Brain<PpoThinker> {
     }
 
     pub fn learn(&mut self, frame_count: usize, rbs: &BTreeMap<usize, SartAdvBuffer>) {
-        // self.thinker.learn(
-        //     &SartAdvBuffer::sample_many(rbs, AGENT_OPTIM_BATCH_SIZE * AGENT_OPTIM_EPOCHS).unwrap(),
-        // );
         self.thinker.learn(&rbs[&self.id]);
         let net_reward = rbs[&self.id].reward.iter().sum::<f32>();
         self.writer.add_scalar("Reward", net_reward, frame_count);
@@ -114,8 +104,6 @@ impl Brain<PpoThinker> {
         );
         self.writer
             .add_scalar("PolicyClampRatio", self.thinker.recent_nclamp, frame_count);
-        // self.writer
-        //     .add_scalar("PolicyKLDivergence", self.thinker.recent_kl, frame_count);
     }
 }
 
