@@ -1,7 +1,7 @@
 pub const NUM_AGENTS: usize = 4;
 pub const AGENT_HIDDEN_DIM: usize = 32;
-pub const AGENT_ACTOR_LR: f64 = 1e-5;
-pub const AGENT_CRITIC_LR: f64 = 1e-4;
+pub const AGENT_ACTOR_LR: f64 = 1e-3;
+pub const AGENT_CRITIC_LR: f64 = 1e-3;
 pub const AGENT_OPTIM_EPOCHS: usize = 25;
 pub const AGENT_OPTIM_BATCH_SIZE: usize = 128;
 pub const AGENT_ENTROPY_BETA: f32 = 0.00001;

@@ -204,9 +204,10 @@ impl<B: Backend> Gru<B> {
 
 #[derive(Module, Debug)]
 pub struct PpoActor<B: Backend> {
-    common: TransformerEncoder<B>,
-    mu_head: Ltc<B>,
-    std_head: Ltc<B>,
+    common: Cfc<B>,
+    mu_head: Cfc<B>,
+    std_head: Cfc<B>,
+    common_h: Tensor<B, 2>,
     mu_h: Tensor<B, 2>,
     std_h: Tensor<B, 2>,
 }
@@ -220,17 +221,39 @@ pub struct PpoActorConfig {
 
 impl PpoActorConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoActor<B> {
-        let wiring1 = Ncp::auto(self.obs_len, self.hidden_len, self.action_len, None);
-        let wiring2 = Ncp::auto(self.obs_len, self.hidden_len, self.action_len, None);
+        let wiring_com = Ncp::auto(
+            self.obs_len,
+            self.hidden_len * 2,
+            self.hidden_len,
+            Some(0.0),
+        );
+        let wiring_mu = Ncp::auto(
+            self.hidden_len,
+            self.hidden_len * 2,
+            self.hidden_len,
+            Some(0.0),
+        );
+        let wiring_std = Ncp::auto(
+            self.hidden_len,
+            self.hidden_len * 2,
+            self.hidden_len,
+            Some(0.0),
+        );
         PpoActor {
-            common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 2, 1).init(),
-            mu_h: Tensor::zeros([1, wiring1.wiring.units()]),
-            std_h: Tensor::zeros([1, wiring1.wiring.units()]),
-            mu_head: Ltc {
-                cell: LtcCellConfig::new().init(wiring1),
+            common_h: Tensor::zeros([1, wiring_com.wiring.units()]),
+            common: Cfc {
+                cell: WiredCfcCellConfig::new().init(wiring_com),
+                fc: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
             },
-            std_head: Ltc {
-                cell: LtcCellConfig::new().init(wiring2),
+            mu_h: Tensor::zeros([1, wiring_mu.wiring.units()]),
+            std_h: Tensor::zeros([1, wiring_std.wiring.units()]),
+            mu_head: Cfc {
+                cell: WiredCfcCellConfig::new().init(wiring_mu),
+                fc: LinearConfig::new(self.hidden_len, self.action_len).init(),
+            },
+            std_head: Cfc {
+                cell: WiredCfcCellConfig::new().init(wiring_std),
+                fc: LinearConfig::new(self.hidden_len, self.action_len).init(),
             },
         }
     }
@@ -239,7 +262,8 @@ impl<B: Backend> PpoActor<B> {
     pub fn forward(&mut self, x: Tensor<B, 3>) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let x = x.to_device(&self.devices()[0]);
 
-        let x = self.common.forward(TransformerEncoderInput::new(x));
+        let (x, common_h) = self.common.forward(x, Some(self.common_h.clone()));
+        self.common_h = common_h;
 
         let (mu, mu_h) = self.mu_head.forward(x.clone(), Some(self.mu_h.clone()));
         self.mu_h = mu_h;
@@ -247,11 +271,12 @@ impl<B: Backend> PpoActor<B> {
         let mu = mu
             .clone()
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
-            .squeeze(1)
-            .tanh();
+            .squeeze(1);
+        let mu = mu.tanh();
 
         let (std, std_h) = self.std_head.forward(x, Some(self.std_h.clone()));
         self.std_h = std_h;
+        let [nbatch, nstack, nfeat] = std.shape().dims;
         let std = std
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1);
@@ -267,6 +292,10 @@ impl<B: Backend> PpoActor<B> {
         self.std_h = Tensor::zeros_device(
             [batch_len, self.std_h.shape().dims[1]],
             &self.std_h.device(),
+        );
+        self.common_h = Tensor::zeros_device(
+            [batch_len, self.common_h.shape().dims[1]],
+            &self.common_h.device(),
         );
     }
 }
@@ -286,14 +315,18 @@ pub struct PpoCriticConfig {
 
 impl PpoCriticConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoCritic<B> {
-        let wiring = Ncp::auto(self.obs_len, self.hidden_len, 1, None);
+        let wiring = Ncp::auto(
+            self.obs_len,
+            self.hidden_len * 2,
+            self.hidden_len,
+            Some(0.0),
+        );
         PpoCritic {
             h: Tensor::zeros([1, wiring.wiring.units()]),
-            // rnn: GruConfig::new(self.obs_len, self.hidden_len).init(),
             rnn: Cfc {
                 cell: WiredCfcCellConfig::new().init(wiring),
+                fc: LinearConfig::new(self.hidden_len, 1).init(),
             },
-            // head: LinearConfig::new(self.hidden_len, 1).init(),
         }
     }
 }
@@ -340,12 +373,14 @@ impl PpoThinker {
         }
         .init()
         .fork(&TchDevice::Cuda(0));
+        // dbg!(actor.num_params());
         let critic = PpoCriticConfig {
             obs_len: OBS_LEN,
             hidden_len: AGENT_HIDDEN_DIM,
         }
         .init()
         .fork(&TchDevice::Cuda(0));
+        // dbg!(critic.num_params());
         let actor_optim = RMSPropConfig::new().with_momentum(0.0).init();
         let critic_optim = RMSPropConfig::new().with_momentum(0.0).init();
         Self {

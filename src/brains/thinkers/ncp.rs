@@ -556,7 +556,7 @@ impl<B: Backend> CfcCell<B> {
         let t_a = self.time_a.forward(x.clone());
         let t_b = self.time_b.forward(x.clone());
         let t_interp = sigmoid(t_a * ts.unsqueeze() + t_b);
-        let new_hidden = ff1 * (-t_interp.clone() + 1.0) + t_interp * ff2;
+        let new_hidden = ff1 * (t_interp.ones_like() - t_interp.clone()) + t_interp * ff2;
         (new_hidden.clone(), new_hidden)
     }
 }
@@ -598,9 +598,9 @@ impl<B: Backend> WiredCfcCell<B> {
         ];
         let mut new_h_state = vec![];
         for (layer, h) in self.layers.iter().zip(h_state.into_iter()) {
-            let (h, _) = layer.forward(input, h, timespans.clone());
-            input = h.clone();
-            new_h_state.push(h);
+            let (h_new, _) = layer.forward(input, h, timespans.clone());
+            input = h_new.clone();
+            new_h_state.push(h_new);
         }
         let last_h = new_h_state.last().cloned().unwrap();
         let new_h_state = Tensor::cat(new_h_state, 1);
@@ -691,6 +691,7 @@ impl WiredCfcCellConfig {
 #[derive(Debug, Module)]
 pub struct Cfc<B: Backend> {
     pub cell: WiredCfcCell<B>,
+    pub fc: Linear<B>,
 }
 
 impl<B: Backend> Cfc<B> {
@@ -701,7 +702,7 @@ impl<B: Backend> Cfc<B> {
     ) -> (Tensor<B, 3>, Tensor<B, 2>) {
         let dev = &self.devices()[0];
         let [nbatch, nseq, nfeat] = xs.shape().dims;
-        let nout = self.cell.motor_neurons.len();
+        let nout = self.fc.weight.shape().dims[1];
         let nhidden = self.cell.command_neurons.len()
             + self.cell.motor_neurons.len()
             + self.cell.inter_neurons.len();
@@ -714,10 +715,9 @@ impl<B: Backend> Cfc<B> {
             h = h_next;
             outputs = outputs.slice_assign(
                 [0..nbatch, i..i + 1, 0..nout],
-                out.clone().reshape([nbatch, 1, nout]),
+                self.fc.forward(out).reshape([nbatch, 1, nout]),
             );
         }
-
         (outputs, h)
     }
 }
