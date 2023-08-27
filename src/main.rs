@@ -24,7 +24,7 @@ use brains::{
 use burn_tensor::backend::Backend;
 use hparams::{
     AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_OPTIM_EPOCHS, AGENT_RADIUS,
-    AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, AGENT_TICK_RATE, AGENT_UPDATE_INTERVAL, NUM_AGENTS,
+    AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, AGENT_UPDATE_INTERVAL, NUM_AGENTS, N_FRAME_STACK,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -765,7 +765,8 @@ fn update(
 
         all_states.insert(agent, my_state.clone());
         brains.get_mut(&agent).unwrap().fs.push(my_state.clone());
-        let action = if frame_count.0 as usize % AGENT_TICK_RATE == 0 {
+        #[allow(clippy::modulo_one)]
+        let action = if frame_count.0 as usize % N_FRAME_STACK == 0 {
             brains
                 .get_mut(&agent)
                 .unwrap()
