@@ -107,9 +107,10 @@ pub fn ui(
                                             //     0,
                                             // ));
                                             .fill(Color32::RED);
+                                        let var = std * std;
                                         let s = Line::new(vec![
-                                            [i as f64, *mu as f64 - *std as f64],
-                                            [i as f64, *mu as f64 + *std as f64],
+                                            [i as f64, *mu as f64 - var as f64],
+                                            [i as f64, *mu as f64 + var as f64],
                                         ])
                                         .stroke(Stroke::new(4.0, Color32::LIGHT_GREEN));
                                         (m, s)

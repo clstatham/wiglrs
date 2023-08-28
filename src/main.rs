@@ -4,15 +4,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     f32::consts::PI,
     sync::Arc,
-    time::Duration,
 };
 
 use bevy::{
     core::FrameCount,
-    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     math::Vec3Swizzles,
     prelude::*,
-    sprite::{Anchor, MaterialMesh2dBundle},
+    sprite::MaterialMesh2dBundle,
     window::{PresentMode, WindowMode},
     winit::WinitSettings,
 };
@@ -20,13 +18,13 @@ use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 use brains::{
     replay_buffer::{Sart, SartAdvBuffer},
-    thinkers::{ppo::PpoThinker, SharedThinker, Thinker},
-    AgentThinker, Brain, BrainBank, FrameStack,
+    thinkers::{ppo::PpoThinker, Thinker},
+    Brain, BrainBank,
 };
 use burn_tensor::backend::Backend;
 use hparams::{
-    AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_OPTIM_EPOCHS, AGENT_RADIUS,
-    AGENT_RB_MAX_LEN, AGENT_SHOOT_DISTANCE, AGENT_UPDATE_INTERVAL, NUM_AGENTS, N_FRAME_STACK,
+    AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_RADIUS, AGENT_RB_MAX_LEN,
+    AGENT_SHOOT_DISTANCE, AGENT_UPDATE_INTERVAL, NUM_AGENTS,
 };
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -608,10 +606,17 @@ fn setup(
                 .with_translation(Vec3::new(400.0, -200.0, 0.0)),
         ));
 
+    let mut taken_names = vec![];
     for _ in 0..NUM_AGENTS {
         let ts = timestamp.clone();
-        // let brain = Brain::new(thinker, &timestamp);
-        let id = brains.spawn(|rx| Brain::new(PpoThinker::default(), ts, rx));
+        let mut name = names::random_name();
+        while taken_names.contains(&name) {
+            name = names::random_name();
+        }
+        taken_names.push(name.clone());
+        let brain_name = name.clone();
+
+        let id = brains.spawn(|rx| Brain::new(PpoThinker::default(), brain_name, ts, rx));
         rbs.0.insert(id, SartAdvBuffer::default());
         spawn_agent(
             BrainHandle {
@@ -619,7 +624,7 @@ fn setup(
                 kills: 0,
                 deaths: 0,
                 brain_id: id,
-                name: names::random_name(),
+                name: name.to_owned(),
             },
             &mut commands,
             &mut meshes,
@@ -930,9 +935,9 @@ impl Drop for TbWriter {
 
 impl<T: Thinker> Drop for Brain<T> {
     fn drop(&mut self) {
-        warn!("Saving {}...", &self.name);
+        // warn!("Saving {}...", &self.name);
         if let Err(e) = self.save() {
-            error!("Failed to save {}: {:?}", &self.name, e);
+            error!("Failed to save brain: {:?}", e);
         }
     }
 }

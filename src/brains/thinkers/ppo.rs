@@ -9,7 +9,7 @@ use burn::{
     tensor::{backend::Backend, Tensor},
 };
 
-use burn_tch::{TchBackend, TchDevice};
+use burn_tch::{TchBackend, TchDevice, TchTensor};
 
 use itertools::Itertools;
 use std::f32::consts::PI;
@@ -22,7 +22,7 @@ use crate::{brains::replay_buffer::SartAdvBuffer, hparams::AGENT_ENTROPY_BETA};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::{
-    ncp::{Cfc, FullyConnected, Ncp, WiredCfcCellConfig, WiringConfig},
+    ncp::{Cfc, CfcCellMode, FullyConnected, WiredCfcCellConfig, WiringConfig},
     Thinker,
 };
 
@@ -218,24 +218,6 @@ pub struct PpoActorConfig {
 
 impl PpoActorConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoActor<B> {
-        // let wiring_com = Ncp::auto(
-        //     self.obs_len,
-        //     self.hidden_len * 2,
-        //     self.hidden_len,
-        //     Some(0.5),
-        // );
-        // let wiring_mu = Ncp::auto(
-        //     self.hidden_len,
-        //     self.hidden_len * 2,
-        //     self.hidden_len,
-        //     Some(0.5),
-        // );
-        // let wiring_std = Ncp::auto(
-        //     self.hidden_len,
-        //     self.hidden_len * 2,
-        //     self.hidden_len,
-        //     Some(0.5),
-        // );
         let wiring_com = FullyConnected::new(self.obs_len, self.hidden_len, true);
         let wiring_mu = FullyConnected::new(self.hidden_len, self.hidden_len, true);
         let wiring_std = FullyConnected::new(self.hidden_len, self.hidden_len, true);
@@ -245,21 +227,21 @@ impl PpoActorConfig {
             com_units: wiring_com.units(),
             mustd_units: wiring_mu.units(),
             common: Cfc {
-                cell: WiredCfcCellConfig::new().init(wiring_com),
+                cell: WiredCfcCellConfig::new().init(wiring_com, CfcCellMode::NoGate),
                 fc: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
             },
             mu_head: Cfc {
-                cell: WiredCfcCellConfig::new().init(wiring_mu),
+                cell: WiredCfcCellConfig::new().init(wiring_mu, CfcCellMode::NoGate),
                 fc: LinearConfig::new(self.hidden_len, self.action_len).init(),
             },
             std_head: Cfc {
-                cell: WiredCfcCellConfig::new().init(wiring_std),
+                cell: WiredCfcCellConfig::new().init(wiring_std, CfcCellMode::NoGate),
                 fc: LinearConfig::new(self.hidden_len, self.action_len).init(),
             },
         }
     }
 }
-impl<B: Backend> PpoActor<B> {
+impl<B: Backend<FloatElem = f32>> PpoActor<B> {
     pub fn forward(
         &mut self,
         x: Tensor<B, 3>,
@@ -271,6 +253,9 @@ impl<B: Backend> PpoActor<B> {
 
         let (x, ch) = self.common.forward(x, Some(common_h.clone()));
         *common_h = ch;
+        if x.to_data().value.into_iter().any(|s| s.is_nan()) {
+            panic!()
+        }
         let (mu, mh) = self.mu_head.forward(x.clone(), Some(mu_h.clone()));
         *mu_h = mh;
         let [nbatch, nstack, nfeat] = mu.shape().dims;
@@ -287,8 +272,7 @@ impl<B: Backend> PpoActor<B> {
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1);
         // softplus
-        let std: Tensor<B, 2> = (std.exp() + 1.0).log();
-
+        let std: Tensor<B, 2> = (std.exp() + 1.0).log() + 1e-7;
         (mu, std)
     }
 }
@@ -308,18 +292,12 @@ pub struct PpoCriticConfig {
 
 impl PpoCriticConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoCritic<B> {
-        // let wiring = Ncp::auto(
-        //     self.obs_len,
-        //     self.hidden_len * 2,
-        //     self.hidden_len,
-        //     Some(0.5),
-        // );
         let wiring = FullyConnected::new(self.obs_len, self.hidden_len, true);
         PpoCritic {
             obs_len: self.obs_len,
             rnn_units: wiring.units(),
             rnn: Cfc {
-                cell: WiredCfcCellConfig::new().init(wiring),
+                cell: WiredCfcCellConfig::new().init(wiring, CfcCellMode::NoGate),
                 fc: LinearConfig::new(self.hidden_len, 1).init(),
             },
         }
@@ -557,6 +535,13 @@ impl Thinker for PpoThinker {
             let policy_loss = policy_loss - entropy_loss * AGENT_ENTROPY_BETA;
 
             let actor_grads = policy_loss.backward();
+
+            // TchTensor::new(todo!())
+            //     .tensor
+            //     .isnan()
+            //     .any()
+            //     .iter()
+            //     .map(|t| t.map(|t| println!("{}", t)));
             self.actor = self.actor_optim.step(
                 AGENT_ACTOR_LR,
                 self.actor.clone(),
@@ -567,6 +552,14 @@ impl Thinker for PpoThinker {
             let value_loss = (val_err.clone() * val_err).mean();
             total_val_loss += value_loss.clone().into_scalar();
             let critic_grads = value_loss.backward();
+            // let g = critic_grads
+            //     .get(&self.critic.rnn.fc.weight.val().into_primitive())
+            //     .unwrap()
+            //     .tensor
+            //     .to_device(burn_tch::TchDevice::Cpu.into())
+            //     .isnan()
+            //     .any();
+            // println!("{}", g);
             self.critic = self.critic_optim.step(
                 AGENT_CRITIC_LR,
                 self.critic.clone(),

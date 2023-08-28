@@ -12,7 +12,7 @@ use tokio::sync::{
 
 use self::{
     replay_buffer::SartAdvBuffer,
-    thinkers::{ppo::PpoThinker, SharedThinker, Thinker},
+    thinkers::{ppo::PpoThinker, Thinker},
 };
 use crate::{hparams::N_FRAME_STACK, Action, Observation, TbWriter, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -62,18 +62,17 @@ pub struct Brain<T: Thinker> {
 }
 
 impl<T: Thinker> Brain<T> {
-    pub fn new(thinker: T, timestamp: Timestamp, rx: Receiver<BrainControl>) -> Self {
-        let name = crate::names::random_name();
+    pub fn new(thinker: T, name: String, timestamp: Timestamp, rx: Receiver<BrainControl>) -> Self {
         let mut writer = TbWriter::default();
         writer.init(Some(name.as_str()), &timestamp);
         Self {
             metadata: thinker.init_metadata(1),
-            name,
             timestamp: timestamp.to_owned(),
             fs: FrameStack::default(),
             last_action: Action::default(),
             thinker,
             writer,
+            name,
             rx,
             learn_waker: None,
             last_trained_at: 0,

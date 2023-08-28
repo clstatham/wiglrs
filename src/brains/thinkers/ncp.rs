@@ -446,10 +446,7 @@ pub struct LtcCellConfig {
 }
 
 impl LtcCellConfig {
-    pub fn init<B: Backend<FloatElem = f32>, C: WiringConfig<B>>(
-        &self,
-        wiring: impl WiringConfig<B>,
-    ) -> LtcCell<B> {
+    pub fn init<B: Backend<FloatElem = f32>>(&self, wiring: impl WiringConfig<B>) -> LtcCell<B> {
         LtcCell {
             output_len: wiring.output_dim(),
             gleak: Param::new(
@@ -553,15 +550,25 @@ impl<B: Backend> Ltc<B> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Module)]
+pub enum CfcCellMode {
+    Default,
+    Pure,
+    NoGate,
+}
+
 #[derive(Debug, Module)]
 pub struct CfcCell<B: Backend> {
     pub ff1: Linear<B>,
+    pub a: Param<Tensor<B, 2>>,
+    pub w_tau: Param<Tensor<B, 2>>,
     pub ff2: Linear<B>,
     pub time_a: Linear<B>,
     pub time_b: Linear<B>,
     pub sparsity_mask: Tensor<B, 2>,
     pub ninputs: usize,
     pub nhidden: usize,
+    pub mode: CfcCellMode,
 }
 
 impl<B: Backend> CfcCell<B> {
@@ -576,17 +583,29 @@ impl<B: Backend> CfcCell<B> {
             .clone()
             .matmul(self.ff1.weight.val() * self.sparsity_mask.clone())
             + self.ff1.bias.as_ref().unwrap().val().unsqueeze();
-        let ff2 = x
-            .clone()
-            .matmul(self.ff2.weight.val() * self.sparsity_mask.clone())
-            + self.ff2.bias.as_ref().unwrap().val().unsqueeze();
-        let ff1 = ff1.tanh();
-        let ff2 = ff2.tanh();
-        let t_a = self.time_a.forward(x.clone());
-        let t_b = self.time_b.forward(x.clone());
-        let t_interp = sigmoid(t_a * ts.unsqueeze() + t_b);
-        let new_hidden = ff1 * (t_interp.ones_like() - t_interp.clone()) + t_interp * ff2;
-        (new_hidden.clone(), new_hidden)
+        if let CfcCellMode::Pure = self.mode {
+            let new_hidden = -self.a.val()
+                * (-ts.unsqueeze() * (self.w_tau.val().abs() + ff1.clone().abs())).exp()
+                * ff1
+                + self.a.val();
+            (new_hidden.clone(), new_hidden)
+        } else {
+            let ff2 = x
+                .clone()
+                .matmul(self.ff2.weight.val() * self.sparsity_mask.clone())
+                + self.ff2.bias.as_ref().unwrap().val().unsqueeze();
+            let ff1 = ff1.tanh();
+            let ff2 = ff2.tanh();
+            let t_a = self.time_a.forward(x.clone());
+            let t_b = self.time_b.forward(x.clone());
+            let t_interp = sigmoid(t_a * ts.unsqueeze() + t_b);
+            let new_hidden = if let CfcCellMode::NoGate = self.mode {
+                ff1 + t_interp * ff2
+            } else {
+                ff1 * (t_interp.ones_like() - t_interp.clone()) + t_interp * ff2
+            };
+            (new_hidden.clone(), new_hidden)
+        }
     }
 }
 
@@ -626,7 +645,11 @@ impl<B: Backend> WiredCfcCell<B> {
 pub struct WiredCfcCellConfig;
 
 impl WiredCfcCellConfig {
-    pub fn init<B: Backend>(&self, wiring: impl WiringConfig<B>) -> WiredCfcCell<B> {
+    pub fn init<B: Backend>(
+        &self,
+        wiring: impl WiringConfig<B>,
+        mode: CfcCellMode,
+    ) -> WiredCfcCell<B> {
         let mut layers = vec![];
         let mut in_features = wiring.input_dim();
         for l in 0..wiring.num_layers() {
@@ -656,22 +679,31 @@ impl WiredCfcCellConfig {
                 vec![input_sparsity, Tensor::ones([neurons.len(), neurons.len()])],
                 0,
             );
-
+            let init = burn::nn::Initializer::XavierUniform { gain: 1.0 };
             let cell = CfcCell {
+                mode,
                 sparsity_mask: input_sparsity,
                 ninputs: in_features,
                 nhidden: neurons.len(),
+                a: Param::new(
+                    ParamId::new(),
+                    init.init_with([1, neurons.len()], Some(neurons.len()), Some(neurons.len())),
+                ),
+                w_tau: Param::new(
+                    ParamId::new(),
+                    init.init_with([1, neurons.len()], Some(neurons.len()), Some(neurons.len())),
+                ),
                 ff1: LinearConfig::new(in_features + neurons.len(), neurons.len())
-                    .with_initializer(burn::nn::Initializer::XavierUniform { gain: 1.0 })
+                    .with_initializer(init.clone())
                     .init(),
                 ff2: LinearConfig::new(in_features + neurons.len(), neurons.len())
-                    .with_initializer(burn::nn::Initializer::XavierUniform { gain: 1.0 })
+                    .with_initializer(init.clone())
                     .init(),
                 time_a: LinearConfig::new(in_features + neurons.len(), neurons.len())
-                    .with_initializer(burn::nn::Initializer::XavierUniform { gain: 1.0 })
+                    .with_initializer(init.clone())
                     .init(),
                 time_b: LinearConfig::new(in_features + neurons.len(), neurons.len())
-                    .with_initializer(burn::nn::Initializer::XavierUniform { gain: 1.0 })
+                    .with_initializer(init.clone())
                     .init(),
             };
             layers.push(cell);
