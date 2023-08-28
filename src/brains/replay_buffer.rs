@@ -1,16 +1,12 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use burn_tch::TchBackend;
-use rand::{seq::IteratorRandom, thread_rng};
 
 use serde::{Deserialize, Serialize};
 
 use crate::Action;
 
-use super::{
-    thinkers::ppo::{Be, HiddenStates},
-    FrameStack,
-};
+use super::{thinkers::ppo::HiddenStates, FrameStack};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Sart {

@@ -367,6 +367,18 @@ fn spawn_agent(
                 },
                 ..Default::default()
             });
+            parent.spawn(MaterialMesh2dBundle {
+                mesh: meshes.add(Mesh::from(shape::Circle::new(3.0))).into(),
+                material: materials.add(ColorMaterial::from(Color::BLACK)),
+                transform: Transform::from_translation(Vec3::new(-5.0, AGENT_RADIUS - 5.0, 0.1)),
+                ..Default::default()
+            });
+            parent.spawn(MaterialMesh2dBundle {
+                mesh: meshes.add(Mesh::from(shape::Circle::new(3.0))).into(),
+                material: materials.add(ColorMaterial::from(Color::BLACK)),
+                transform: Transform::from_translation(Vec3::new(5.0, AGENT_RADIUS - 5.0, 0.1)),
+                ..Default::default()
+            });
         })
         .id();
     commands.spawn((
@@ -677,7 +689,7 @@ fn update(
 
     for (t_ent, mut t, mut text, text_comp) in name_text_t.iter_mut() {
         if let Ok(agent) = agents.get_component::<Transform>(text_comp.entity_following) {
-            t.translation = agent.translation + Vec3::new(0.0, 40.0, 2.0);
+            t.translation = agent.translation + Vec3::new(0.0, AGENT_RADIUS + 20.0, 2.0);
             let brain = &handles.get(text_comp.entity_following).unwrap();
             text.sections[0].value = format!(
                 "{} {} {}-{}",
@@ -689,7 +701,7 @@ fn update(
     }
     for (t_ent, mut t, hb) in health_bar_t.iter_mut() {
         if let Ok(agent) = agents.get_component::<Transform>(hb.entity_following) {
-            t.translation = agent.translation + Vec3::new(0.0, 25.0, 2.0);
+            t.translation = agent.translation + Vec3::new(0.0, AGENT_RADIUS + 5.0, 2.0);
             let health = health.get_component::<Health>(hb.entity_following).unwrap();
             t.scale = Vec3::new(health.0 / AGENT_MAX_HEALTH * 100.0, 1.0, 1.0);
         } else {
@@ -1002,7 +1014,7 @@ fn main() {
             ..Default::default()
         })
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
-        .add_plugins(RapierDebugRenderPlugin::default())
+        // .add_plugins(RapierDebugRenderPlugin::default())
         .add_plugins(EguiPlugin)
         .add_systems(Startup, setup)
         .add_systems(Update, update)
