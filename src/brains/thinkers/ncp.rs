@@ -92,15 +92,9 @@ impl<B: Backend> WiringConfig<B> for FullyConnected<B> {
     }
 }
 
-#[derive(Debug, Module)]
-pub struct Wiring<B: Backend> {
-    adj_matrix: Tensor<B, 2>,
-    sensory_adj_matrix: Tensor<B, 2>,
-}
-
-impl<B: Backend> Wiring<B> {
-    pub fn fully_connected(input_dim: usize, output_dim: usize, self_connections: bool) -> Self {
-        let mut this = Self {
+impl<B: Backend> FullyConnected<B> {
+    pub fn new(input_dim: usize, output_dim: usize, self_connections: bool) -> Self {
+        let mut this = Wiring {
             adj_matrix: Tensor::zeros([output_dim, output_dim]),
             sensory_adj_matrix: Tensor::zeros([input_dim, output_dim]),
         };
@@ -125,9 +119,21 @@ impl<B: Backend> Wiring<B> {
                 this.add_sensory_synapse(from, to, polarity);
             }
         }
-        this
+        Self {
+            wiring: this,
+            input_dim,
+            output_dim,
+        }
     }
+}
 
+#[derive(Debug, Module)]
+pub struct Wiring<B: Backend> {
+    adj_matrix: Tensor<B, 2>,
+    sensory_adj_matrix: Tensor<B, 2>,
+}
+
+impl<B: Backend> Wiring<B> {
     pub fn add_synapse(&mut self, from: Neuron, to: Neuron, polarity: Polarity) {
         let dev = self.adj_matrix.device();
         self.adj_matrix = self.adj_matrix.clone().slice_assign(

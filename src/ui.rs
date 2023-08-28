@@ -36,7 +36,7 @@ impl std::fmt::Display for LogText {
 
 pub fn ui(
     mut cxs: EguiContexts,
-    mut brains: NonSendMut<BrainBank>,
+    mut brains: ResMut<BrainBank>,
     handles: Query<&BrainHandle>,
     log: ResMut<LogText>,
 ) {
@@ -74,8 +74,7 @@ pub fn ui(
                             ui.vertical(|ui| {
                                 ui.heading(&brain.name);
                                 // ui.group(|ui| {
-                                let status =
-                                    brains.get_status(brain.brain_id).0.unwrap_or_default();
+                                let status = brains.get_status(brain.brain_id).unwrap_or_default();
                                 let mut mu = "mu:".to_owned();
                                 for m in status.recent_mu.iter() {
                                     mu.push_str(&format!(" {:.4}", m));

@@ -1,13 +1,12 @@
 use bevy::prelude::*;
-use bevy_tasks::{AsyncComputeTaskPool, Task, ThreadExecutor};
 use futures_lite::future;
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
-    sync::{atomic::AtomicUsize, Arc, Mutex},
+    sync::atomic::AtomicUsize,
 };
 use tokio::sync::{
-    mpsc::{self, error::TryRecvError, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+    mpsc::{self, Receiver, Sender},
     oneshot,
 };
 
@@ -187,7 +186,7 @@ pub enum BrainControl {
     },
 }
 
-#[derive(Default)]
+#[derive(Default, Resource)]
 pub struct BrainBank {
     rxs: BTreeMap<usize, Receiver<BrainStatus>>,
     txs: BTreeMap<usize, Sender<BrainControl>>,
@@ -249,13 +248,11 @@ impl BrainBank {
         });
     }
 
-    pub fn get_status(&mut self, brain: usize) -> (Option<ThinkerStatus>, bool) {
-        let mut fresh = false;
+    pub fn get_status(&mut self, brain: usize) -> Option<ThinkerStatus> {
         while let Ok(status) = self.rxs.get_mut(&brain).unwrap().try_recv() {
             match status {
                 BrainStatus::NewStatus(status) => {
                     self.statuses.insert(brain, status);
-                    fresh = true;
                 }
                 BrainStatus::Wait(waker) => future::block_on(async {
                     waker.await.unwrap();
@@ -263,7 +260,7 @@ impl BrainBank {
                 _ => {}
             }
         }
-        (self.statuses.get(&brain).cloned(), fresh)
+        self.statuses.get(&brain).cloned()
     }
 
     pub fn assign_entity(&mut self, brain: usize, ent: Entity) {

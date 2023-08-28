@@ -251,13 +251,11 @@ struct DoneTraining;
 struct TrainingText(usize, Timer);
 
 fn check_train_brains(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mut tx: EventWriter<TrainBrain>,
-    mut rx: EventReader<DoneTraining>,
-    mut text: Query<(Entity, &mut TrainingText)>,
     frame_count: Res<FrameCount>,
-    time: Res<Time>,
+    mut brains: ResMut<BrainBank>,
+    rbs: Res<ReplayBuffers>,
+    mut log: ResMut<LogText>,
+    handles: Query<&BrainHandle>,
 ) {
     if frame_count.0 > 1 && frame_count.0 as usize % AGENT_UPDATE_INTERVAL == 0 {
         // commands.spawn((
@@ -277,7 +275,27 @@ fn check_train_brains(
         //     TrainingText(0, Timer::from_seconds(0.1, TimerMode::Once)),
         // ));
         for id in 0..NUM_AGENTS {
-            tx.send(TrainBrain(id));
+            let handle = handles.iter().find(|h| h.brain_id == id).unwrap();
+            if handle.deaths > 0 {
+                brains.learn(id, frame_count.0 as usize, rbs.0[&id].clone());
+            }
+            let status = brains.get_status(id).unwrap();
+            log.push(format!(
+                "{} {} Value Loss: {}",
+                handle.brain_id, handle.name, status.recent_value_loss,
+            ));
+            log.push(format!(
+                "{} {} Policy Loss: {}",
+                handle.brain_id, handle.name, status.recent_policy_loss,
+            ));
+            log.push(format!(
+                "{} {} Entropy Loss: {}",
+                handle.brain_id, handle.name, status.recent_entropy_loss,
+            ));
+            log.push(format!(
+                "{} {} Policy Clamp Ratio: {}",
+                handle.brain_id, handle.name, status.recent_nclamp,
+            ));
         }
     }
     // for (text_ent, mut text) in text.iter_mut() {
@@ -310,27 +328,8 @@ fn check_train_brains(
     // }
 }
 
-#[derive(Default)]
+#[derive(Default, Resource)]
 pub struct ReplayBuffers(pub BTreeMap<usize, SartAdvBuffer>);
-
-fn train_brains(
-    mut brains: NonSendMut<BrainBank>,
-    rbs: NonSend<ReplayBuffers>,
-    mut log: ResMut<LogText>,
-    frame_count: Res<FrameCount>,
-    mut rx: EventReader<TrainBrain>,
-    mut tx: EventWriter<DoneTraining>,
-    handles: Query<&BrainHandle>,
-) {
-    if let Some(id) = rx.iter().next() {
-        let brain = brains.brain_iter().find(|v| *v == id.0).unwrap();
-        if handles.iter().find(|h| h.brain_id == id.0).unwrap().deaths > 0 {
-            brains.learn(brain, frame_count.0 as usize, rbs.0[&brain].clone());
-        }
-
-        tx.send(DoneTraining);
-    }
-}
 
 #[derive(Component)]
 pub struct Wall;
@@ -340,7 +339,7 @@ fn spawn_agent(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
-    brains: &mut NonSendMut<BrainBank>,
+    brains: &mut ResMut<BrainBank>,
     asset_server: &Res<AssetServer>,
 ) {
     let agent_pos = Vec3::new(
@@ -407,8 +406,8 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    mut brains: NonSendMut<BrainBank>,
-    mut rbs: NonSendMut<ReplayBuffers>,
+    mut brains: ResMut<BrainBank>,
+    mut rbs: ResMut<ReplayBuffers>,
     asset_server: Res<AssetServer>,
     timestamp: Res<Timestamp>,
 ) {
@@ -643,9 +642,9 @@ fn update(
         ),
         (With<Agent>, Without<NameText>, Without<ShootyLine>),
     >,
-    mut brains: NonSendMut<BrainBank>,
+    mut brains: ResMut<BrainBank>,
     mut handles: Query<&mut BrainHandle>,
-    mut rbs: NonSendMut<ReplayBuffers>,
+    mut rbs: ResMut<ReplayBuffers>,
     mut health: Query<&mut Health>,
     mut line_vis: Query<
         (&mut Visibility, &mut Transform),
@@ -745,7 +744,6 @@ fn update(
                 direction: other_transform.local_y().xy(),
                 firing: brains
                     .get_status(handles.get(other).unwrap().brain_id)
-                    .0
                     .unwrap_or_default()
                     .last_action
                     .shoot
@@ -760,7 +758,7 @@ fn update(
         brains.send_obs(agent, my_state.clone(), frame_count.0 as usize);
         // }
 
-        let status = brains.get_status(handles.get(agent).unwrap().brain_id).0;
+        let status = brains.get_status(handles.get(agent).unwrap().brain_id);
         if let Some(status) = status {
             all_actions.insert(agent, status.last_action);
         }
@@ -840,7 +838,7 @@ fn update(
     }
 
     for (agent, _, _, _, _) in agents.iter() {
-        if let (Some(status), fresh) = brains.get_status(handles.get(agent).unwrap().brain_id) {
+        if let Some(status) = brains.get_status(handles.get(agent).unwrap().brain_id) {
             if let Some(rb) = rbs.0.get_mut(&handles.get(agent).unwrap().brain_id) {
                 // if fresh {
                 if let (Some(action), Some(reward), Some(terminal)) = (
@@ -969,10 +967,10 @@ fn main() {
         })
         .insert_resource(Timestamp::default())
         .insert_resource(AvgAgentKills::default())
-        .insert_non_send_resource(ReplayBuffers::default())
+        .insert_resource(ReplayBuffers::default())
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
-        .insert_non_send_resource(BrainBank::default())
+        .insert_resource(BrainBank::default())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 present_mode: bevy::window::PresentMode::AutoNoVsync,
@@ -987,8 +985,8 @@ fn main() {
             // limiter: bevy_framepace::Limiter::Manual(Duration::from_secs_f64(1.0 / 144.0)),
             limiter: bevy_framepace::Limiter::Off,
         })
-        .add_plugins(LogDiagnosticsPlugin::default())
-        .add_plugins(FrameTimeDiagnosticsPlugin)
+        // .add_plugins(LogDiagnosticsPlugin::default())
+        // .add_plugins(FrameTimeDiagnosticsPlugin)
         .insert_resource(RapierConfiguration {
             gravity: Vec2::ZERO,
             timestep_mode: TimestepMode::Fixed {
@@ -1003,7 +1001,6 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(Update, update)
         .add_systems(Update, check_train_brains)
-        .add_systems(Update, train_brains)
         .add_systems(Update, ui)
         .add_systems(Update, handle_input)
         .add_event::<TrainBrain>()

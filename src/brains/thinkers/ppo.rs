@@ -22,7 +22,7 @@ use crate::{brains::replay_buffer::SartAdvBuffer, hparams::AGENT_ENTROPY_BETA};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::{
-    ncp::{Cfc, Ncp, WiredCfcCellConfig, WiringConfig},
+    ncp::{Cfc, FullyConnected, Ncp, WiredCfcCellConfig, WiringConfig},
     Thinker,
 };
 
@@ -218,24 +218,27 @@ pub struct PpoActorConfig {
 
 impl PpoActorConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoActor<B> {
-        let wiring_com = Ncp::auto(
-            self.obs_len,
-            self.hidden_len * 2,
-            self.hidden_len,
-            Some(0.5),
-        );
-        let wiring_mu = Ncp::auto(
-            self.hidden_len,
-            self.hidden_len * 2,
-            self.hidden_len,
-            Some(0.5),
-        );
-        let wiring_std = Ncp::auto(
-            self.hidden_len,
-            self.hidden_len * 2,
-            self.hidden_len,
-            Some(0.5),
-        );
+        // let wiring_com = Ncp::auto(
+        //     self.obs_len,
+        //     self.hidden_len * 2,
+        //     self.hidden_len,
+        //     Some(0.5),
+        // );
+        // let wiring_mu = Ncp::auto(
+        //     self.hidden_len,
+        //     self.hidden_len * 2,
+        //     self.hidden_len,
+        //     Some(0.5),
+        // );
+        // let wiring_std = Ncp::auto(
+        //     self.hidden_len,
+        //     self.hidden_len * 2,
+        //     self.hidden_len,
+        //     Some(0.5),
+        // );
+        let wiring_com = FullyConnected::new(self.obs_len, self.hidden_len, true);
+        let wiring_mu = FullyConnected::new(self.hidden_len, self.hidden_len, true);
+        let wiring_std = FullyConnected::new(self.hidden_len, self.hidden_len, true);
 
         PpoActor {
             obs_len: self.obs_len,
@@ -305,12 +308,13 @@ pub struct PpoCriticConfig {
 
 impl PpoCriticConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoCritic<B> {
-        let wiring = Ncp::auto(
-            self.obs_len,
-            self.hidden_len * 2,
-            self.hidden_len,
-            Some(0.5),
-        );
+        // let wiring = Ncp::auto(
+        //     self.obs_len,
+        //     self.hidden_len * 2,
+        //     self.hidden_len,
+        //     Some(0.5),
+        // );
+        let wiring = FullyConnected::new(self.obs_len, self.hidden_len, true);
         PpoCritic {
             obs_len: self.obs_len,
             rnn_units: wiring.units(),
@@ -462,7 +466,7 @@ impl Thinker for PpoThinker {
         let mut total_entropy_loss = 0.0;
         let mut total_nclamp = 0.0;
         for _epoch in kdam::tqdm!(0..AGENT_OPTIM_EPOCHS, desc = "Training") {
-            nstep += AGENT_OPTIM_BATCH_SIZE;
+            nstep += 1;
 
             let step = rb.sample_batch(AGENT_OPTIM_BATCH_SIZE).unwrap();
             let returns = Tensor::from_floats(
