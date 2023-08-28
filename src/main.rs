@@ -17,7 +17,7 @@ use bevy::{
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 use brains::{
-    replay_buffer::{Sart, SartAdvBuffer},
+    replay_buffer::{PpoBuffer, Sart},
     thinkers::{ppo::PpoThinker, Thinker},
     Brain, BrainBank,
 };
@@ -327,7 +327,7 @@ fn check_train_brains(
 }
 
 #[derive(Default, Resource)]
-pub struct ReplayBuffers(pub BTreeMap<usize, SartAdvBuffer>);
+pub struct ReplayBuffers(pub BTreeMap<usize, PpoBuffer>);
 
 #[derive(Component)]
 pub struct Wall;
@@ -617,7 +617,7 @@ fn setup(
         let brain_name = name.clone();
 
         let id = brains.spawn(|rx| Brain::new(PpoThinker::default(), brain_name, ts, rx));
-        rbs.0.insert(id, SartAdvBuffer::default());
+        rbs.0.insert(id, PpoBuffer::default());
         spawn_agent(
             BrainHandle {
                 color: Color::rgb(rand::random(), rand::random(), rand::random()),
@@ -858,6 +858,7 @@ fn update(
                             reward: *reward,
                             terminal: *terminal,
                         },
+                        status.hiddens.unwrap(),
                         Some(AGENT_RB_MAX_LEN),
                     );
                 }

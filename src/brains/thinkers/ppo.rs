@@ -2,14 +2,14 @@
 
 use burn::{
     config::Config,
-    module::{ADModule, Module, Param, ParamId},
+    module::{ADModule, Module, ModuleVisitor, Param, ParamId},
     nn::{Initializer, LinearConfig},
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
 };
 
-use burn_tch::{TchBackend, TchDevice, TchTensor};
+use burn_tch::{TchBackend, TchDevice};
 
 use itertools::Itertools;
 use std::f32::consts::PI;
@@ -18,11 +18,11 @@ use crate::brains::FrameStack;
 use crate::hparams::{
     AGENT_ACTOR_LR, AGENT_CRITIC_LR, AGENT_HIDDEN_DIM, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS,
 };
-use crate::{brains::replay_buffer::SartAdvBuffer, hparams::AGENT_ENTROPY_BETA};
+use crate::{brains::replay_buffer::PpoBuffer, hparams::AGENT_ENTROPY_BETA};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::{
-    ncp::{Cfc, CfcCellMode, FullyConnected, WiredCfcCellConfig, WiringConfig},
+    ncp::{Cfc, CfcCellMode, CfcConfig, CfcMode, FullyConnected, WiredCfcCellConfig, WiringConfig},
     Thinker,
 };
 
@@ -51,7 +51,7 @@ impl<B: Backend<FloatElem = f32>, const K: usize> MvNormal<B, K> {
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let cov_diag = self.cov_diag.clone();
         let nbatch = self.mu.shape().dims[0];
-        let mut det = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
+        let mut det = Tensor::<B, 2>::ones([nbatch, 1]).to_device(&self.cov_diag.device());
         for i in 0..K {
             det = det * cov_diag.clone().slice([0..nbatch, i..i + 1]);
         }
@@ -61,7 +61,6 @@ impl<B: Backend<FloatElem = f32>, const K: usize> MvNormal<B, K> {
         let f = (2.0 * PI).powf(K as f32);
         let denom = (det * f).sqrt();
         let pdf = numer / denom;
-
         pdf.log()
     }
 
@@ -83,7 +82,7 @@ pub fn sigmoid<B: Backend, const ND: usize>(x: Tensor<B, ND>) -> Tensor<B, ND> {
 }
 
 #[derive(Module, Debug)]
-pub struct Gru<B: Backend> {
+pub struct GruCell<B: Backend> {
     w_xz: Param<Tensor<B, 2>>,
     w_hz: Param<Tensor<B, 2>>,
     b_z: Param<Tensor<B, 1>>,
@@ -96,15 +95,15 @@ pub struct Gru<B: Backend> {
 }
 
 #[derive(Config, Debug)]
-pub struct GruConfig {
+pub struct GruCellConfig {
     input_len: usize,
     hidden_len: usize,
 }
 
-impl GruConfig {
-    pub fn init<B: Backend>(&self) -> Gru<B> {
+impl GruCellConfig {
+    pub fn init<B: Backend>(&self) -> GruCell<B> {
         let initializer = Initializer::XavierNormal { gain: 1.0 };
-        Gru {
+        GruCell {
             w_xz: Param::new(
                 ParamId::new(),
                 initializer.init_with(
@@ -160,42 +159,47 @@ impl GruConfig {
     }
 }
 
-impl<B: Backend> Gru<B> {
+impl<B: Backend> GruCell<B> {
     pub fn forward(
         &self,
-        xs: Tensor<B, 3>,
+        x: Tensor<B, 2>,
         h: Option<Tensor<B, 2>>,
-    ) -> (Tensor<B, 3>, Tensor<B, 2>) {
+    ) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let dev = &self.devices()[0];
-        let [nbatch, nseq, nfeat] = xs.shape().dims;
+        let [nbatch, _] = x.shape().dims;
         let [nhidden] = self.b_h.shape().dims;
         let mut h = h.unwrap_or(Tensor::zeros([nbatch, nhidden])).to_device(dev);
-        let mut outputs = Tensor::zeros([nbatch, nseq, nhidden]).to_device(dev);
 
-        for i in 0..nseq {
-            let x: Tensor<B, 2> = xs.clone().slice([0..nbatch, i..i + 1, 0..nfeat]).squeeze(1);
-            let z = sigmoid(
-                x.clone().matmul(self.w_xz.val())
-                    + h.clone().matmul(self.w_hz.val())
-                    + self.b_z.val().reshape([1, nhidden]),
-            );
-            let r = sigmoid(
-                x.clone().matmul(self.w_xr.val())
-                    + h.clone().matmul(self.w_hr.val())
-                    + self.b_r.val().reshape([1, nhidden]),
-            );
-            let h_tilde = (x.clone().matmul(self.w_xh.val())
-                + (r * h.clone()).matmul(self.w_hh.val())
-                + self.b_h.val().reshape([1, nhidden]))
-            .tanh();
-            h = z.clone() * h + (z.ones_like() - z) * h_tilde;
-            outputs = outputs.slice_assign(
-                [0..nbatch, i..i + 1, 0..nhidden],
-                h.clone().reshape([nbatch, 1, nhidden]),
-            );
+        // let x: Tensor<B, 2> = xs.clone().slice([0..nbatch, i..i + 1, 0..nfeat]).squeeze(1);
+        let z = sigmoid(
+            x.clone().matmul(self.w_xz.val())
+                + h.clone().matmul(self.w_hz.val())
+                + self.b_z.val().reshape([1, nhidden]),
+        );
+        let r = sigmoid(
+            x.clone().matmul(self.w_xr.val())
+                + h.clone().matmul(self.w_hr.val())
+                + self.b_r.val().reshape([1, nhidden]),
+        );
+        let h_tilde = (x.clone().matmul(self.w_xh.val())
+            + (r * h.clone()).matmul(self.w_hh.val())
+            + self.b_h.val().reshape([1, nhidden]))
+        .tanh();
+        h = z.clone() * h + (z.ones_like() - z) * h_tilde;
+
+        (h.clone(), h)
+    }
+}
+
+pub struct CheckNanWeights;
+impl<B: Backend<FloatElem = f32>> ModuleVisitor<B> for CheckNanWeights {
+    fn visit<const D: usize>(&mut self, id: &ParamId, tensor: &Tensor<B, D>) {
+        if tensor.to_data().value.into_iter().any(|s| s.is_nan()) {
+            panic!("NaN weight detected in param id {}", id);
         }
-
-        (outputs, h)
+        if tensor.to_data().value.into_iter().any(|s| !s.is_finite()) {
+            panic!("Inf weight detected in param id {}", id);
+        }
     }
 }
 
@@ -226,18 +230,17 @@ impl PpoActorConfig {
             obs_len: self.obs_len,
             com_units: wiring_com.units(),
             mustd_units: wiring_mu.units(),
-            common: Cfc {
-                cell: WiredCfcCellConfig::new().init(wiring_com, CfcCellMode::NoGate),
-                fc: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
-            },
-            mu_head: Cfc {
-                cell: WiredCfcCellConfig::new().init(wiring_mu, CfcCellMode::NoGate),
-                fc: LinearConfig::new(self.hidden_len, self.action_len).init(),
-            },
-            std_head: Cfc {
-                cell: WiredCfcCellConfig::new().init(wiring_std, CfcCellMode::NoGate),
-                fc: LinearConfig::new(self.hidden_len, self.action_len).init(),
-            },
+            common: CfcConfig::new(self.obs_len, self.hidden_len).init(
+                wiring_com,
+                CfcMode::MixedMemory,
+                CfcCellMode::Default,
+            ),
+            mu_head: CfcConfig::new(self.hidden_len, self.hidden_len)
+                .with_projected_len(self.action_len)
+                .init(wiring_mu, CfcMode::MixedMemory, CfcCellMode::Default),
+            std_head: CfcConfig::new(self.hidden_len, self.hidden_len)
+                .with_projected_len(self.action_len)
+                .init(wiring_std, CfcMode::MixedMemory, CfcCellMode::Default),
         }
     }
 }
@@ -253,9 +256,7 @@ impl<B: Backend<FloatElem = f32>> PpoActor<B> {
 
         let (x, ch) = self.common.forward(x, Some(common_h.clone()));
         *common_h = ch;
-        if x.to_data().value.into_iter().any(|s| s.is_nan()) {
-            panic!()
-        }
+        let x = x.tanh();
         let (mu, mh) = self.mu_head.forward(x.clone(), Some(mu_h.clone()));
         *mu_h = mh;
         let [nbatch, nstack, nfeat] = mu.shape().dims;
@@ -296,10 +297,9 @@ impl PpoCriticConfig {
         PpoCritic {
             obs_len: self.obs_len,
             rnn_units: wiring.units(),
-            rnn: Cfc {
-                cell: WiredCfcCellConfig::new().init(wiring, CfcCellMode::NoGate),
-                fc: LinearConfig::new(self.hidden_len, 1).init(),
-            },
+            rnn: CfcConfig::new(self.obs_len, self.hidden_len)
+                .with_projected_len(1)
+                .init(wiring, CfcMode::MixedMemory, CfcCellMode::Default),
         }
     }
 }
@@ -317,6 +317,7 @@ impl<B: Backend> PpoCritic<B> {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct HiddenStates<B: Backend> {
     pub actor_com_h: Tensor<B, 2>,
     pub actor_mu_h: Tensor<B, 2>,
@@ -436,7 +437,7 @@ impl Thinker for PpoThinker {
         )
     }
 
-    fn learn(&mut self, rb: &SartAdvBuffer) {
+    fn learn(&mut self, rb: &PpoBuffer) {
         let mut nstep = 0;
 
         let mut total_pi_loss = 0.0;
@@ -502,12 +503,21 @@ impl Thinker for PpoThinker {
             let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
                 / (advantage.var(0).sqrt() + 1e-7);
 
-            let mut meta = self.init_hidden_train(AGENT_OPTIM_BATCH_SIZE);
+            let (actor_com_h, actor_mu_h, actor_std_h, critic_h): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
+                step.hiddens
+                    .into_iter()
+                    .map(|hs| (hs.actor_com_h, hs.actor_mu_h, hs.actor_std_h, hs.critic_h))
+                    .multiunzip();
+            // let mut meta = self.init_hidden_train(AGENT_OPTIM_BATCH_SIZE);
+            let mut actor_com_h = Tensor::from_inner(Tensor::cat(actor_com_h, 0));
+            let mut actor_mu_h = Tensor::from_inner(Tensor::cat(actor_mu_h, 0));
+            let mut actor_std_h = Tensor::from_inner(Tensor::cat(actor_std_h, 0));
+            let mut critic_h = Tensor::from_inner(Tensor::cat(critic_h, 0));
             let (mu, std) = self.actor.forward(
                 s.clone(),
-                &mut meta.actor_com_h,
-                &mut meta.actor_mu_h,
-                &mut meta.actor_std_h,
+                &mut actor_com_h,
+                &mut actor_mu_h,
+                &mut actor_std_h,
             );
             let dist = MvNormal::<Be, ACTION_LEN> {
                 mu,
@@ -542,12 +552,14 @@ impl Thinker for PpoThinker {
             //     .any()
             //     .iter()
             //     .map(|t| t.map(|t| println!("{}", t)));
+            let mut visitor = CheckNanWeights;
             self.actor = self.actor_optim.step(
                 AGENT_ACTOR_LR,
                 self.actor.clone(),
                 GradientsParams::from_grads(actor_grads, &self.actor),
             );
-            let val = self.critic.forward(s, &mut meta.critic_h);
+            self.actor.visit(&mut visitor);
+            let val = self.critic.forward(s, &mut critic_h);
             let val_err = val - returns;
             let value_loss = (val_err.clone() * val_err).mean();
             total_val_loss += value_loss.clone().into_scalar();
@@ -565,6 +577,7 @@ impl Thinker for PpoThinker {
                 self.critic.clone(),
                 GradientsParams::from_grads(critic_grads, &self.critic),
             );
+            self.critic.visit(&mut visitor);
         }
 
         self.recent_policy_loss = total_pi_loss / nstep as f32;

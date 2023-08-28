@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use burn_tch::TchBackend;
 use futures_lite::future;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -11,8 +12,11 @@ use tokio::sync::{
 };
 
 use self::{
-    replay_buffer::SartAdvBuffer,
-    thinkers::{ppo::PpoThinker, Thinker},
+    replay_buffer::PpoBuffer,
+    thinkers::{
+        ppo::{HiddenStates, PpoThinker},
+        Thinker,
+    },
 };
 use crate::{hparams::N_FRAME_STACK, Action, Observation, TbWriter, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -57,7 +61,7 @@ pub struct Brain<T: Thinker> {
     pub writer: TbWriter,
     pub metadata: T::Metadata,
     last_trained_at: usize,
-    learn_waker: Option<(oneshot::Sender<()>, usize, SartAdvBuffer)>,
+    learn_waker: Option<(oneshot::Sender<()>, usize, PpoBuffer)>,
     rx: Receiver<BrainControl>,
 }
 
@@ -96,7 +100,7 @@ impl Brain<PpoThinker> {
         action
     }
 
-    pub fn learn(&mut self, frame_count: usize, rb: &SartAdvBuffer) {
+    pub fn learn(&mut self, frame_count: usize, rb: &PpoBuffer) {
         self.thinker.learn(rb);
         let net_reward = rb.reward.iter().sum::<f32>();
         self.writer.add_scalar("Reward", net_reward, frame_count);
@@ -135,6 +139,7 @@ impl Brain<PpoThinker> {
                             recent_std: self.thinker.recent_std.clone(),
                             recent_entropy: self.thinker.recent_entropy,
                             fs: self.fs.clone(),
+                            hiddens: Some(self.metadata.clone()),
                         })
                     } else {
                         BrainStatus::Ready
@@ -164,6 +169,7 @@ pub struct ThinkerStatus {
     pub recent_nclamp: f32,
     pub recent_entropy: f32,
     pub fs: FrameStack,
+    pub hiddens: Option<HiddenStates<TchBackend<f32>>>,
 }
 
 #[derive(Debug)]
@@ -180,7 +186,7 @@ pub enum BrainControl {
         frame_count: usize,
     },
     Learn {
-        rb: SartAdvBuffer,
+        rb: PpoBuffer,
         frame_count: usize,
     },
 }
@@ -238,7 +244,7 @@ impl BrainBank {
         // }
     }
 
-    pub fn learn(&self, brain: usize, frame_count: usize, rb: SartAdvBuffer) {
+    pub fn learn(&self, brain: usize, frame_count: usize, rb: PpoBuffer) {
         let tx = self.txs.get(&brain).unwrap();
         future::block_on(async {
             tx.send(BrainControl::Learn { frame_count, rb })

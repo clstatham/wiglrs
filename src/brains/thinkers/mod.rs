@@ -7,7 +7,7 @@ use bevy::prelude::Vec2;
 
 use crate::Action;
 
-use super::{replay_buffer::SartAdvBuffer, FrameStack};
+use super::{replay_buffer::PpoBuffer, FrameStack};
 
 pub mod ncp;
 pub mod ppo;
@@ -16,7 +16,7 @@ pub mod stats;
 pub trait Thinker {
     type Metadata;
     fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action;
-    fn learn(&mut self, b: &SartAdvBuffer);
+    fn learn(&mut self, b: &PpoBuffer);
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>;
     fn init_metadata(&self, batch_size: usize) -> Self::Metadata;
 }
@@ -36,7 +36,7 @@ impl Thinker for RandomThinker {
             metadata: None,
         }
     }
-    fn learn(&mut self, _b: &SartAdvBuffer) {}
+    fn learn(&mut self, _b: &PpoBuffer) {}
     fn save(&self, _path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
@@ -72,7 +72,7 @@ impl<T: Thinker> Thinker for SharedThinker<T> {
     fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action {
         self.lock().act(obs, metadata)
     }
-    fn learn(&mut self, b: &SartAdvBuffer) {
+    fn learn(&mut self, b: &PpoBuffer) {
         self.lock().learn(b)
     }
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {

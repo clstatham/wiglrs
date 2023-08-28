@@ -12,7 +12,7 @@ use itertools::Itertools;
 
 use rand::{seq::SliceRandom, thread_rng};
 
-use super::ppo::sigmoid;
+use super::ppo::{sigmoid, GruCell, GruCellConfig};
 
 pub type Neuron = usize;
 
@@ -550,8 +550,9 @@ impl<B: Backend> Ltc<B> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Module)]
+#[derive(Debug, Clone, Copy, Module, Default)]
 pub enum CfcCellMode {
+    #[default]
     Default,
     Pure,
     NoGate,
@@ -716,7 +717,9 @@ impl WiredCfcCellConfig {
 #[derive(Debug, Module)]
 pub struct Cfc<B: Backend> {
     pub cell: WiredCfcCell<B>,
+    pub rnn: GruCell<B>,
     pub fc: Linear<B>,
+    pub mode: CfcMode,
 }
 
 impl<B: Backend> Cfc<B> {
@@ -728,9 +731,6 @@ impl<B: Backend> Cfc<B> {
         let dev = &self.devices()[0];
         let [nbatch, nseq, nfeat] = xs.shape().dims;
         let nout = self.fc.weight.shape().dims[1];
-        // let nhidden = self.cell.command_neurons.len()
-        //     + self.cell.motor_neurons.len()
-        //     + self.cell.inter_neurons.len();
         let nhidden = self
             .cell
             .layers
@@ -742,13 +742,46 @@ impl<B: Backend> Cfc<B> {
 
         for i in 0..nseq {
             let x: Tensor<B, 2> = xs.clone().slice([0..nbatch, i..i + 1, 0..nfeat]).squeeze(1);
-            let (out, h_next) = self.cell.forward(x, h, Tensor::ones_device([1], dev));
+            let (out, h_next) = if let CfcMode::MixedMemory = self.mode {
+                let (h, _) = self.rnn.forward(x.clone(), Some(h));
+                self.cell.forward(x, h, Tensor::ones_device([1], dev))
+            } else {
+                self.cell.forward(x, h, Tensor::ones_device([1], dev))
+            };
             h = h_next;
-            outputs = outputs.slice_assign(
-                [0..nbatch, i..i + 1, 0..nout],
-                self.fc.forward(out).reshape([nbatch, 1, nout]),
-            );
+            let out = self.fc.forward(out).reshape([nbatch, 1, nout]);
+            outputs = outputs.slice_assign([0..nbatch, i..i + 1, 0..nout], out);
         }
         (outputs, h)
+    }
+}
+
+#[derive(Debug, Clone, Module)]
+pub enum CfcMode {
+    Default,
+    MixedMemory,
+}
+
+#[derive(Debug, Config)]
+pub struct CfcConfig {
+    pub input_len: usize,
+    pub hidden_len: usize,
+    #[config(default = "hidden_len")]
+    pub projected_len: usize,
+}
+
+impl CfcConfig {
+    pub fn init<B: Backend>(
+        &self,
+        wiring: impl WiringConfig<B>,
+        mode: CfcMode,
+        cell_mode: CfcCellMode,
+    ) -> Cfc<B> {
+        Cfc {
+            cell: WiredCfcCellConfig::new().init(wiring, cell_mode),
+            rnn: GruCellConfig::new(self.input_len, self.hidden_len).init(),
+            fc: LinearConfig::new(self.hidden_len, self.projected_len).init(),
+            mode,
+        }
     }
 }

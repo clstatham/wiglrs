@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, VecDeque};
 
+use burn_tch::TchBackend;
 use rand::{seq::IteratorRandom, thread_rng};
 
 use serde::{Deserialize, Serialize};
 
 use crate::Action;
 
-use super::FrameStack;
+use super::{
+    thinkers::ppo::{Be, HiddenStates},
+    FrameStack,
+};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Sart {
@@ -45,19 +49,25 @@ impl SartAdv {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-pub struct SartAdvBuffer {
+#[derive(Clone, Default)]
+pub struct PpoBuffer {
     pub obs: VecDeque<FrameStack>,
     pub action: VecDeque<Action>,
     pub reward: VecDeque<f32>,
     pub advantage: VecDeque<Option<f32>>,
     pub returns: VecDeque<Option<f32>>,
     pub terminal: VecDeque<bool>,
+    pub hiddens: VecDeque<HiddenStates<TchBackend<f32>>>,
     current_trajectory_start: usize,
 }
 
-impl SartAdvBuffer {
-    pub fn remember_sart(&mut self, step: Sart, max_len: Option<usize>) {
+impl PpoBuffer {
+    pub fn remember_sart(
+        &mut self,
+        step: Sart,
+        hiddens: HiddenStates<TchBackend<f32>>,
+        max_len: Option<usize>,
+    ) {
         if let Some(max_len) = max_len {
             while self.obs.len() >= max_len {
                 self.obs.pop_front();
@@ -77,6 +87,9 @@ impl SartAdvBuffer {
             while self.terminal.len() >= max_len {
                 self.terminal.pop_front();
             }
+            while self.hiddens.len() >= max_len {
+                self.hiddens.pop_front();
+            }
         }
 
         let Sart {
@@ -86,6 +99,7 @@ impl SartAdvBuffer {
             terminal,
         } = step;
 
+        self.hiddens.push_back(hiddens);
         self.obs.push_back(obs);
         self.action.push_back(action);
         self.reward.push_back(reward);
@@ -123,13 +137,13 @@ impl SartAdvBuffer {
         self.current_trajectory_start = 0;
     }
 
-    pub fn sample_batch(&self, batch_size: usize) -> Option<SartAdvBuffer> {
+    pub fn sample_batch(&self, batch_size: usize) -> Option<PpoBuffer> {
         use rand::prelude::*;
 
         let end_of_last_traj = self.obs.len() - self.current_trajectory_start;
         let mut idxs = vec![0; batch_size];
         (0..end_of_last_traj).choose_multiple_fill(&mut thread_rng(), &mut idxs);
-        let mut batch = SartAdvBuffer::default();
+        let mut batch = PpoBuffer::default();
         for i in idxs {
             batch.obs.push_back(self.obs[i].to_owned());
             batch.action.push_back(self.action[i]);
@@ -137,24 +151,7 @@ impl SartAdvBuffer {
             batch.terminal.push_back(self.terminal[i]);
             batch.advantage.push_back(self.advantage[i]);
             batch.returns.push_back(self.returns[i]);
-        }
-        Some(batch)
-    }
-
-    pub fn sample_many(
-        rbs: &BTreeMap<usize, SartAdvBuffer>,
-        batch_size: usize,
-    ) -> Option<SartAdvBuffer> {
-        let mut batch = SartAdvBuffer::default();
-        for _ in 0..batch_size {
-            let r = rbs.values().choose(&mut thread_rng())?;
-            let b = r.sample_batch(1)?;
-            batch.obs.push_back(b.obs[0].to_owned());
-            batch.action.push_back(b.action[0].to_owned());
-            batch.reward.push_back(b.reward[0].to_owned());
-            batch.terminal.push_back(b.terminal[0].to_owned());
-            batch.advantage.push_back(b.advantage[0].to_owned());
-            batch.returns.push_back(b.returns[0].to_owned());
+            batch.hiddens.push_back(self.hiddens[i].clone());
         }
         Some(batch)
     }
