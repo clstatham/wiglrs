@@ -7,7 +7,7 @@ pub const AGENT_OPTIM_BATCH_SIZE: usize = 128;
 pub const AGENT_ENTROPY_BETA: f32 = 0.001;
 
 pub const AGENT_UPDATE_INTERVAL: usize = 2_000;
-pub const AGENT_RB_MAX_LEN: usize = 100_000;
+pub const AGENT_RB_MAX_LEN: usize = 10_000;
 pub const N_FRAME_STACK: usize = 5;
 
 pub const AGENT_RADIUS: f32 = 20.0;

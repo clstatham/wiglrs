@@ -110,7 +110,7 @@ impl PpoBuffer {
         self.current_trajectory_start += 1;
         if let Some(max_len) = max_len {
             if self.current_trajectory_start >= max_len {
-                self.current_trajectory_start = 0;
+                self.current_trajectory_start = max_len;
                 self.finish_trajectory(); // in case one of them is an ABSOLUTE GAMER and doesn't die for like 100_000 frames
             }
         }
