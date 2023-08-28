@@ -5,7 +5,7 @@ use std::{
 
 use bevy::prelude::Vec2;
 
-use crate::Action;
+use crate::{Action, TbWriter};
 
 use super::{replay_buffer::PpoBuffer, FrameStack};
 
@@ -13,18 +13,29 @@ pub mod ncp;
 pub mod ppo;
 pub mod stats;
 
+pub trait Status {
+    fn log(&self, writer: &mut TbWriter, step: usize);
+}
+
+impl Status for () {
+    fn log(&self, _writer: &mut TbWriter, _step: usize) {}
+}
+
 pub trait Thinker {
-    type Metadata;
+    type Metadata: Clone;
+    type Status: Status + Clone + Default;
     fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action;
     fn learn(&mut self, b: &PpoBuffer);
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>;
     fn init_metadata(&self, batch_size: usize) -> Self::Metadata;
+    fn status(&self) -> Self::Status;
 }
 
 pub struct RandomThinker;
 
 impl Thinker for RandomThinker {
     type Metadata = ();
+    type Status = ();
     fn act(&mut self, _obs: FrameStack, _metadata: &mut ()) -> Action {
         Action {
             lin_force: Vec2::new(
@@ -41,10 +52,20 @@ impl Thinker for RandomThinker {
         Ok(())
     }
     fn init_metadata(&self, _batch_size: usize) -> Self::Metadata {}
+    fn status(&self) -> Self::Status {}
 }
 
 pub struct SharedThinker<T: Thinker> {
     thinker: Arc<Mutex<T>>,
+}
+
+impl<T: Thinker> Default for SharedThinker<T>
+where
+    T: Default,
+{
+    fn default() -> Self {
+        Self::new(T::default())
+    }
 }
 
 impl<T: Thinker> Clone for SharedThinker<T> {
@@ -63,12 +84,13 @@ impl<T: Thinker> SharedThinker<T> {
     }
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        self.thinker.try_lock().unwrap()
+        self.thinker.lock().unwrap()
     }
 }
 
 impl<T: Thinker> Thinker for SharedThinker<T> {
     type Metadata = T::Metadata;
+    type Status = T::Status;
     fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action {
         self.lock().act(obs, metadata)
     }
@@ -80,5 +102,8 @@ impl<T: Thinker> Thinker for SharedThinker<T> {
     }
     fn init_metadata(&self, batch_size: usize) -> Self::Metadata {
         self.lock().init_metadata(batch_size)
+    }
+    fn status(&self) -> Self::Status {
+        self.lock().status()
     }
 }

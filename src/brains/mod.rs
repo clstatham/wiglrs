@@ -15,7 +15,7 @@ use self::{
     replay_buffer::PpoBuffer,
     thinkers::{
         ppo::{HiddenStates, PpoThinker},
-        Thinker,
+        SharedThinker, Status, Thinker,
     },
 };
 use crate::{hparams::N_FRAME_STACK, Action, Observation, TbWriter, Timestamp};
@@ -91,7 +91,7 @@ impl<T: Thinker> Brain<T> {
     }
 }
 
-impl Brain<PpoThinker> {
+impl<T: Thinker> Brain<T> {
     pub fn act(&mut self) -> Action {
         let action = self.thinker.act(self.fs.clone(), &mut self.metadata);
         self.last_action = action;
@@ -103,21 +103,12 @@ impl Brain<PpoThinker> {
     pub fn learn(&mut self, frame_count: usize, rb: &PpoBuffer) {
         self.thinker.learn(rb);
         let net_reward = rb.reward.iter().sum::<f32>();
+        let status = self.thinker.status();
+        status.log(&mut self.writer, frame_count);
         self.writer.add_scalar("Reward", net_reward, frame_count);
-        self.writer
-            .add_scalar("Loss/Policy", self.thinker.recent_policy_loss, frame_count);
-        self.writer
-            .add_scalar("Loss/Value", self.thinker.recent_value_loss, frame_count);
-        self.writer.add_scalar(
-            "Loss/EntropyPenalty",
-            self.thinker.recent_entropy_loss,
-            frame_count,
-        );
-        self.writer
-            .add_scalar("PolicyClampRatio", self.thinker.recent_nclamp, frame_count);
     }
 
-    pub async fn poll(&mut self) -> BrainStatus {
+    pub async fn poll(&mut self) -> BrainStatus<T> {
         if let Some((waker, frame_count, rb)) = self.learn_waker.take() {
             self.learn(frame_count, &rb);
             self.last_trained_at = frame_count;
@@ -128,19 +119,14 @@ impl Brain<PpoThinker> {
                 BrainControl::NewObs { frame_count, obs } => {
                     self.fs.push(obs);
                     if frame_count % N_FRAME_STACK == 0 {
-                        let hiddens = self.metadata.clone();
+                        let meta = self.metadata.clone();
+                        let status = self.thinker.status().clone();
                         self.act();
                         BrainStatus::NewStatus(ThinkerStatus {
                             last_action: self.last_action,
-                            recent_policy_loss: self.thinker.recent_policy_loss,
-                            recent_value_loss: self.thinker.recent_value_loss,
-                            recent_entropy_loss: self.thinker.recent_entropy_loss,
-                            recent_nclamp: self.thinker.recent_nclamp,
-                            recent_mu: self.thinker.recent_mu.clone(),
-                            recent_std: self.thinker.recent_std.clone(),
-                            recent_entropy: self.thinker.recent_entropy,
+                            status: Some(status),
                             fs: self.fs.clone(),
-                            hiddens: Some(hiddens),
+                            meta: Some(meta),
                         })
                     } else {
                         BrainStatus::Ready
@@ -157,25 +143,46 @@ impl Brain<PpoThinker> {
     }
 }
 
-pub type AgentThinker = PpoThinker;
-
-#[derive(Clone, Default, Debug)]
-pub struct ThinkerStatus {
-    pub last_action: Action,
-    pub recent_mu: Vec<f32>,
-    pub recent_std: Vec<f32>,
-    pub recent_policy_loss: f32,
-    pub recent_value_loss: f32,
-    pub recent_entropy_loss: f32,
-    pub recent_nclamp: f32,
-    pub recent_entropy: f32,
-    pub fs: FrameStack,
-    pub hiddens: Option<HiddenStates<TchBackend<f32>>>,
-}
+pub type AgentThinker = SharedThinker<PpoThinker>;
 
 #[derive(Debug)]
-pub enum BrainStatus {
-    NewStatus(ThinkerStatus),
+pub struct ThinkerStatus<T: Thinker> {
+    pub last_action: Action,
+    pub status: Option<T::Status>,
+    pub fs: FrameStack,
+    pub meta: Option<T::Metadata>,
+}
+
+impl<T: Thinker> Default for ThinkerStatus<T>
+where
+    T::Status: Default,
+{
+    fn default() -> Self {
+        Self {
+            last_action: Action::default(),
+            status: Some(T::Status::default()),
+            fs: FrameStack::default(),
+            meta: None,
+        }
+    }
+}
+
+impl<T: Thinker> Clone for ThinkerStatus<T>
+where
+    T::Status: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            last_action: self.last_action,
+            status: self.status.clone(),
+            fs: self.fs.clone(),
+            meta: self.meta.clone(),
+        }
+    }
+}
+
+pub enum BrainStatus<T: Thinker> {
+    NewStatus(ThinkerStatus<T>),
     Ready,
     Wait(oneshot::Receiver<()>),
     Error,
@@ -193,24 +200,29 @@ pub enum BrainControl {
 }
 
 #[derive(Default, Resource)]
-pub struct BrainBank {
-    rxs: BTreeMap<usize, Receiver<BrainStatus>>,
+pub struct BrainBank<T: Thinker> {
+    rxs: BTreeMap<usize, Receiver<BrainStatus<T>>>,
     txs: BTreeMap<usize, Sender<BrainControl>>,
-    statuses: BTreeMap<usize, ThinkerStatus>,
+    statuses: BTreeMap<usize, ThinkerStatus<T>>,
     n_brains: usize,
     pub entity_to_brain: BTreeMap<Entity, usize>,
 }
 
-impl BrainBank {
+impl<T: Thinker> BrainBank<T>
+where
+    T: Send + 'static,
+    T::Metadata: Send + Sync,
+    T::Status: Send + Sync,
+{
     pub fn spawn(
         &mut self,
-        cons: impl FnOnce(Receiver<BrainControl>) -> Brain<AgentThinker> + Send + 'static,
+        cons: impl FnOnce(Receiver<BrainControl>) -> Brain<T> + Send + 'static,
     ) -> usize {
         static BRAIN_IDS: AtomicUsize = AtomicUsize::new(0);
         let id = BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.n_brains += 1;
-        let (tx, rx) = mpsc::channel(1);
-        let (c_tx, c_rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(4);
+        let (c_tx, c_rx) = mpsc::channel(4);
         let mut brain = cons(c_rx);
         println!("Brain {id} constructed");
         // run the brain on its own thread, not bevy's
@@ -220,7 +232,7 @@ impl BrainBank {
                     let status = brain.poll().await;
                     match status {
                         BrainStatus::Error => panic!("Brain returned error status"),
-                        BrainStatus::Ready => {}
+                        BrainStatus::Ready => std::thread::yield_now(),
                         status => tx.send(status).await.unwrap(),
                     }
                 }
@@ -251,7 +263,7 @@ impl BrainBank {
             .unwrap();
     }
 
-    pub fn get_status(&mut self, brain: usize) -> Option<ThinkerStatus> {
+    pub fn get_status(&mut self, brain: usize) -> Option<ThinkerStatus<T>> {
         while let Ok(status) = self.rxs.get_mut(&brain).unwrap().try_recv() {
             match status {
                 BrainStatus::NewStatus(status) => {

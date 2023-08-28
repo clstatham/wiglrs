@@ -19,8 +19,8 @@ use bevy_rapier2d::prelude::*;
 use bevy_tasks::AsyncComputeTaskPool;
 use brains::{
     replay_buffer::{PpoBuffer, Sart},
-    thinkers::{ppo::PpoThinker, Thinker},
-    Brain, BrainBank,
+    thinkers::{ppo::PpoThinker, SharedThinker, Thinker},
+    AgentThinker, Brain, BrainBank,
 };
 use burn_tensor::backend::Backend;
 use hparams::{
@@ -251,7 +251,7 @@ struct TrainingText(usize, Timer);
 
 fn check_train_brains(
     frame_count: Res<FrameCount>,
-    mut brains: ResMut<BrainBank>,
+    mut brains: ResMut<BrainBank<AgentThinker>>,
     rbs: Res<ReplayBuffers>,
     mut log: ResMut<LogText>,
     handles: Query<&BrainHandle>,
@@ -288,19 +288,27 @@ fn check_train_brains(
 
                 log.push(format!(
                     "{} {} Value Loss: {}",
-                    handle.brain_id, handle.name, status.recent_value_loss,
+                    handle.brain_id,
+                    handle.name,
+                    status.status.as_ref().unwrap().recent_value_loss,
                 ));
                 log.push(format!(
                     "{} {} Policy Loss: {}",
-                    handle.brain_id, handle.name, status.recent_policy_loss,
+                    handle.brain_id,
+                    handle.name,
+                    status.status.as_ref().unwrap().recent_policy_loss,
                 ));
                 log.push(format!(
                     "{} {} Entropy Loss: {}",
-                    handle.brain_id, handle.name, status.recent_entropy_loss,
+                    handle.brain_id,
+                    handle.name,
+                    status.status.as_ref().unwrap().recent_entropy_loss,
                 ));
                 log.push(format!(
                     "{} {} Policy Clamp Ratio: {}",
-                    handle.brain_id, handle.name, status.recent_nclamp,
+                    handle.brain_id,
+                    handle.name,
+                    status.status.as_ref().unwrap().recent_nclamp,
                 ));
             }
         }
@@ -346,7 +354,7 @@ fn spawn_agent(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
-    brains: &mut ResMut<BrainBank>,
+    brains: &mut ResMut<BrainBank<AgentThinker>>,
     asset_server: &Res<AssetServer>,
 ) {
     let agent_pos = Vec3::new(
@@ -425,7 +433,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    mut brains: ResMut<BrainBank>,
+    mut brains: ResMut<BrainBank<AgentThinker>>,
     mut rbs: ResMut<ReplayBuffers>,
     asset_server: Res<AssetServer>,
     timestamp: Res<Timestamp>,
@@ -628,6 +636,7 @@ fn setup(
         ));
 
     let mut taken_names = vec![];
+    let thinker = SharedThinker::new(PpoThinker::new());
     for _ in 0..NUM_AGENTS {
         let ts = timestamp.clone();
         let mut name = names::random_name();
@@ -636,8 +645,8 @@ fn setup(
         }
         taken_names.push(name.clone());
         let brain_name = name.clone();
-
-        let id = brains.spawn(|rx| Brain::new(PpoThinker::default(), brain_name, ts, rx));
+        let thinker = thinker.clone();
+        let id = brains.spawn(|rx| Brain::new(thinker, brain_name, ts, rx));
         rbs.0.insert(id, PpoBuffer::default());
         spawn_agent(
             BrainHandle {
@@ -668,7 +677,7 @@ fn update(
         ),
         (With<Agent>, Without<NameText>, Without<ShootyLine>),
     >,
-    mut brains: ResMut<BrainBank>,
+    mut brains: ResMut<BrainBank<AgentThinker>>,
     mut handles: Query<&mut BrainHandle>,
     mut rbs: ResMut<ReplayBuffers>,
     mut health: Query<&mut Health>,
@@ -876,7 +885,7 @@ fn update(
                             reward: *reward,
                             terminal: *terminal,
                         },
-                        status.hiddens.unwrap(),
+                        status.meta.as_ref().unwrap().clone(),
                         Some(AGENT_RB_MAX_LEN),
                     );
                 }
@@ -994,7 +1003,7 @@ fn main() {
         .insert_resource(ReplayBuffers::default())
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
-        .insert_resource(BrainBank::default())
+        .insert_resource(BrainBank::<AgentThinker>::default())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 present_mode: bevy::window::PresentMode::AutoNoVsync,

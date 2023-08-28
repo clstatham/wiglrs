@@ -12,7 +12,10 @@ use bevy_egui::{
 
 use itertools::Itertools;
 
-use crate::{brains::BrainBank, BrainHandle};
+use crate::{
+    brains::{AgentThinker, BrainBank},
+    BrainHandle,
+};
 
 #[derive(Debug, Default, Resource)]
 pub struct LogText(pub VecDeque<String>);
@@ -37,7 +40,7 @@ impl std::fmt::Display for LogText {
 
 pub fn ui(
     mut cxs: EguiContexts,
-    mut brains: ResMut<BrainBank>,
+    mut brains: ResMut<BrainBank<AgentThinker>>,
     handles: Query<&BrainHandle>,
     log: ResMut<LogText>,
 ) {
@@ -76,6 +79,7 @@ pub fn ui(
                                 ui.heading(&brain.name);
                                 // ui.group(|ui| {
                                 let status = brains.get_status(brain.brain_id).unwrap_or_default();
+                                let status = status.status.unwrap();
                                 let mut mu = "mu:".to_owned();
                                 for m in status.recent_mu.iter() {
                                     mu.push_str(&format!(" {:.4}", m));

@@ -23,7 +23,7 @@ use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::{
     ncp::{Cfc, CfcCellMode, CfcConfig, CfcMode, FullyConnected, WiringConfig},
-    Thinker,
+    Status, Thinker,
 };
 
 pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
@@ -325,11 +325,8 @@ pub struct HiddenStates<B: Backend> {
     pub critic_h: Tensor<B, 2>,
 }
 
-pub struct PpoThinker {
-    actor: PpoActor<Be>,
-    critic: PpoCritic<Be>,
-    actor_optim: OptimizerAdaptor<RMSProp<TchBackend<f32>>, PpoActor<Be>, Be>,
-    critic_optim: OptimizerAdaptor<RMSProp<TchBackend<f32>>, PpoCritic<Be>, Be>,
+#[derive(Debug, Clone, Default)]
+pub struct PpoStatus {
     pub recent_mu: Vec<f32>,
     pub recent_std: Vec<f32>,
     pub recent_entropy: f32,
@@ -338,6 +335,23 @@ pub struct PpoThinker {
     pub recent_entropy_loss: f32,
     pub recent_nclamp: f32,
     pub recent_kl: f32,
+}
+
+impl Status for PpoStatus {
+    fn log(&self, writer: &mut crate::TbWriter, step: usize) {
+        writer.add_scalar("Policy/Loss", self.recent_policy_loss, step);
+        writer.add_scalar("Policy/Entropy", self.recent_entropy_loss, step);
+        writer.add_scalar("Policy/ClampRatio", self.recent_nclamp, step);
+        writer.add_scalar("Value/Loss", self.recent_value_loss, step);
+    }
+}
+
+pub struct PpoThinker {
+    actor: PpoActor<Be>,
+    critic: PpoCritic<Be>,
+    actor_optim: OptimizerAdaptor<RMSProp<TchBackend<f32>>, PpoActor<Be>, Be>,
+    critic_optim: OptimizerAdaptor<RMSProp<TchBackend<f32>>, PpoCritic<Be>, Be>,
+    status: PpoStatus,
 }
 
 impl PpoThinker {
@@ -364,14 +378,7 @@ impl PpoThinker {
             critic,
             actor_optim,
             critic_optim,
-            recent_mu: Vec::new(),
-            recent_std: Vec::new(),
-            recent_entropy: 0.0,
-            recent_policy_loss: 0.0,
-            recent_value_loss: 0.0,
-            recent_entropy_loss: 0.0,
-            recent_nclamp: 0.0,
-            recent_kl: 0.0,
+            status: PpoStatus::default(),
         }
     }
 }
@@ -384,6 +391,11 @@ impl Default for PpoThinker {
 
 impl Thinker for PpoThinker {
     type Metadata = HiddenStates<TchBackend<f32>>;
+    type Status = PpoStatus;
+
+    fn status(&self) -> Self::Status {
+        self.status.clone()
+    }
 
     fn init_metadata(&self, batch_size: usize) -> Self::Metadata {
         let dev = self.actor.devices()[0];
@@ -408,13 +420,13 @@ impl Thinker for PpoThinker {
             &mut metadata.actor_mu_h,
             &mut metadata.actor_std_h,
         );
-        self.recent_mu = mu.to_data().value;
-        self.recent_std = std.to_data().value;
+        self.status.recent_mu = mu.to_data().value;
+        self.status.recent_std = std.to_data().value;
         let dist: MvNormal<_, ACTION_LEN> = MvNormal {
             mu,
             cov_diag: std.clone() * std,
         };
-        self.recent_entropy = dist.entropy().into_scalar();
+        self.status.recent_entropy = dist.entropy().into_scalar();
         let action = dist.sample().clamp(-1.0, 1.0);
         let val = self.critic.valid().forward(obs, &mut metadata.critic_h);
 
@@ -570,10 +582,10 @@ impl Thinker for PpoThinker {
             self.critic.visit(&mut visitor);
         }
 
-        self.recent_policy_loss = total_pi_loss / nstep as f32;
-        self.recent_value_loss = total_val_loss / nstep as f32;
-        self.recent_entropy_loss = total_entropy_loss / nstep as f32;
-        self.recent_nclamp = total_nclamp / nstep as f32;
+        self.status.recent_policy_loss = total_pi_loss / nstep as f32;
+        self.status.recent_value_loss = total_val_loss / nstep as f32;
+        self.status.recent_entropy_loss = total_entropy_loss / nstep as f32;
+        self.status.recent_nclamp = total_nclamp / nstep as f32;
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
