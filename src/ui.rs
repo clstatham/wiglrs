@@ -9,6 +9,7 @@ use bevy_egui::{
     },
     EguiContexts,
 };
+
 use itertools::Itertools;
 
 use crate::{brains::BrainBank, BrainHandle};

@@ -16,6 +16,7 @@ use bevy::{
 };
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
+use bevy_tasks::AsyncComputeTaskPool;
 use brains::{
     replay_buffer::{PpoBuffer, Sart},
     thinkers::{ppo::PpoThinker, Thinker},
@@ -275,25 +276,33 @@ fn check_train_brains(
         for id in 0..NUM_AGENTS {
             let handle = handles.iter().find(|h| h.brain_id == id).unwrap();
             if handle.deaths > 0 {
-                brains.learn(id, frame_count.0 as usize, rbs.0[&id].clone());
+                // let brains = &mut *brains;
+                let frame_count = frame_count.0 as usize;
+                let rb = rbs.0[&id].clone();
+                let status = &AsyncComputeTaskPool::get().scope(|scope| {
+                    scope.spawn(async {
+                        brains.learn(id, frame_count, rb).await;
+                        brains.get_status(id).unwrap()
+                    })
+                })[0];
+
+                log.push(format!(
+                    "{} {} Value Loss: {}",
+                    handle.brain_id, handle.name, status.recent_value_loss,
+                ));
+                log.push(format!(
+                    "{} {} Policy Loss: {}",
+                    handle.brain_id, handle.name, status.recent_policy_loss,
+                ));
+                log.push(format!(
+                    "{} {} Entropy Loss: {}",
+                    handle.brain_id, handle.name, status.recent_entropy_loss,
+                ));
+                log.push(format!(
+                    "{} {} Policy Clamp Ratio: {}",
+                    handle.brain_id, handle.name, status.recent_nclamp,
+                ));
             }
-            let status = brains.get_status(id).unwrap();
-            log.push(format!(
-                "{} {} Value Loss: {}",
-                handle.brain_id, handle.name, status.recent_value_loss,
-            ));
-            log.push(format!(
-                "{} {} Policy Loss: {}",
-                handle.brain_id, handle.name, status.recent_policy_loss,
-            ));
-            log.push(format!(
-                "{} {} Entropy Loss: {}",
-                handle.brain_id, handle.name, status.recent_entropy_loss,
-            ));
-            log.push(format!(
-                "{} {} Policy Clamp Ratio: {}",
-                handle.brain_id, handle.name, status.recent_nclamp,
-            ));
         }
     }
     // for (text_ent, mut text) in text.iter_mut() {
@@ -755,16 +764,12 @@ fn update(
             .sorted_by_key(|a| a.3.translation.distance(transform.translation) as i64)
             .enumerate()
         {
+            let status = brains.get_status(handles.get(other).unwrap().brain_id);
             let other_state = OtherState {
                 rel_pos: transform.translation.xy() - other_transform.translation.xy(),
                 linvel: other_vel.linvel,
                 direction: other_transform.local_y().xy(),
-                firing: brains
-                    .get_status(handles.get(other).unwrap().brain_id)
-                    .unwrap_or_default()
-                    .last_action
-                    .shoot
-                    > 0.0,
+                firing: status.unwrap_or_default().last_action.shoot > 0.0,
             };
             my_state.other_states[i] = other_state;
         }
@@ -855,7 +860,8 @@ fn update(
     }
 
     for (agent, _, _, _, _) in agents.iter() {
-        if let Some(status) = brains.get_status(handles.get(agent).unwrap().brain_id) {
+        let status = brains.get_status(handles.get(agent).unwrap().brain_id);
+        if let Some(status) = status {
             if let Some(rb) = rbs.0.get_mut(&handles.get(agent).unwrap().brain_id) {
                 // if fresh {
                 if let (Some(action), Some(reward), Some(terminal)) = (

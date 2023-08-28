@@ -1,6 +1,6 @@
 use bevy::prelude::*;
+use bevy_tasks::AsyncComputeTaskPool;
 use burn_tch::TchBackend;
-use futures_lite::future;
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
@@ -209,12 +209,13 @@ impl BrainBank {
         static BRAIN_IDS: AtomicUsize = AtomicUsize::new(0);
         let id = BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.n_brains += 1;
-        let (tx, rx) = mpsc::channel(16);
-        let (c_tx, c_rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(1);
+        let (c_tx, c_rx) = mpsc::channel(1);
         let mut brain = cons(c_rx);
         println!("Brain {id} constructed");
+        // run the brain on its own thread, not bevy's
         std::thread::spawn(move || {
-            future::block_on(async move {
+            futures_lite::future::block_on(async {
                 loop {
                     let status = brain.poll().await;
                     match status {
@@ -222,36 +223,32 @@ impl BrainBank {
                         BrainStatus::Ready => {}
                         status => tx.send(status).await.unwrap(),
                     }
-                    std::thread::yield_now();
                 }
-            })
+            });
         });
         self.rxs.insert(id, rx);
         self.txs.insert(id, c_tx);
-        // });
         id
     }
 
     pub fn send_obs(&self, ent: Entity, obs: Observation, frame_count: usize) {
-        // if let Some(tx) = self.txs.get(&self.entity_to_brain[&ent]) {
-        future::block_on(async {
-            self.txs
-                .get(&self.entity_to_brain[&ent])
-                .unwrap()
-                .send(BrainControl::NewObs { obs, frame_count })
-                .await
-                .unwrap();
+        AsyncComputeTaskPool::get().scope(|scope| {
+            scope.spawn(async {
+                self.txs
+                    .get(&self.entity_to_brain[&ent])
+                    .unwrap()
+                    .send(BrainControl::NewObs { obs, frame_count })
+                    .await
+                    .unwrap();
+            })
         });
-        // }
     }
 
-    pub fn learn(&self, brain: usize, frame_count: usize, rb: PpoBuffer) {
+    pub async fn learn(&self, brain: usize, frame_count: usize, rb: PpoBuffer) {
         let tx = self.txs.get(&brain).unwrap();
-        future::block_on(async {
-            tx.send(BrainControl::Learn { frame_count, rb })
-                .await
-                .unwrap();
-        });
+        tx.send(BrainControl::Learn { frame_count, rb })
+            .await
+            .unwrap();
     }
 
     pub fn get_status(&mut self, brain: usize) -> Option<ThinkerStatus> {
@@ -260,9 +257,13 @@ impl BrainBank {
                 BrainStatus::NewStatus(status) => {
                     self.statuses.insert(brain, status);
                 }
-                BrainStatus::Wait(waker) => future::block_on(async {
-                    waker.await.unwrap();
-                }),
+                BrainStatus::Wait(waker) => {
+                    AsyncComputeTaskPool::get().scope(|scope| {
+                        scope.spawn(async {
+                            waker.await.unwrap();
+                        })
+                    });
+                }
                 _ => {}
             }
         }

@@ -3,7 +3,7 @@
 use burn::{
     config::Config,
     module::{ADModule, Module, ModuleVisitor, Param, ParamId},
-    nn::{Initializer, LinearConfig},
+    nn::Initializer,
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -22,7 +22,7 @@ use crate::{brains::replay_buffer::PpoBuffer, hparams::AGENT_ENTROPY_BETA};
 use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
 
 use super::{
-    ncp::{Cfc, CfcCellMode, CfcConfig, CfcMode, FullyConnected, WiredCfcCellConfig, WiringConfig},
+    ncp::{Cfc, CfcCellMode, CfcConfig, CfcMode, FullyConnected, WiringConfig},
     Thinker,
 };
 
@@ -372,16 +372,6 @@ impl PpoThinker {
             recent_entropy_loss: 0.0,
             recent_nclamp: 0.0,
             recent_kl: 0.0,
-        }
-    }
-
-    fn init_hidden_train(&self, batch_size: usize) -> HiddenStates<Be> {
-        let dev = self.actor.devices()[0];
-        HiddenStates {
-            actor_com_h: Tensor::zeros_device([batch_size, self.actor.com_units], &dev),
-            actor_mu_h: Tensor::zeros_device([batch_size, self.actor.mustd_units], &dev),
-            actor_std_h: Tensor::zeros_device([batch_size, self.actor.mustd_units], &dev),
-            critic_h: Tensor::zeros_device([batch_size, self.critic.rnn_units], &dev),
         }
     }
 }
