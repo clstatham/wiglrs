@@ -1,7 +1,5 @@
 //! implementation of https://github.com/mlech26l/ncps/
 
-
-
 use burn::{
     config::Config,
     module::{Module, Param, ParamId},
@@ -48,6 +46,11 @@ where
     fn neurons_for_layer(&self, l: usize) -> Option<Vec<Neuron>>;
     fn adj_matrix(&self) -> &Tensor<B, 2>;
     fn sensory_adj_matrix(&self) -> &Tensor<B, 2>;
+    fn num_neurons(&self) -> usize {
+        (0..self.num_layers())
+            .map(|l| self.dim_for_layer(l).unwrap())
+            .sum::<usize>()
+    }
 }
 
 #[derive(Debug, Clone)]

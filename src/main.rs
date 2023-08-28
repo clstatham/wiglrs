@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     f32::consts::PI,
     sync::Arc,
+    time::Duration,
 };
 
 use bevy::{
@@ -169,6 +170,15 @@ pub struct HealthBar {
 #[derive(Component)]
 pub struct Agent;
 
+#[derive(Component, Clone)]
+pub struct BrainHandle {
+    pub color: Color,
+    pub kills: usize,
+    pub deaths: usize,
+    pub brain_id: usize,
+    pub name: String,
+}
+
 #[derive(Component, Default)]
 pub struct ShootyLine;
 
@@ -191,7 +201,7 @@ pub struct AgentBundle {
     impulse: ExternalImpulse,
     mesh: MaterialMesh2dBundle<ColorMaterial>,
     health: Health,
-    _a: Agent,
+    a: Agent,
 }
 impl AgentBundle {
     pub fn new(
@@ -225,7 +235,7 @@ impl AgentBundle {
             },
 
             health: Health(AGENT_MAX_HEALTH),
-            _a: Agent,
+            a: Agent,
         }
     }
 }
@@ -306,59 +316,15 @@ fn train_brains(
     frame_count: Res<FrameCount>,
     mut rx: EventReader<TrainBrain>,
     mut tx: EventWriter<DoneTraining>,
+    handles: Query<&BrainHandle>,
 ) {
     if let Some(id) = rx.iter().next() {
-        let brain = brains
-            .iter_mut()
-            .find_map(|(_, v)| if v.id == id.0 { Some(v) } else { None })
-            .unwrap();
-        if brain.deaths > 0 {
-            log.push(format!(
-                "Training {} {} for {} epochs...",
-                brain.id, brain.name, AGENT_OPTIM_EPOCHS
-            ));
-
-            brain.learn(frame_count.0 as usize, &rbs.0);
-            log.push(format!(
-                "{} {} Policy Loss: {}",
-                brain.id, &brain.name, brain.thinker.recent_policy_loss
-            ));
-            log.push(format!(
-                "{} {} Value Loss: {}",
-                brain.id, &brain.name, brain.thinker.recent_value_loss
-            ));
-            log.push(format!(
-                "{} {} Policy Clamp Ratio: {}",
-                brain.id, &brain.name, brain.thinker.recent_nclamp
-            ));
+        let brain = brains.brain_iter().find(|v| *v == id.0).unwrap();
+        if handles.iter().find(|h| h.brain_id == id.0).unwrap().deaths > 0 {
+            brains.learn(brain, frame_count.0 as usize, rbs.0[&brain].clone());
         }
 
         tx.send(DoneTraining);
-    }
-}
-
-fn check_respawn_all(
-    mut commands: Commands,
-    mut brains: NonSendMut<BrainBank>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    asset_server: Res<AssetServer>,
-) {
-    for agent in brains.keys().copied().collect::<Vec<_>>() {
-        if commands.get_entity(agent).is_none() {
-            let mut brain = brains.remove(&agent).unwrap();
-
-            brain.deaths += 1;
-
-            spawn_agent(
-                brain,
-                &mut commands,
-                &mut meshes,
-                &mut materials,
-                &mut brains,
-                &asset_server,
-            );
-        }
     }
 }
 
@@ -366,7 +332,7 @@ fn check_respawn_all(
 pub struct Wall;
 
 fn spawn_agent(
-    brain: Brain<AgentThinker>,
+    brain: BrainHandle,
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<ColorMaterial>>,
@@ -386,6 +352,7 @@ fn spawn_agent(
             materials,
         ))
         .insert(ActiveEvents::all())
+        .insert(brain.clone())
         .with_children(|parent| {
             parent.spawn(ShootyLineBundle {
                 mesh: MaterialMesh2dBundle {
@@ -404,7 +371,7 @@ fn spawn_agent(
     commands.spawn((
         Text2dBundle {
             text: Text::from_section(
-                format!("{} {} {}.0", brain.id, &brain.name, brain.deaths),
+                format!("{} {} {}.0", brain.brain_id, &brain.name, brain.deaths),
                 TextStyle {
                     font: asset_server.load("fonts/FiraSans-Bold.ttf"),
                     font_size: 20.0,
@@ -429,7 +396,7 @@ fn spawn_agent(
             ..Default::default()
         },
     ));
-    brains.insert(id, brain);
+    brains.assign_entity(brain.brain_id, id);
 }
 
 fn setup(
@@ -639,11 +606,18 @@ fn setup(
         ));
 
     for _ in 0..NUM_AGENTS {
-        let thinker = PpoThinker::default();
-        let brain = Brain::new(thinker, &timestamp);
-        rbs.0.insert(brain.id, SartAdvBuffer::default());
+        let ts = timestamp.clone();
+        // let brain = Brain::new(thinker, &timestamp);
+        let id = brains.spawn(|rx| Brain::new(PpoThinker::default(), ts, rx));
+        rbs.0.insert(id, SartAdvBuffer::default());
         spawn_agent(
-            brain,
+            BrainHandle {
+                color: Color::rgb(rand::random(), rand::random(), rand::random()),
+                kills: 0,
+                deaths: 0,
+                brain_id: id,
+                name: names::random_name(),
+            },
             &mut commands,
             &mut meshes,
             &mut materials,
@@ -656,13 +630,19 @@ fn setup(
 fn update(
     mut commands: Commands,
     mut agents: Query<
-        (Entity, &mut ExternalForce, &mut Velocity, &Transform),
-        (With<Agent>, Without<NameText>),
+        (
+            Entity,
+            &mut ExternalForce,
+            &mut Velocity,
+            &mut Transform,
+            &Children,
+        ),
+        (With<Agent>, Without<NameText>, Without<ShootyLine>),
     >,
     mut brains: NonSendMut<BrainBank>,
+    mut handles: Query<&mut BrainHandle>,
     mut rbs: NonSendMut<ReplayBuffers>,
     mut health: Query<&mut Health>,
-    agents_shootin: Query<(&Transform, &Children), (With<Agent>, Without<ShootyLine>)>,
     mut line_vis: Query<
         (&mut Visibility, &mut Transform),
         (With<ShootyLine>, Without<Agent>, Without<NameText>),
@@ -690,10 +670,10 @@ fn update(
     for (t_ent, mut t, mut text, text_comp) in name_text_t.iter_mut() {
         if let Ok(agent) = agents.get_component::<Transform>(text_comp.entity_following) {
             t.translation = agent.translation + Vec3::new(0.0, 40.0, 2.0);
-            let brain = &brains[&text_comp.entity_following];
+            let brain = &handles.get(text_comp.entity_following).unwrap();
             text.sections[0].value = format!(
                 "{} {} {}-{}",
-                brain.id, &brain.name, brain.kills, brain.deaths
+                brain.brain_id, &brain.name, brain.kills, brain.deaths
             );
         } else {
             commands.entity(t_ent).despawn();
@@ -709,7 +689,7 @@ fn update(
         }
     }
 
-    for (agent, _, velocity, transform) in agents.iter() {
+    for (agent, _, velocity, transform, _) in agents.iter() {
         let mut my_state = Observation {
             pos: transform.translation.xy(),
             linvel: velocity.linvel,
@@ -749,7 +729,7 @@ fn update(
             my_state.left_wall_dist = toi;
         }
 
-        for (i, (other, _, other_vel, other_transform)) in agents
+        for (i, (other, _, other_vel, other_transform, _)) in agents
             .iter()
             .filter(|a| a.0 != agent)
             .sorted_by_key(|a| a.3.translation.distance(transform.translation) as i64)
@@ -759,33 +739,35 @@ fn update(
                 rel_pos: transform.translation.xy() - other_transform.translation.xy(),
                 linvel: other_vel.linvel,
                 direction: other_transform.local_y().xy(),
-                firing: brains[&other].last_action.shoot > 0.0,
+                firing: brains
+                    .get_status(handles.get(other).unwrap().brain_id)
+                    .0
+                    .unwrap_or_default()
+                    .last_action
+                    .shoot
+                    > 0.0,
             };
             my_state.other_states[i] = other_state;
         }
 
         all_states.insert(agent, my_state.clone());
-        brains.get_mut(&agent).unwrap().fs.push(my_state.clone());
-        #[allow(clippy::modulo_one)]
-        let action = if frame_count.0 as usize % N_FRAME_STACK == 0 {
-            brains
-                .get_mut(&agent)
-                .unwrap()
-                .act(my_state, frame_count.0 as usize)
-        } else {
-            brains.get(&agent).unwrap().last_action
-        };
 
-        all_actions.insert(agent, action);
+        // if frame_count.0 as usize % N_FRAME_STACK == 0 {
+        brains.send_obs(agent, my_state.clone(), frame_count.0 as usize);
+        // }
+
+        let status = brains.get_status(handles.get(agent).unwrap().brain_id).0;
+        if let Some(status) = status {
+            all_actions.insert(agent, status.last_action);
+        }
         all_rewards.insert(agent, 0.0);
         all_terminals.insert(agent, false);
     }
     let mut dead_agents = BTreeSet::default();
-    for (agent, mut force, _velocity, _transform) in agents.iter_mut() {
-        if !dead_agents.contains(&agent) {
+    for (agent, mut force, _velocity, transform, childs) in agents.iter_mut() {
+        if !dead_agents.contains(&agent) && all_actions.get(&agent).is_some() {
             if all_actions[&agent].shoot > 0.0 && !dead_agents.contains(&agent) {
                 let (ray_dir, ray_pos) = {
-                    let (transform, childs) = agents_shootin.get(agent).unwrap();
                     let ray_dir = transform.local_y().xy();
                     let ray_pos = transform.translation.xy() + ray_dir * (AGENT_RADIUS + 2.0);
                     for child in childs.iter() {
@@ -804,7 +786,6 @@ fn update(
                 if let Some((hit_entity, toi)) =
                     cx.cast_ray(ray_pos, ray_dir, AGENT_SHOOT_DISTANCE, false, filter)
                 {
-                    let (_, childs) = agents_shootin.get(agent).unwrap();
                     for child in childs.iter() {
                         if let Ok((_, mut t)) = line_vis.get_mut(*child) {
                             t.scale = Vec3::new(1.0, toi, 1.0);
@@ -820,16 +801,16 @@ fn update(
                             *all_terminals.get_mut(&hit_entity).unwrap() = true;
                             *all_rewards.get_mut(&agent).unwrap() += 100.0;
                             *all_rewards.get_mut(&hit_entity).unwrap() -= 100.0;
-                            brains.get_mut(&agent).unwrap().kills += 1;
+                            handles.get_mut(agent).unwrap().kills += 1;
                             let msg = format!(
                                 "{} killed {}! Nice!",
-                                &brains[&agent].name, &brains[&hit_entity].name
+                                &handles.get(agent).unwrap().name,
+                                &handles.get(hit_entity).unwrap().name,
                             );
                             log.push(msg);
                         }
                     }
                 } else {
-                    let (_, childs) = agents_shootin.get(agent).unwrap();
                     for child in childs.iter() {
                         if let Ok((_, mut t)) = line_vis.get_mut(*child) {
                             t.scale = Vec3::new(1.0, AGENT_SHOOT_DISTANCE, 1.0);
@@ -837,10 +818,9 @@ fn update(
                                 t.with_translation(Vec3::new(0.0, AGENT_SHOOT_DISTANCE / 2.0, 0.0));
                         }
                     }
-                    *all_rewards.get_mut(&agent).unwrap() -= 1.0;
+                    *all_rewards.get_mut(&agent).unwrap() -= 4.0;
                 }
             } else {
-                let (_, childs) = agents_shootin.get(agent).unwrap();
                 for child in childs.iter() {
                     if let Ok(mut line) = line_vis.get_mut(*child) {
                         *line.0 = Visibility::Hidden;
@@ -848,34 +828,55 @@ fn update(
                 }
             }
 
-            force.force = all_actions[&agent].lin_force * AGENT_LIN_MOVE_FORCE;
-            force.torque = all_actions[&agent].ang_force * AGENT_ANG_MOVE_FORCE;
+            if let Some(action) = all_actions.get(&agent) {
+                force.force = action.lin_force * AGENT_LIN_MOVE_FORCE;
+                force.torque = action.ang_force * AGENT_ANG_MOVE_FORCE;
+            }
         }
     }
 
-    for (agent, _, _, _) in agents.iter() {
-        let fs = brains.get(&agent).unwrap().fs.clone();
-        if let Some(rb) = rbs.0.get_mut(&brains.get(&agent).unwrap().id) {
-            rb.remember_sart(
-                Sart {
-                    obs: fs.clone(),
-                    action: all_actions.get(&agent).unwrap().to_owned(),
-                    reward: all_rewards.get(&agent).unwrap().to_owned(),
-                    terminal: all_terminals.get(&agent).unwrap().to_owned(),
-                },
-                Some(AGENT_RB_MAX_LEN),
-            );
+    for (agent, _, _, _, _) in agents.iter() {
+        if let (Some(status), fresh) = brains.get_status(handles.get(agent).unwrap().brain_id) {
+            if let Some(rb) = rbs.0.get_mut(&handles.get(agent).unwrap().brain_id) {
+                // if fresh {
+                if let (Some(action), Some(reward), Some(terminal)) = (
+                    all_actions.get(&agent),
+                    all_rewards.get(&agent),
+                    all_terminals.get(&agent),
+                ) {
+                    rb.remember_sart(
+                        Sart {
+                            obs: status.fs.clone(),
+                            action: action.to_owned(),
+                            reward: *reward,
+                            terminal: *terminal,
+                        },
+                        Some(AGENT_RB_MAX_LEN),
+                    );
+                }
+            }
         }
     }
 
     for agent in dead_agents {
-        let brain = brains.get_mut(&agent).unwrap();
-        brain.fs = FrameStack::default();
-        if let Some(rb) = rbs.0.get_mut(&brain.id) {
+        // let brain = brains.get_mut(&agent).unwrap();
+        // brain.fs = FrameStack::default();
+        if let Some(rb) = rbs.0.get_mut(&handles.get(agent).unwrap().brain_id) {
             rb.finish_trajectory();
         }
 
-        commands.entity(agent).despawn_recursive();
+        // let mut ent = commands.entity(agent);
+        let mut handle = handles.get_mut(agent).unwrap();
+        handle.deaths += 1;
+        let mut t = agents.get_component_mut::<Transform>(agent).unwrap();
+        let mut h = health.get_component_mut::<Health>(agent).unwrap();
+        h.0 = AGENT_MAX_HEALTH;
+        let agent_pos = Vec3::new(
+            (rand::random::<f32>() - 0.5) * 500.0,
+            (rand::random::<f32>() - 0.5) * 500.0,
+            0.0,
+        );
+        t.translation = agent_pos;
     }
 }
 
@@ -977,6 +978,10 @@ fn main() {
             }),
             ..Default::default()
         }))
+        .add_plugins(bevy_framepace::FramepacePlugin)
+        .insert_resource(bevy_framepace::FramepaceSettings {
+            limiter: bevy_framepace::Limiter::Manual(Duration::from_secs_f64(1.0 / 144.0)),
+        })
         .insert_resource(RapierConfiguration {
             gravity: Vec2::ZERO,
             timestep_mode: TimestepMode::Fixed {
@@ -990,7 +995,6 @@ fn main() {
         .add_plugins(EguiPlugin)
         .add_systems(Startup, setup)
         .add_systems(Update, update)
-        .add_systems(Update, check_respawn_all)
         .add_systems(PostUpdate, check_train_brains)
         .add_systems(Update, train_brains)
         .add_systems(Update, ui)

@@ -11,7 +11,7 @@ use bevy_egui::{
 };
 use itertools::Itertools;
 
-use crate::brains::BrainBank;
+use crate::{brains::BrainBank, BrainHandle};
 
 #[derive(Debug, Default, Resource)]
 pub struct LogText(pub VecDeque<String>);
@@ -34,18 +34,23 @@ impl std::fmt::Display for LogText {
     }
 }
 
-pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText>) {
+pub fn ui(
+    mut cxs: EguiContexts,
+    mut brains: NonSendMut<BrainBank>,
+    handles: Query<&BrainHandle>,
+    log: ResMut<LogText>,
+) {
     egui::Window::new("Scores").show(cxs.ctx_mut(), |ui| {
         ui.vertical(|ui| {
-            for (_ent, brain) in brains.iter().sorted_by_key(|(_, b)| b.kills).rev() {
+            for handle in handles.iter().sorted_by_key(|b| b.kills).rev() {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("{} {}", brain.id, &brain.name))
+                        egui::RichText::new(format!("{} {}", handle.brain_id, &handle.name))
                             .text_style(egui::TextStyle::Heading),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         ui.label(
-                            egui::RichText::new(format!("{}-{}", brain.kills, brain.deaths))
+                            egui::RichText::new(format!("{}-{}", handle.kills, handle.deaths))
                                 .text_style(egui::TextStyle::Heading),
                         );
                     });
@@ -64,33 +69,32 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                 Layout::left_to_right(egui::Align::Min).with_main_wrap(false),
                 |ui| {
                     // egui::Grid::new("mean/std grid").show(ui, |ui| {
-                    for (_i, (_ent, brain)) in
-                        brains.iter().sorted_by_key(|(_, b)| b.id).enumerate()
-                    {
+                    for (_i, brain) in handles.iter().sorted_by_key(|h| h.brain_id).enumerate() {
                         ui.group(|ui| {
                             ui.vertical(|ui| {
                                 ui.heading(&brain.name);
                                 // ui.group(|ui| {
+                                let status =
+                                    brains.get_status(brain.brain_id).0.unwrap_or_default();
                                 let mut mu = "mu:".to_owned();
-                                for m in brain.thinker.recent_mu.iter() {
+                                for m in status.recent_mu.iter() {
                                     mu.push_str(&format!(" {:.4}", m));
                                 }
                                 ui.label(mu);
                                 let mut std = "std:".to_owned();
-                                for s in brain.thinker.recent_std.iter() {
+                                for s in status.recent_std.iter() {
                                     std.push_str(&format!(" {:.4}", s));
                                 }
                                 ui.label(std);
-                                ui.label(format!("ent: {}", brain.thinker.recent_entropy));
+                                ui.label(format!("ent: {}", status.recent_entropy));
                                 // });
 
                                 // ui.horizontal_top(|ui| {
 
-                                let ms = brain
-                                    .thinker
+                                let ms = status
                                     .recent_mu
                                     .iter()
-                                    .zip(brain.thinker.recent_std.iter())
+                                    .zip(status.recent_std.iter())
                                     .enumerate()
                                     .map(|(i, (mu, std))| {
                                         // https://www.desmos.com/calculator/rkoehr8rve
@@ -120,7 +124,7 @@ pub fn ui(mut cxs: EguiContexts, brains: NonSend<BrainBank>, log: ResMut<LogText
                                             ui.label("Action Space");
                                             egui::plot::Plot::new(format!(
                                                 "ActionSpace{}",
-                                                brain.id
+                                                brain.brain_id
                                             ))
                                             .center_y_axis(true)
                                             .data_aspect(1.0 / 2.0)

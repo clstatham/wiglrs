@@ -3,9 +3,7 @@
 use burn::{
     config::Config,
     module::{ADModule, Module, Param, ParamId},
-    nn::{
-        Initializer, LinearConfig,
-    },
+    nn::{Initializer, LinearConfig},
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -224,20 +222,21 @@ impl PpoActorConfig {
             self.obs_len,
             self.hidden_len * 2,
             self.hidden_len,
-            Some(0.0),
+            Some(0.5),
         );
         let wiring_mu = Ncp::auto(
             self.hidden_len,
             self.hidden_len * 2,
             self.hidden_len,
-            Some(0.0),
+            Some(0.5),
         );
         let wiring_std = Ncp::auto(
             self.hidden_len,
             self.hidden_len * 2,
             self.hidden_len,
-            Some(0.0),
+            Some(0.5),
         );
+
         PpoActor {
             obs_len: self.obs_len,
             com_units: wiring_com.units(),
@@ -310,7 +309,7 @@ impl PpoCriticConfig {
             self.obs_len,
             self.hidden_len * 2,
             self.hidden_len,
-            Some(0.0),
+            Some(0.5),
         );
         PpoCritic {
             obs_len: self.obs_len,
@@ -475,8 +474,9 @@ impl Thinker for PpoThinker {
                     .as_slice(),
             )
             .to_device(&self.actor.devices()[0]);
-            let returns =
-                (returns.clone() - returns.clone().mean().unsqueeze()) / (returns.var(0) + 1e-7);
+            let returns = (returns.clone() - returns.clone().mean().unsqueeze())
+                / (returns.var(0).sqrt() + 1e-7);
+
             let s = step
                 .obs
                 .iter()
@@ -518,10 +518,8 @@ impl Thinker for PpoThinker {
             .to_device(&self.actor.devices()[0])
             .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
             let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
-                / (advantage.var(0) + 1e-7);
+                / (advantage.var(0).sqrt() + 1e-7);
 
-            // let s = s.require_grad();
-            // self.actor.reset_h(AGENT_OPTIM_BATCH_SIZE);
             let mut meta = self.init_hidden_train(AGENT_OPTIM_BATCH_SIZE);
             let (mu, std) = self.actor.forward(
                 s.clone(),
