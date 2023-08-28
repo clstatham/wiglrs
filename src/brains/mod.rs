@@ -128,6 +128,7 @@ impl Brain<PpoThinker> {
                 BrainControl::NewObs { frame_count, obs } => {
                     self.fs.push(obs);
                     if frame_count % N_FRAME_STACK == 0 {
+                        let hiddens = self.metadata.clone();
                         self.act();
                         BrainStatus::NewStatus(ThinkerStatus {
                             last_action: self.last_action,
@@ -139,7 +140,7 @@ impl Brain<PpoThinker> {
                             recent_std: self.thinker.recent_std.clone(),
                             recent_entropy: self.thinker.recent_entropy,
                             fs: self.fs.clone(),
-                            hiddens: Some(self.metadata.clone()),
+                            hiddens: Some(hiddens),
                         })
                     } else {
                         BrainStatus::Ready
