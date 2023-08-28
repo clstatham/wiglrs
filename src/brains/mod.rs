@@ -57,6 +57,7 @@ pub struct Brain<T: Thinker> {
     pub thinker: T,
     pub writer: TbWriter,
     pub metadata: T::Metadata,
+    last_trained_at: usize,
     learn_waker: Option<(oneshot::Sender<()>, usize, SartAdvBuffer)>,
     rx: Receiver<BrainControl>,
 }
@@ -76,6 +77,7 @@ impl<T: Thinker> Brain<T> {
             writer,
             rx,
             learn_waker: None,
+            last_trained_at: 0,
         }
     }
 
@@ -113,13 +115,14 @@ impl Brain<PpoThinker> {
             .add_scalar("PolicyClampRatio", self.thinker.recent_nclamp, frame_count);
     }
 
-    pub fn poll(&mut self) -> BrainStatus {
+    pub async fn poll(&mut self) -> BrainStatus {
         if let Some((waker, frame_count, rb)) = self.learn_waker.take() {
             self.learn(frame_count, &rb);
+            self.last_trained_at = frame_count;
             waker.send(()).unwrap();
         }
-        match self.rx.try_recv() {
-            Ok(ctrl) => match ctrl {
+        match self.rx.recv().await {
+            Some(ctrl) => match ctrl {
                 BrainControl::NewObs { frame_count, obs } => {
                     self.fs.push(obs);
                     if frame_count % N_FRAME_STACK == 0 {
@@ -145,8 +148,7 @@ impl Brain<PpoThinker> {
                     BrainStatus::Wait(rx)
                 }
             },
-            Err(TryRecvError::Disconnected) => BrainStatus::Error,
-            Err(TryRecvError::Empty) => BrainStatus::Ready,
+            None => BrainStatus::Error,
         }
     }
 }
@@ -202,16 +204,14 @@ impl BrainBank {
         static BRAIN_IDS: AtomicUsize = AtomicUsize::new(0);
         let id = BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.n_brains += 1;
-        let (tx, rx) = mpsc::channel(1024);
-        let (c_tx, c_rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(16);
+        let (c_tx, c_rx) = mpsc::channel(16);
         let mut brain = cons(c_rx);
-        println!("Brain constructed");
+        println!("Brain {id} constructed");
         std::thread::spawn(move || {
             future::block_on(async move {
                 loop {
-                    // println!("Polling");
-                    let status = brain.poll();
-                    // dbg!(&status);
+                    let status = brain.poll().await;
                     match status {
                         BrainStatus::Error => panic!("Brain returned error status"),
                         BrainStatus::Ready => {}

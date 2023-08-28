@@ -9,6 +9,7 @@ use std::{
 
 use bevy::{
     core::FrameCount,
+    diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     math::Vec3Swizzles,
     prelude::*,
     sprite::{Anchor, MaterialMesh2dBundle},
@@ -259,51 +260,54 @@ fn check_train_brains(
     time: Res<Time>,
 ) {
     if frame_count.0 > 1 && frame_count.0 as usize % AGENT_UPDATE_INTERVAL == 0 {
-        commands.spawn((
-            Text2dBundle {
-                text: Text::from_section(
-                    format!("Training (1/{})", NUM_AGENTS),
-                    TextStyle {
-                        font: asset_server.load("fonts/FiraSans-Bold.ttf"),
-                        font_size: 72.0,
-                        color: Color::YELLOW,
-                    },
-                ),
-                transform: Transform::from_translation(Vec3::splat(0.0)),
-                text_anchor: Anchor::Center,
-                ..Default::default()
-            },
-            TrainingText(0, Timer::from_seconds(0.1, TimerMode::Once)),
-        ));
-    }
-    for (text_ent, mut text) in text.iter_mut() {
-        text.1.tick(time.delta());
-        if text.1.just_finished() {
-            tx.send(TrainBrain(text.0));
-        }
-        if rx.iter().next().is_some() {
-            let id = text.0;
-            commands.entity(text_ent).despawn();
-            if id + 1 < NUM_AGENTS {
-                commands.spawn((
-                    Text2dBundle {
-                        text: Text::from_section(
-                            format!("Training ({}/{})", id + 2, NUM_AGENTS),
-                            TextStyle {
-                                font: asset_server.load("fonts/FiraSans-Bold.ttf"),
-                                font_size: 72.0,
-                                color: Color::YELLOW,
-                            },
-                        ),
-                        transform: Transform::from_translation(Vec3::splat(0.0)),
-                        text_anchor: Anchor::Center,
-                        ..Default::default()
-                    },
-                    TrainingText(id + 1, Timer::from_seconds(0.1, TimerMode::Once)),
-                ));
-            }
+        // commands.spawn((
+        //     Text2dBundle {
+        //         text: Text::from_section(
+        //             format!("Training (1/{})", NUM_AGENTS),
+        //             TextStyle {
+        //                 font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+        //                 font_size: 72.0,
+        //                 color: Color::YELLOW,
+        //             },
+        //         ),
+        //         transform: Transform::from_translation(Vec3::splat(0.0)),
+        //         text_anchor: Anchor::Center,
+        //         ..Default::default()
+        //     },
+        //     TrainingText(0, Timer::from_seconds(0.1, TimerMode::Once)),
+        // ));
+        for id in 0..NUM_AGENTS {
+            tx.send(TrainBrain(id));
         }
     }
+    // for (text_ent, mut text) in text.iter_mut() {
+    //     text.1.tick(time.delta());
+    //     if text.1.just_finished() {
+    //         tx.send(TrainBrain(text.0));
+    //     }
+    //     if rx.iter().next().is_some() {
+    //         let id = text.0;
+    //         commands.entity(text_ent).despawn();
+    //         if id + 1 < NUM_AGENTS {
+    //             commands.spawn((
+    //                 Text2dBundle {
+    //                     text: Text::from_section(
+    //                         format!("Training ({}/{})", id + 2, NUM_AGENTS),
+    //                         TextStyle {
+    //                             font: asset_server.load("fonts/FiraSans-Bold.ttf"),
+    //                             font_size: 72.0,
+    //                             color: Color::YELLOW,
+    //                         },
+    //                     ),
+    //                     transform: Transform::from_translation(Vec3::splat(0.0)),
+    //                     text_anchor: Anchor::Center,
+    //                     ..Default::default()
+    //                 },
+    //                 TrainingText(id + 1, Timer::from_seconds(0.1, TimerMode::Once)),
+    //             ));
+    //         }
+    //     }
+    // }
 }
 
 #[derive(Default)]
@@ -980,8 +984,11 @@ fn main() {
         }))
         .add_plugins(bevy_framepace::FramepacePlugin)
         .insert_resource(bevy_framepace::FramepaceSettings {
-            limiter: bevy_framepace::Limiter::Manual(Duration::from_secs_f64(1.0 / 144.0)),
+            // limiter: bevy_framepace::Limiter::Manual(Duration::from_secs_f64(1.0 / 144.0)),
+            limiter: bevy_framepace::Limiter::Off,
         })
+        .add_plugins(LogDiagnosticsPlugin::default())
+        .add_plugins(FrameTimeDiagnosticsPlugin)
         .insert_resource(RapierConfiguration {
             gravity: Vec2::ZERO,
             timestep_mode: TimestepMode::Fixed {
@@ -995,7 +1002,7 @@ fn main() {
         .add_plugins(EguiPlugin)
         .add_systems(Startup, setup)
         .add_systems(Update, update)
-        .add_systems(PostUpdate, check_train_brains)
+        .add_systems(Update, check_train_brains)
         .add_systems(Update, train_brains)
         .add_systems(Update, ui)
         .add_systems(Update, handle_input)
