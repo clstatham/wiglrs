@@ -110,6 +110,7 @@ impl PpoBuffer {
         self.current_trajectory_start += 1;
         if let Some(max_len) = max_len {
             if self.current_trajectory_start >= max_len {
+                self.current_trajectory_start = 0;
                 self.finish_trajectory(); // in case one of them is an ABSOLUTE GAMER and doesn't die for like 100_000 frames
             }
         }
@@ -118,7 +119,7 @@ impl PpoBuffer {
     pub fn finish_trajectory(&mut self) {
         let endpoint = self.obs.len();
         let startpoint = endpoint - self.current_trajectory_start;
-        // push a temporary value of 0 so we can backprop through time
+        // push a temporary value of 0
         self.action.push_back(Action {
             metadata: Some(crate::ActionMetadata {
                 val: 0.0,
