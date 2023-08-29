@@ -12,10 +12,7 @@ use bevy_egui::{
 
 use itertools::Itertools;
 
-use crate::{
-    brains::{AgentThinker, BrainBank},
-    BrainHandle,
-};
+use crate::envs::ffa::{BrainId, Deaths, Ffa, FfaAgent, Kills, Name};
 
 #[derive(Debug, Default, Resource)]
 pub struct LogText(pub VecDeque<String>);
@@ -40,22 +37,38 @@ impl std::fmt::Display for LogText {
 
 pub fn ui(
     mut cxs: EguiContexts,
-    mut brains: ResMut<BrainBank<AgentThinker>>,
-    handles: Query<&BrainHandle>,
+    mut env: ResMut<Ffa>,
     log: ResMut<LogText>,
+    agents: Query<Entity, With<FfaAgent>>,
+    kills: Query<&Kills, With<FfaAgent>>,
+    deaths: Query<&Deaths, With<FfaAgent>>,
+    brain_ids: Query<&BrainId, With<FfaAgent>>,
+    names: Query<&Name, With<FfaAgent>>,
 ) {
     egui::Window::new("Scores").show(cxs.ctx_mut(), |ui| {
         ui.vertical(|ui| {
-            for handle in handles.iter().sorted_by_key(|b| b.kills).rev() {
+            for handle in agents
+                .iter()
+                .sorted_by_key(|b| kills.get(*b).unwrap().0)
+                .rev()
+            {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("{} {}", handle.brain_id, &handle.name))
-                            .text_style(egui::TextStyle::Heading),
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            brain_ids.get(handle).unwrap().0,
+                            names.get(handle).unwrap().0,
+                        ))
+                        .text_style(egui::TextStyle::Heading),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         ui.label(
-                            egui::RichText::new(format!("{}-{}", handle.kills, handle.deaths))
-                                .text_style(egui::TextStyle::Heading),
+                            egui::RichText::new(format!(
+                                "{}-{}",
+                                kills.get(handle).unwrap().0,
+                                deaths.get(handle).unwrap().0,
+                            ))
+                            .text_style(egui::TextStyle::Heading),
                         );
                     });
                 });
@@ -73,12 +86,19 @@ pub fn ui(
                 Layout::left_to_right(egui::Align::Min).with_main_wrap(false),
                 |ui| {
                     // egui::Grid::new("mean/std grid").show(ui, |ui| {
-                    for (_i, brain) in handles.iter().sorted_by_key(|h| h.brain_id).enumerate() {
+                    for (_i, brain) in agents
+                        .iter()
+                        .sorted_by_key(|h| brain_ids.get(*h).unwrap().0)
+                        .enumerate()
+                    {
                         ui.group(|ui| {
                             ui.vertical(|ui| {
-                                ui.heading(&brain.name);
+                                ui.heading(&names.get(brain).unwrap().0);
                                 // ui.group(|ui| {
-                                let status = brains.get_status(brain.brain_id).unwrap_or_default();
+                                let status = env
+                                    .brains
+                                    .get_status(brain_ids.get(brain).unwrap().0)
+                                    .unwrap_or_default();
                                 let status = status.status.unwrap();
                                 let mut mu = "mu:".to_owned();
                                 for m in status.recent_mu.iter() {
@@ -129,7 +149,7 @@ pub fn ui(
                                             ui.label("Action Space");
                                             egui::plot::Plot::new(format!(
                                                 "ActionSpace{}",
-                                                brain.brain_id
+                                                brain_ids.get(brain).unwrap().0,
                                             ))
                                             .center_y_axis(true)
                                             .data_aspect(1.0 / 2.0)

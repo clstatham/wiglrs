@@ -1,34 +1,18 @@
+#![feature(return_position_impl_trait_in_trait)]
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    f32::consts::PI,
-    sync::Arc,
-};
+use std::{collections::VecDeque, fmt, sync::Arc};
 
 use bevy::{
-    core::FrameCount,
-    math::Vec3Swizzles,
     prelude::*,
-    sprite::MaterialMesh2dBundle,
     window::{PresentMode, WindowMode},
     winit::WinitSettings,
 };
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
-use bevy_tasks::AsyncComputeTaskPool;
-use brains::{
-    replay_buffer::{PpoBuffer, Sart},
-    thinkers::{ppo::PpoThinker, SharedThinker, Thinker},
-    AgentThinker, Brain, BrainBank,
-};
+
 use burn_tensor::backend::Backend;
-use hparams::{
-    AGENT_ANG_MOVE_FORCE, AGENT_LIN_MOVE_FORCE, AGENT_MAX_HEALTH, AGENT_RADIUS, AGENT_RB_MAX_LEN,
-    AGENT_SHOOT_DISTANCE, AGENT_UPDATE_INTERVAL, NUM_AGENTS,
-};
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
+use envs::{ffa::Ffa, Env};
 use tensorboard_rs::summary_writer::SummaryWriter;
 use ui::{ui, LogText};
 
@@ -37,882 +21,51 @@ pub mod envs;
 pub mod names;
 pub mod ui;
 
-#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct OtherState {
-    pub rel_pos: Vec2,
-    pub linvel: Vec2,
-    pub direction: Vec2,
-    pub firing: bool,
-}
+pub struct FrameStack<O>(pub VecDeque<O>);
 
-pub const OTHER_STATE_LEN: usize = 7;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Observation {
-    pub pos: Vec2,
-    pub linvel: Vec2,
-    pub direction: Vec2,
-    pub health: f32,
-    pub up_wall_dist: f32,
-    pub down_wall_dist: f32,
-    pub left_wall_dist: f32,
-    pub right_wall_dist: f32,
-    pub other_states: Vec<OtherState>,
-}
-
-pub const OBS_LEN: usize = OTHER_STATE_LEN * (NUM_AGENTS - 1) + 11;
-
-impl Default for Observation {
-    fn default() -> Self {
-        Self {
-            pos: Vec2::default(),
-            linvel: Vec2::default(),
-            direction: Vec2::default(),
-            health: 0.0,
-            up_wall_dist: 0.0,
-            down_wall_dist: 0.0,
-            left_wall_dist: 0.0,
-            right_wall_dist: 0.0,
-            other_states: vec![OtherState::default(); NUM_AGENTS - 1],
-        }
+impl<O> Clone for FrameStack<O>
+where
+    O: Clone,
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
-impl Observation {
-    pub fn as_vec(&self) -> Vec<f32> {
-        let mut out = vec![
-            self.pos.x / 2000.0,
-            self.pos.y / 2000.0,
-            self.linvel.x / 2000.0,
-            self.linvel.y / 2000.0,
-            self.direction.x,
-            self.direction.y,
-            self.up_wall_dist / 2000.0,
-            self.down_wall_dist / 2000.0,
-            self.left_wall_dist / 2000.0,
-            self.right_wall_dist / 2000.0,
-            self.health / AGENT_MAX_HEALTH,
-        ];
-        for other in &self.other_states {
-            out.extend_from_slice(&[
-                other.rel_pos.x / 2000.0,
-                other.rel_pos.y / 2000.0,
-                other.linvel.x / 2000.0,
-                other.linvel.y / 2000.0,
-                other.direction.x,
-                other.direction.y,
-                if other.firing { 1.0 } else { 0.0 },
-            ]);
-        }
-        out
-    }
-
-    pub fn dim() -> usize {
-        Self::default().as_vec().len()
+impl<O> fmt::Debug for FrameStack<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FrameStack")
     }
 }
 
-pub mod hparams;
-
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
-pub struct ActionMetadata {
-    pub val: f32,
-    pub logp: f32,
-}
-
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
-pub struct Action {
-    lin_force: Vec2,
-    ang_force: f32,
-    shoot: f32,
-    metadata: Option<ActionMetadata>,
-}
-
-pub const ACTION_LEN: usize = 4;
-
-impl Action {
-    pub fn from_slice(action: &[f32], metadata: Option<ActionMetadata>) -> Self {
-        Self {
-            lin_force: Vec2::new(action[0], action[1]).clamp(Vec2::splat(-1.0), Vec2::splat(1.0)),
-            ang_force: action[2].clamp(-1.0, 1.0),
-            shoot: action[3].clamp(-1.0, 1.0),
-            metadata,
-        }
-    }
-
-    pub fn as_vec(&self) -> Vec<f32> {
-        vec![
-            self.lin_force.x,
-            self.lin_force.y,
-            self.ang_force,
-            self.shoot,
-        ]
-    }
-
-    pub fn dim() -> usize {
-        Self::default().as_vec().len()
-    }
-}
-
-#[derive(Component)]
-pub struct NameText {
-    entity_following: Entity,
-}
-
-#[derive(Component)]
-pub struct Health(pub f32);
-
-#[derive(Component)]
-pub struct HealthBar {
-    entity_following: Entity,
-}
-
-#[derive(Component)]
-pub struct Agent;
-
-#[derive(Component, Clone)]
-pub struct BrainHandle {
-    pub color: Color,
-    pub kills: usize,
-    pub deaths: usize,
-    pub brain_id: usize,
-    pub name: String,
-}
-
-#[derive(Component, Default)]
-pub struct ShootyLine;
-
-#[derive(Bundle, Default)]
-pub struct ShootyLineBundle {
-    mesh: MaterialMesh2dBundle<ColorMaterial>,
-    s: ShootyLine,
-}
-
-#[derive(Bundle)]
-pub struct AgentBundle {
-    rb: RigidBody,
-    col: Collider,
-    rest: Restitution,
-    friction: Friction,
-    gravity: GravityScale,
-    velocity: Velocity,
-    damping: Damping,
-    force: ExternalForce,
-    impulse: ExternalImpulse,
-    mesh: MaterialMesh2dBundle<ColorMaterial>,
-    health: Health,
-    a: Agent,
-}
-impl AgentBundle {
-    pub fn new(
-        pos: Vec3,
-        color: Option<Color>,
-        meshes: &mut ResMut<Assets<Mesh>>,
-        materials: &mut ResMut<Assets<ColorMaterial>>,
-    ) -> Self {
-        Self {
-            rb: RigidBody::Dynamic,
-            col: Collider::ball(AGENT_RADIUS),
-            rest: Restitution::coefficient(0.5),
-            friction: Friction {
-                coefficient: 0.0,
-                combine_rule: CoefficientCombineRule::Min,
-            },
-            gravity: GravityScale(0.0),
-            velocity: Velocity::default(),
-            damping: Damping {
-                angular_damping: 30.0,
-                linear_damping: 10.0,
-            },
-            force: ExternalForce::default(),
-            impulse: ExternalImpulse::default(),
-
-            mesh: MaterialMesh2dBundle {
-                material: materials.add(ColorMaterial::from(color.unwrap_or(Color::PURPLE))),
-                mesh: meshes.add(shape::Circle::new(AGENT_RADIUS).into()).into(),
-                transform: Transform::from_translation(pos),
-                ..Default::default()
-            },
-
-            health: Health(AGENT_MAX_HEALTH),
-            a: Agent,
-        }
-    }
-}
-
-#[derive(Event)]
-struct TrainBrain(usize);
-
-#[derive(Event)]
-struct DoneTraining;
-
-#[derive(Component)]
-struct TrainingText(usize, Timer);
-
-fn check_train_brains(
-    frame_count: Res<FrameCount>,
-    mut brains: ResMut<BrainBank<AgentThinker>>,
-    rbs: Res<ReplayBuffers>,
-    mut log: ResMut<LogText>,
-    handles: Query<&BrainHandle>,
-) {
-    if frame_count.0 > 1 && frame_count.0 as usize % AGENT_UPDATE_INTERVAL == 0 {
-        // commands.spawn((
-        //     Text2dBundle {
-        //         text: Text::from_section(
-        //             format!("Training (1/{})", NUM_AGENTS),
-        //             TextStyle {
-        //                 font: asset_server.load("fonts/FiraSans-Bold.ttf"),
-        //                 font_size: 72.0,
-        //                 color: Color::YELLOW,
-        //             },
-        //         ),
-        //         transform: Transform::from_translation(Vec3::splat(0.0)),
-        //         text_anchor: Anchor::Center,
-        //         ..Default::default()
-        //     },
-        //     TrainingText(0, Timer::from_seconds(0.1, TimerMode::Once)),
-        // ));
-        for id in 0..NUM_AGENTS {
-            let handle = handles.iter().find(|h| h.brain_id == id).unwrap();
-            if handle.deaths > 0 {
-                // let brains = &mut *brains;
-                let frame_count = frame_count.0 as usize;
-                let rb = rbs.0[&id].clone();
-                let status = &AsyncComputeTaskPool::get().scope(|scope| {
-                    scope.spawn(async {
-                        brains.learn(id, frame_count, rb).await;
-                        brains.get_status(id).unwrap()
-                    })
-                })[0];
-
-                log.push(format!(
-                    "{} {} Value Loss: {}",
-                    handle.brain_id,
-                    handle.name,
-                    status.status.as_ref().unwrap().recent_value_loss,
-                ));
-                log.push(format!(
-                    "{} {} Policy Loss: {}",
-                    handle.brain_id,
-                    handle.name,
-                    status.status.as_ref().unwrap().recent_policy_loss,
-                ));
-                log.push(format!(
-                    "{} {} Entropy Loss: {}",
-                    handle.brain_id,
-                    handle.name,
-                    status.status.as_ref().unwrap().recent_entropy_loss,
-                ));
-                log.push(format!(
-                    "{} {} Policy Clamp Ratio: {}",
-                    handle.brain_id,
-                    handle.name,
-                    status.status.as_ref().unwrap().recent_nclamp,
-                ));
+impl<O> FrameStack<O> {
+    pub fn push(&mut self, s: O, max_len: Option<usize>) {
+        if let Some(max_len) = max_len {
+            while self.0.len() >= max_len {
+                self.0.pop_front();
             }
         }
-    }
-    // for (text_ent, mut text) in text.iter_mut() {
-    //     text.1.tick(time.delta());
-    //     if text.1.just_finished() {
-    //         tx.send(TrainBrain(text.0));
-    //     }
-    //     if rx.iter().next().is_some() {
-    //         let id = text.0;
-    //         commands.entity(text_ent).despawn();
-    //         if id + 1 < NUM_AGENTS {
-    //             commands.spawn((
-    //                 Text2dBundle {
-    //                     text: Text::from_section(
-    //                         format!("Training ({}/{})", id + 2, NUM_AGENTS),
-    //                         TextStyle {
-    //                             font: asset_server.load("fonts/FiraSans-Bold.ttf"),
-    //                             font_size: 72.0,
-    //                             color: Color::YELLOW,
-    //                         },
-    //                     ),
-    //                     transform: Transform::from_translation(Vec3::splat(0.0)),
-    //                     text_anchor: Anchor::Center,
-    //                     ..Default::default()
-    //                 },
-    //                 TrainingText(id + 1, Timer::from_seconds(0.1, TimerMode::Once)),
-    //             ));
-    //         }
-    //     }
-    // }
-}
 
-#[derive(Default, Resource)]
-pub struct ReplayBuffers(pub BTreeMap<usize, PpoBuffer>);
+        self.0.push_back(s);
+    }
+}
+impl<O> FrameStack<O>
+where
+    O: Clone,
+{
+    pub fn as_vec(&self) -> Vec<O> {
+        self.0.clone().into()
+    }
+}
 
 #[derive(Component)]
 pub struct Wall;
 
-fn spawn_agent(
-    brain: BrainHandle,
-    commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<ColorMaterial>>,
-    brains: &mut ResMut<BrainBank<AgentThinker>>,
-    asset_server: &Res<AssetServer>,
-) {
-    let agent_pos = Vec3::new(
-        (rand::random::<f32>() - 0.5) * 500.0,
-        (rand::random::<f32>() - 0.5) * 500.0,
-        0.0,
-    );
-    let id = commands
-        .spawn(AgentBundle::new(
-            agent_pos,
-            Some(brain.color),
-            meshes,
-            materials,
-        ))
-        .insert(ActiveEvents::all())
-        .insert(brain.clone())
-        .with_children(|parent| {
-            parent.spawn(ShootyLineBundle {
-                mesh: MaterialMesh2dBundle {
-                    mesh: meshes
-                        .add(Mesh::from(shape::Box::new(3.0, 1.0, 0.0)))
-                        .into(),
-                    material: materials.add(ColorMaterial::from(Color::WHITE)),
-                    transform: Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
-                    visibility: Visibility::Hidden,
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-            parent.spawn(MaterialMesh2dBundle {
-                mesh: meshes.add(Mesh::from(shape::Circle::new(3.0))).into(),
-                material: materials.add(ColorMaterial::from(Color::BLACK)),
-                transform: Transform::from_translation(Vec3::new(-5.0, AGENT_RADIUS - 5.0, 0.1)),
-                ..Default::default()
-            });
-            parent.spawn(MaterialMesh2dBundle {
-                mesh: meshes.add(Mesh::from(shape::Circle::new(3.0))).into(),
-                material: materials.add(ColorMaterial::from(Color::BLACK)),
-                transform: Transform::from_translation(Vec3::new(5.0, AGENT_RADIUS - 5.0, 0.1)),
-                ..Default::default()
-            });
-        })
-        .id();
-    commands.spawn((
-        Text2dBundle {
-            text: Text::from_section(
-                format!("{} {} {}.0", brain.brain_id, &brain.name, brain.deaths),
-                TextStyle {
-                    font: asset_server.load("fonts/FiraSans-Bold.ttf"),
-                    font_size: 20.0,
-                    color: Color::WHITE,
-                },
-            ),
-            transform: Transform::from_translation(agent_pos + Vec3::new(0.0, 0.0, 2.0)),
-            ..Default::default()
-        },
-        NameText {
-            entity_following: id,
-        },
-    ));
-    commands.spawn((
-        HealthBar {
-            entity_following: id,
-        },
-        MaterialMesh2dBundle {
-            mesh: meshes.add(shape::Box::new(1.0, 6.0, 0.0).into()).into(),
-            material: materials.add(ColorMaterial::from(Color::RED)),
-            transform: Transform::from_translation(agent_pos + Vec3::new(0.0, -AGENT_RADIUS, 2.0)),
-            ..Default::default()
-        },
-    ));
-    brains.assign_entity(brain.brain_id, id);
-}
-
-fn setup(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    mut brains: ResMut<BrainBank<AgentThinker>>,
-    mut rbs: ResMut<ReplayBuffers>,
-    asset_server: Res<AssetServer>,
-    timestamp: Res<Timestamp>,
-) {
+fn setup(mut commands: Commands) {
     commands.spawn(Camera2dBundle {
         transform: Transform::from_xyz(0.0, 0.0, 500.0),
         ..Default::default()
     });
-
-    // bottom wall
-    commands
-        .spawn(Collider::cuboid(500.0, 10.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::BEIGE,
-                custom_size: Some(Vec2::new(1000.0, 20.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(0.0, -250.0, 0.0)));
-
-    // top wall
-    commands
-        .spawn(Collider::cuboid(500.0, 10.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::BEIGE,
-                custom_size: Some(Vec2::new(1000.0, 20.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(0.0, 250.0, 0.0)));
-
-    // left wall
-    commands
-        .spawn(Collider::cuboid(10.0, 300.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::BLUE,
-                custom_size: Some(Vec2::new(20.0, 600.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(-500.0, 0.0, 0.0)));
-
-    // right wall
-    commands
-        .spawn(Collider::cuboid(10.0, 300.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::RED,
-                custom_size: Some(Vec2::new(20.0, 600.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(500.0, 0.0, 0.0)));
-
-    // right-middle wall
-    commands
-        .spawn(Collider::cuboid(100.0, 10.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::RED,
-                custom_size: Some(Vec2::new(200.0, 20.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(400.0, 0.0, 0.0)));
-
-    // left-middle wall
-    commands
-        .spawn(Collider::cuboid(100.0, 10.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::BLUE,
-                custom_size: Some(Vec2::new(200.0, 20.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(-400.0, 0.0, 0.0)));
-
-    // top-middle wall
-    commands
-        .spawn(Collider::cuboid(10.0, 100.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::BEIGE,
-                custom_size: Some(Vec2::new(20.0, 200.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(0.0, 200.0, 0.0)));
-
-    // bottom-middle wall
-    commands
-        .spawn(Collider::cuboid(10.0, 100.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::BEIGE,
-                custom_size: Some(Vec2::new(20.0, 200.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(Transform::from_xyz(0.0, -200.0, 0.0)));
-
-    // bottom-left corner wall
-    commands
-        .spawn(Collider::cuboid(10.0, 120.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::BLUE,
-                custom_size: Some(Vec2::new(20.0, 240.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(
-            Transform::from_rotation(Quat::from_axis_angle(Vec3::Z, 45.0 / 180.0 * PI))
-                .with_translation(Vec3::new(-400.0, -200.0, 0.0)),
-        ));
-
-    // top-right corner wall
-    commands
-        .spawn(Collider::cuboid(10.0, 120.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::RED,
-                custom_size: Some(Vec2::new(20.0, 240.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(
-            Transform::from_rotation(Quat::from_axis_angle(Vec3::Z, 45.0 / 180.0 * PI))
-                .with_translation(Vec3::new(400.0, 200.0, 0.0)),
-        ));
-
-    // top-left corner wall
-    commands
-        .spawn(Collider::cuboid(10.0, 120.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::BLUE,
-                custom_size: Some(Vec2::new(20.0, 240.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(
-            Transform::from_rotation(Quat::from_axis_angle(Vec3::Z, -45.0 / 180.0 * PI))
-                .with_translation(Vec3::new(-400.0, 200.0, 0.0)),
-        ));
-
-    // bottom-right corner wall
-    commands
-        .spawn(Collider::cuboid(10.0, 120.0))
-        .insert(SpriteBundle {
-            sprite: Sprite {
-                color: Color::RED,
-                custom_size: Some(Vec2::new(20.0, 240.0)),
-                ..default()
-            },
-            ..default()
-        })
-        .insert(Wall)
-        .insert(ActiveEvents::all())
-        .insert(TransformBundle::from(
-            Transform::from_rotation(Quat::from_axis_angle(Vec3::Z, -45.0 / 180.0 * PI))
-                .with_translation(Vec3::new(400.0, -200.0, 0.0)),
-        ));
-
-    let mut taken_names = vec![];
-    let thinker = SharedThinker::new(PpoThinker::new());
-    for _ in 0..NUM_AGENTS {
-        let ts = timestamp.clone();
-        let mut name = names::random_name();
-        while taken_names.contains(&name) {
-            name = names::random_name();
-        }
-        taken_names.push(name.clone());
-        let brain_name = name.clone();
-        let thinker = thinker.clone();
-        let id = brains.spawn(|rx| Brain::new(thinker, brain_name, ts, rx));
-        rbs.0.insert(id, PpoBuffer::default());
-        spawn_agent(
-            BrainHandle {
-                color: Color::rgb(rand::random(), rand::random(), rand::random()),
-                kills: 0,
-                deaths: 0,
-                brain_id: id,
-                name: name.to_owned(),
-            },
-            &mut commands,
-            &mut meshes,
-            &mut materials,
-            &mut brains,
-            &asset_server,
-        );
-    }
-}
-
-fn update(
-    mut commands: Commands,
-    mut agents: Query<
-        (
-            Entity,
-            &mut ExternalForce,
-            &mut Velocity,
-            &mut Transform,
-            &Children,
-        ),
-        (With<Agent>, Without<NameText>, Without<ShootyLine>),
-    >,
-    mut brains: ResMut<BrainBank<AgentThinker>>,
-    mut handles: Query<&mut BrainHandle>,
-    mut rbs: ResMut<ReplayBuffers>,
-    mut health: Query<&mut Health>,
-    mut line_vis: Query<
-        (&mut Visibility, &mut Transform),
-        (With<ShootyLine>, Without<Agent>, Without<NameText>),
-    >,
-    mut name_text_t: Query<
-        (Entity, &mut Transform, &mut Text, &NameText),
-        (Without<Agent>, Without<ShootyLine>),
-    >,
-    mut health_bar_t: Query<
-        (Entity, &mut Transform, &HealthBar),
-        (Without<Agent>, Without<ShootyLine>, Without<NameText>),
-    >,
-    cx: Res<RapierContext>,
-    _collision_events: EventReader<ContactForceEvent>,
-    _walls: Query<&Collider, (Without<Agent>, With<Wall>)>,
-    _keys: Res<Input<KeyCode>>,
-    mut log: ResMut<LogText>,
-    frame_count: Res<FrameCount>,
-) {
-    let mut all_states = BTreeMap::new();
-    let mut all_actions = BTreeMap::new();
-    let mut all_rewards = BTreeMap::new();
-    let mut all_terminals = BTreeMap::new();
-
-    for (t_ent, mut t, mut text, text_comp) in name_text_t.iter_mut() {
-        if let Ok(agent) = agents.get_component::<Transform>(text_comp.entity_following) {
-            t.translation = agent.translation + Vec3::new(0.0, AGENT_RADIUS + 20.0, 2.0);
-            let brain = &handles.get(text_comp.entity_following).unwrap();
-            text.sections[0].value = format!(
-                "{} {} {}-{}",
-                brain.brain_id, &brain.name, brain.kills, brain.deaths
-            );
-        } else {
-            commands.entity(t_ent).despawn();
-        }
-    }
-    for (t_ent, mut t, hb) in health_bar_t.iter_mut() {
-        if let Ok(agent) = agents.get_component::<Transform>(hb.entity_following) {
-            t.translation = agent.translation + Vec3::new(0.0, AGENT_RADIUS + 5.0, 2.0);
-            let health = health.get_component::<Health>(hb.entity_following).unwrap();
-            t.scale = Vec3::new(health.0 / AGENT_MAX_HEALTH * 100.0, 1.0, 1.0);
-        } else {
-            commands.entity(t_ent).despawn();
-        }
-    }
-
-    for (agent, _, velocity, transform, _) in agents.iter() {
-        let mut my_state = Observation {
-            pos: transform.translation.xy(),
-            linvel: velocity.linvel,
-            direction: transform.local_y().xy(),
-            health: health.get_component::<Health>(agent).unwrap().0,
-            other_states: vec![OtherState::default(); NUM_AGENTS - 1],
-            ..Default::default()
-        };
-
-        let filter = QueryFilter::only_fixed();
-        if let Some((_, toi)) =
-            cx.cast_ray(transform.translation.xy(), Vec2::Y, 2000.0, true, filter)
-        {
-            my_state.up_wall_dist = toi;
-        }
-        if let Some((_, toi)) = cx.cast_ray(
-            transform.translation.xy(),
-            Vec2::NEG_Y,
-            2000.0,
-            true,
-            filter,
-        ) {
-            my_state.down_wall_dist = toi;
-        }
-        if let Some((_, toi)) =
-            cx.cast_ray(transform.translation.xy(), Vec2::X, 2000.0, true, filter)
-        {
-            my_state.right_wall_dist = toi;
-        }
-        if let Some((_, toi)) = cx.cast_ray(
-            transform.translation.xy(),
-            Vec2::NEG_X,
-            2000.0,
-            true,
-            filter,
-        ) {
-            my_state.left_wall_dist = toi;
-        }
-
-        for (i, (other, _, other_vel, other_transform, _)) in agents
-            .iter()
-            .filter(|a| a.0 != agent)
-            .sorted_by_key(|a| a.3.translation.distance(transform.translation) as i64)
-            .enumerate()
-        {
-            let status = brains.get_status(handles.get(other).unwrap().brain_id);
-            let other_state = OtherState {
-                rel_pos: transform.translation.xy() - other_transform.translation.xy(),
-                linvel: other_vel.linvel,
-                direction: other_transform.local_y().xy(),
-                firing: status.unwrap_or_default().last_action.shoot > 0.0,
-            };
-            my_state.other_states[i] = other_state;
-        }
-
-        all_states.insert(agent, my_state.clone());
-
-        // if frame_count.0 as usize % N_FRAME_STACK == 0 {
-        brains.send_obs(agent, my_state.clone(), frame_count.0 as usize);
-        // }
-
-        let status = brains.get_status(handles.get(agent).unwrap().brain_id);
-        if let Some(status) = status {
-            all_actions.insert(agent, status.last_action);
-        }
-        all_rewards.insert(agent, 0.0);
-        all_terminals.insert(agent, false);
-    }
-    let mut dead_agents = BTreeSet::default();
-    for (agent, mut force, _velocity, transform, childs) in agents.iter_mut() {
-        if !dead_agents.contains(&agent) && all_actions.get(&agent).is_some() {
-            if all_actions[&agent].shoot > 0.0 && !dead_agents.contains(&agent) {
-                let (ray_dir, ray_pos) = {
-                    let ray_dir = transform.local_y().xy();
-                    let ray_pos = transform.translation.xy() + ray_dir * (AGENT_RADIUS + 2.0);
-                    for child in childs.iter() {
-                        if let Ok(mut line) = line_vis.get_mut(*child) {
-                            *line.0 = Visibility::Visible;
-                        }
-                    }
-                    (ray_dir, ray_pos)
-                };
-
-                let mut filter = QueryFilter::default().exclude_collider(agent);
-                for dead in dead_agents.iter() {
-                    filter = filter.exclude_collider(*dead);
-                }
-
-                if let Some((hit_entity, toi)) =
-                    cx.cast_ray(ray_pos, ray_dir, AGENT_SHOOT_DISTANCE, false, filter)
-                {
-                    for child in childs.iter() {
-                        if let Ok((_, mut t)) = line_vis.get_mut(*child) {
-                            t.scale = Vec3::new(1.0, toi, 1.0);
-                            *t = t.with_translation(Vec3::new(0.0, toi / 2.0, 0.0));
-                        }
-                    }
-                    if let Ok(mut health) = health.get_mut(hit_entity) {
-                        health.0 -= 5.0;
-                        *all_rewards.get_mut(&agent).unwrap() += 1.0;
-                        *all_rewards.get_mut(&hit_entity).unwrap() -= 1.0;
-                        if health.0 <= 0.0 {
-                            dead_agents.insert(hit_entity);
-                            *all_terminals.get_mut(&hit_entity).unwrap() = true;
-                            *all_rewards.get_mut(&agent).unwrap() += 100.0;
-                            *all_rewards.get_mut(&hit_entity).unwrap() -= 100.0;
-                            handles.get_mut(agent).unwrap().kills += 1;
-                            let msg = format!(
-                                "{} killed {}! Nice!",
-                                &handles.get(agent).unwrap().name,
-                                &handles.get(hit_entity).unwrap().name,
-                            );
-                            log.push(msg);
-                        }
-                    }
-                } else {
-                    for child in childs.iter() {
-                        if let Ok((_, mut t)) = line_vis.get_mut(*child) {
-                            t.scale = Vec3::new(1.0, AGENT_SHOOT_DISTANCE, 1.0);
-                            *t =
-                                t.with_translation(Vec3::new(0.0, AGENT_SHOOT_DISTANCE / 2.0, 0.0));
-                        }
-                    }
-                    *all_rewards.get_mut(&agent).unwrap() -= 4.0;
-                }
-            } else {
-                for child in childs.iter() {
-                    if let Ok(mut line) = line_vis.get_mut(*child) {
-                        *line.0 = Visibility::Hidden;
-                    }
-                }
-            }
-
-            if let Some(action) = all_actions.get(&agent) {
-                force.force = action.lin_force * AGENT_LIN_MOVE_FORCE;
-                force.torque = action.ang_force * AGENT_ANG_MOVE_FORCE;
-            }
-        }
-    }
-
-    for (agent, _, _, _, _) in agents.iter() {
-        let status = brains.get_status(handles.get(agent).unwrap().brain_id);
-        if let Some(status) = status {
-            if let Some(rb) = rbs.0.get_mut(&handles.get(agent).unwrap().brain_id) {
-                // if fresh {
-                if let (Some(action), Some(reward), Some(terminal)) = (
-                    all_actions.get(&agent),
-                    all_rewards.get(&agent),
-                    all_terminals.get(&agent),
-                ) {
-                    rb.remember_sart(
-                        Sart {
-                            obs: status.fs.clone(),
-                            action: action.to_owned(),
-                            reward: *reward,
-                            terminal: *terminal,
-                        },
-                        status.meta.as_ref().unwrap().clone(),
-                        Some(AGENT_RB_MAX_LEN),
-                    );
-                }
-            }
-        }
-    }
-
-    for agent in dead_agents {
-        // let brain = brains.get_mut(&agent).unwrap();
-        // brain.fs = FrameStack::default();
-        if let Some(rb) = rbs.0.get_mut(&handles.get(agent).unwrap().brain_id) {
-            rb.finish_trajectory();
-        }
-
-        // let mut ent = commands.entity(agent);
-        let mut handle = handles.get_mut(agent).unwrap();
-        handle.deaths += 1;
-        let mut t = agents.get_component_mut::<Transform>(agent).unwrap();
-        let mut h = health.get_component_mut::<Health>(agent).unwrap();
-        h.0 = AGENT_MAX_HEALTH;
-        let agent_pos = Vec3::new(
-            (rand::random::<f32>() - 0.5) * 500.0,
-            (rand::random::<f32>() - 0.5) * 500.0,
-            0.0,
-        );
-        t.translation = agent_pos;
-    }
 }
 
 #[derive(Resource, Clone)]
@@ -961,18 +114,6 @@ impl Drop for TbWriter {
     }
 }
 
-impl<T: Thinker> Drop for Brain<T> {
-    fn drop(&mut self) {
-        // warn!("Saving {}...", &self.name);
-        if let Err(e) = self.save() {
-            error!("Failed to save brain: {:?}", e);
-        }
-    }
-}
-
-#[derive(Resource, Default)]
-pub struct AvgAgentKills(f32);
-
 fn handle_input(
     mut window: Query<&mut Window>,
     keys: Res<Input<KeyCode>>,
@@ -990,8 +131,7 @@ fn handle_input(
     }
 }
 
-fn main() {
-    burn_tch::TchBackend::<f32>::seed(rand::random());
+fn run_env<E: Env>() {
     App::new()
         .insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
@@ -999,11 +139,8 @@ fn main() {
             ..default()
         })
         .insert_resource(Timestamp::default())
-        .insert_resource(AvgAgentKills::default())
-        .insert_resource(ReplayBuffers::default())
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
-        .insert_resource(BrainBank::<AgentThinker>::default())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 present_mode: bevy::window::PresentMode::AutoNoVsync,
@@ -1030,13 +167,17 @@ fn main() {
         })
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
         // .add_plugins(RapierDebugRenderPlugin::default())
+        .insert_resource(E::init())
         .add_plugins(EguiPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, update)
-        .add_systems(Update, check_train_brains)
+        .add_systems(Startup, E::setup_system())
         .add_systems(Update, ui)
         .add_systems(Update, handle_input)
-        .add_event::<TrainBrain>()
-        .add_event::<DoneTraining>()
+        .add_systems(Update, E::main_system())
         .run();
+}
+
+fn main() {
+    burn_tch::TchBackend::<f32>::seed(rand::random());
+    run_env::<Ffa>();
 }

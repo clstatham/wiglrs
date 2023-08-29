@@ -1,13 +1,14 @@
 use std::{
+    marker::PhantomData,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use bevy::prelude::Vec2;
 
-use crate::{Action, TbWriter};
 
-use super::{replay_buffer::PpoBuffer, FrameStack};
+use crate::{envs::Env, FrameStack, TbWriter};
+
+use super::replay_buffer::PpoBuffer;
 
 pub mod ncp;
 pub mod ppo;
@@ -21,45 +22,27 @@ impl Status for () {
     fn log(&self, _writer: &mut TbWriter, _step: usize) {}
 }
 
-pub trait Thinker {
+pub trait Thinker<E: Env> {
     type Metadata: Clone;
     type Status: Status + Clone + Default;
-    fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action;
-    fn learn(&mut self, b: &PpoBuffer);
+    fn act(
+        &mut self,
+        obs: &FrameStack<E::Observation>,
+        metadata: &mut Self::Metadata,
+        params: &E::Params,
+    ) -> Option<E::Action>;
+    fn learn(&mut self, b: &PpoBuffer<E>, params: &E::Params);
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>;
     fn init_metadata(&self, batch_size: usize) -> Self::Metadata;
     fn status(&self) -> Self::Status;
 }
 
-pub struct RandomThinker;
-
-impl Thinker for RandomThinker {
-    type Metadata = ();
-    type Status = ();
-    fn act(&mut self, _obs: FrameStack, _metadata: &mut ()) -> Action {
-        Action {
-            lin_force: Vec2::new(
-                rand::random::<f32>() * 2.0 - 1.0,
-                rand::random::<f32>() * 2.0 - 1.0,
-            ),
-            ang_force: rand::random::<f32>() * 2.0 - 1.0,
-            shoot: rand::random::<f32>() * 2.0 - 1.0,
-            metadata: None,
-        }
-    }
-    fn learn(&mut self, _b: &PpoBuffer) {}
-    fn save(&self, _path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
-        Ok(())
-    }
-    fn init_metadata(&self, _batch_size: usize) -> Self::Metadata {}
-    fn status(&self) -> Self::Status {}
-}
-
-pub struct SharedThinker<T: Thinker> {
+pub struct SharedThinker<E: Env, T: Thinker<E>> {
     thinker: Arc<Mutex<T>>,
+    _e: PhantomData<E>,
 }
 
-impl<T: Thinker> Default for SharedThinker<T>
+impl<E: Env, T: Thinker<E>> Default for SharedThinker<E, T>
 where
     T: Default,
 {
@@ -68,18 +51,20 @@ where
     }
 }
 
-impl<T: Thinker> Clone for SharedThinker<T> {
+impl<E: Env, T: Thinker<E>> Clone for SharedThinker<E, T> {
     fn clone(&self) -> Self {
         Self {
             thinker: self.thinker.clone(),
+            _e: PhantomData,
         }
     }
 }
 
-impl<T: Thinker> SharedThinker<T> {
+impl<E: Env, T: Thinker<E>> SharedThinker<E, T> {
     pub fn new(thinker: T) -> Self {
         Self {
             thinker: Arc::new(Mutex::new(thinker)),
+            _e: PhantomData,
         }
     }
 
@@ -88,14 +73,19 @@ impl<T: Thinker> SharedThinker<T> {
     }
 }
 
-impl<T: Thinker> Thinker for SharedThinker<T> {
+impl<E: Env, T: Thinker<E>> Thinker<E> for SharedThinker<E, T> {
     type Metadata = T::Metadata;
     type Status = T::Status;
-    fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action {
-        self.lock().act(obs, metadata)
+    fn act(
+        &mut self,
+        obs: &FrameStack<E::Observation>,
+        metadata: &mut Self::Metadata,
+        params: &E::Params,
+    ) -> Option<E::Action> {
+        self.lock().act(obs, metadata, params)
     }
-    fn learn(&mut self, b: &PpoBuffer) {
-        self.lock().learn(b)
+    fn learn(&mut self, b: &PpoBuffer<E>, params: &E::Params) {
+        self.lock().learn(b, params)
     }
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         self.lock().save(path)

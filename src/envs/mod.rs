@@ -1,46 +1,51 @@
-use bevy::prelude::*;
+use bevy::{ecs::schedule::SystemConfigs, prelude::*};
 
-pub trait Env {
-    type SetupResources;
-    type RewardResources;
+use crate::FrameStack;
 
-    fn setup(
-        &mut self,
-        commands: Commands,
-        asset_server: Res<AssetServer>,
-        resources: Self::SetupResources,
-    );
-    fn reward(
-        &mut self,
-        for_ent: Entity,
-        commands: Commands,
-        asset_server: Res<AssetServer>,
-        resources: Self::RewardResources,
-    ) -> f32;
+pub mod ffa;
+
+pub trait Action<E: Env> {
+    type Metadata;
+    fn as_vec(&self, params: &E::Params) -> Vec<f32>;
+    fn from_slice(v: &[f32], metadata: Self::Metadata, params: &E::Params) -> Self;
+    fn metadata(&self) -> Self::Metadata;
 }
 
-pub struct Ffa {
-    pub n_players: usize,
+pub trait Observation<E: Env>
+where
+    Self: Sized,
+{
+    fn as_vec(&self, params: &E::Params) -> Vec<f32>;
+    fn new_frame_stack(params: &E::Params) -> FrameStack<Self>;
 }
 
-impl Env for Ffa {
-    type SetupResources = ();
-    fn setup(
-        &mut self,
-        _commands: Commands,
-        _asset_server: Res<AssetServer>,
-        _resources: Self::SetupResources,
-    ) {
-    }
+pub trait Env: Resource
+where
+    Self: Sized,
+{
+    type Params: Default + Resource + Send + Sync;
+    type Observation: Observation<Self> + Send + Sync + Clone;
+    type Action: Action<Self> + Default + Send + Sync + Clone;
 
-    type RewardResources = ();
-    fn reward(
-        &mut self,
-        _for_ent: Entity,
-        _commands: Commands,
-        _asset_server: Res<AssetServer>,
-        _resources: Self::RewardResources,
-    ) -> f32 {
-        todo!()
+    fn init() -> Self;
+
+    fn setup_system() -> SystemConfigs;
+    fn observation_system() -> SystemConfigs;
+    fn action_system() -> SystemConfigs;
+    fn reward_system() -> SystemConfigs;
+    fn terminal_system() -> SystemConfigs;
+    fn update_system() -> SystemConfigs;
+    fn learn_system() -> SystemConfigs;
+
+    fn main_system() -> SystemConfigs {
+        (
+            Self::observation_system(),
+            Self::action_system(),
+            Self::reward_system(),
+            Self::terminal_system(),
+            Self::update_system(),
+            Self::learn_system(),
+        )
+            .chain()
     }
 }

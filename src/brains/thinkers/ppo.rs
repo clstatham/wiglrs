@@ -14,12 +14,14 @@ use burn_tch::{TchBackend, TchDevice};
 use itertools::Itertools;
 use std::f32::consts::PI;
 
-use crate::brains::FrameStack;
-use crate::hparams::{
-    AGENT_ACTOR_LR, AGENT_CRITIC_LR, AGENT_HIDDEN_DIM, AGENT_OPTIM_BATCH_SIZE, AGENT_OPTIM_EPOCHS,
+use crate::{
+    brains::replay_buffer::{PpoBuffer, PpoMetadata},
+    envs::Observation,
 };
-use crate::{brains::replay_buffer::PpoBuffer, hparams::AGENT_ENTROPY_BETA};
-use crate::{Action, ActionMetadata, ACTION_LEN, OBS_LEN};
+use crate::{
+    envs::{Action, Env},
+    FrameStack,
+};
 
 use super::{
     ncp::{Cfc, CfcCellMode, CfcConfig, CfcMode, FullyConnected, WiringConfig},
@@ -28,23 +30,25 @@ use super::{
 
 pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
 
-pub struct MvNormal<B: Backend<FloatElem = f32>, const K: usize> {
+pub struct MvNormal<B: Backend<FloatElem = f32>> {
     pub mu: Tensor<B, 2>,
     pub cov_diag: Tensor<B, 2>,
 }
 
-impl<B: Backend<FloatElem = f32>, const K: usize> MvNormal<B, K> {
+impl<B: Backend<FloatElem = f32>> MvNormal<B> {
     pub fn sample(&self) -> Tensor<B, 2> {
         let std = self.cov_diag.clone().sqrt();
+        let [_, nfeat] = self.mu.shape().dims;
         let cov = std.to_data().value;
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
-        let z = Tensor::random([nbatch, K], burn_tensor::Distribution::Normal(0.0, 1.0))
+        let z = Tensor::random([nbatch, nfeat], burn_tensor::Distribution::Normal(0.0, 1.0))
             .to_device(&self.mu.device());
         self.mu.clone() + z * std
     }
 
     pub fn log_prob(self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let [_, nfeat] = self.mu.shape().dims;
         let x = x.to_device(&self.mu.device());
         let a = x.clone() - self.mu.clone();
         let cov = self.cov_diag.to_data().value;
@@ -52,13 +56,13 @@ impl<B: Backend<FloatElem = f32>, const K: usize> MvNormal<B, K> {
         let cov_diag = self.cov_diag.clone();
         let nbatch = self.mu.shape().dims[0];
         let mut det = Tensor::<B, 2>::ones([nbatch, 1]).to_device(&self.cov_diag.device());
-        for i in 0..K {
+        for i in 0..nfeat {
             det = det * cov_diag.clone().slice([0..nbatch, i..i + 1]);
         }
         let d = a.clone() / cov_diag;
         let e = (d * a).sum_dim(1);
         let numer = (e * -0.5).exp().reshape([nbatch, 1]);
-        let f = (2.0 * PI).powf(K as f32);
+        let f = (2.0 * PI).powf(nfeat as f32);
         let denom = (det * f).sqrt();
         let pdf = numer / denom;
         pdf.log()
@@ -66,13 +70,14 @@ impl<B: Backend<FloatElem = f32>, const K: usize> MvNormal<B, K> {
 
     pub fn entropy(&self) -> Tensor<B, 2> {
         let cov = self.cov_diag.to_data().value;
+        let [_, nfeat] = self.mu.shape().dims;
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
         let mut g = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
-        for i in 0..K {
+        for i in 0..nfeat {
             g = g * self.cov_diag.clone().slice([0..nbatch, i..i + 1]);
         }
-        let second_term = (K as f32 * 0.5) * (1.0 + (2.0 * PI).ln());
+        let second_term = (nfeat as f32 * 0.5) * (1.0 + (2.0 * PI).ln());
         g.log() * 0.5 + second_term
     }
 }
@@ -352,21 +357,35 @@ pub struct PpoThinker {
     actor_optim: OptimizerAdaptor<RMSProp<TchBackend<f32>>, PpoActor<Be>, Be>,
     critic_optim: OptimizerAdaptor<RMSProp<TchBackend<f32>>, PpoCritic<Be>, Be>,
     status: PpoStatus,
+    training_epochs: usize,
+    training_batch_size: usize,
+    entropy_beta: f32,
+    actor_lr: f64,
+    critic_lr: f64,
 }
 
 impl PpoThinker {
-    pub fn new() -> Self {
+    pub fn new(
+        obs_len: usize,
+        hidden_len: usize,
+        action_len: usize,
+        training_epochs: usize,
+        training_batch_size: usize,
+        entropy_beta: f32,
+        actor_lr: f64,
+        critic_lr: f64,
+    ) -> Self {
         let actor = PpoActorConfig {
-            obs_len: OBS_LEN,
-            hidden_len: AGENT_HIDDEN_DIM,
-            action_len: ACTION_LEN,
+            obs_len,
+            hidden_len,
+            action_len,
         }
         .init()
         .fork(&TchDevice::Cuda(0));
         // dbg!(actor.num_params());
         let critic = PpoCriticConfig {
-            obs_len: OBS_LEN,
-            hidden_len: AGENT_HIDDEN_DIM,
+            obs_len,
+            hidden_len,
         }
         .init()
         .fork(&TchDevice::Cuda(0));
@@ -379,17 +398,19 @@ impl PpoThinker {
             actor_optim,
             critic_optim,
             status: PpoStatus::default(),
+            training_batch_size,
+            training_epochs,
+            entropy_beta,
+            actor_lr,
+            critic_lr,
         }
     }
 }
 
-impl Default for PpoThinker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Thinker for PpoThinker {
+impl<E: Env> Thinker<E> for PpoThinker
+where
+    E::Action: Action<E, Metadata = PpoMetadata>,
+{
     type Metadata = HiddenStates<TchBackend<f32>>;
     type Status = PpoStatus;
 
@@ -407,11 +428,17 @@ impl Thinker for PpoThinker {
         }
     }
 
-    fn act(&mut self, obs: FrameStack, metadata: &mut Self::Metadata) -> Action {
+    fn act(
+        &mut self,
+        obs: &FrameStack<E::Observation>,
+        metadata: &mut Self::Metadata,
+        params: &E::Params,
+    ) -> Option<E::Action> {
+        let hiddens = metadata.clone();
         let obs = obs
             .as_vec()
             .into_iter()
-            .map(|o| Tensor::from_floats(o.as_vec().as_slice()).unsqueeze::<2>())
+            .map(|o| Tensor::from_floats(o.as_vec(params).as_slice()).unsqueeze::<2>())
             .collect::<Vec<_>>();
         let obs = Tensor::cat(obs, 0).unsqueeze();
         let (mu, std) = self.actor.valid().forward(
@@ -422,7 +449,7 @@ impl Thinker for PpoThinker {
         );
         self.status.recent_mu = mu.to_data().value;
         self.status.recent_std = std.to_data().value;
-        let dist: MvNormal<_, ACTION_LEN> = MvNormal {
+        let dist = MvNormal {
             mu,
             cov_diag: std.clone() * std,
         };
@@ -430,26 +457,29 @@ impl Thinker for PpoThinker {
         let action = dist.sample().clamp(-1.0, 1.0);
         let val = self.critic.valid().forward(obs, &mut metadata.critic_h);
 
-        Action::from_slice(
-            action.to_data().value.as_slice(),
-            Some(ActionMetadata {
-                logp: dist.log_prob(action).into_scalar(),
+        let action_vec = action.to_data().value;
+        Some(E::Action::from_slice(
+            action_vec.as_slice(),
+            PpoMetadata {
                 val: val.into_scalar(),
-            }),
-        )
+                logp: dist.log_prob(action).into_scalar(),
+                hiddens: Some(hiddens),
+            },
+            params,
+        ))
     }
 
-    fn learn(&mut self, rb: &PpoBuffer) {
+    fn learn(&mut self, rb: &PpoBuffer<E>, params: &E::Params) {
         let mut nstep = 0;
 
         let mut total_pi_loss = 0.0;
         let mut total_val_loss = 0.0;
         let mut total_entropy_loss = 0.0;
         let mut total_nclamp = 0.0;
-        for _epoch in kdam::tqdm!(0..AGENT_OPTIM_EPOCHS, desc = "Training") {
+        for _epoch in kdam::tqdm!(0..self.training_epochs, desc = "Training") {
             nstep += 1;
 
-            let step = rb.sample_batch(AGENT_OPTIM_BATCH_SIZE).unwrap();
+            let step = rb.sample_batch(self.training_batch_size).unwrap();
             let returns = Tensor::from_floats(
                 step.returns
                     .iter()
@@ -470,7 +500,7 @@ impl Thinker for PpoThinker {
                         stack
                             .as_vec()
                             .into_iter()
-                            .map(|x| Tensor::from_floats(x.as_vec().as_slice()).unsqueeze())
+                            .map(|x| Tensor::from_floats(x.as_vec(params).as_slice()).unsqueeze())
                             .collect::<Vec<_>>(),
                         1,
                     )
@@ -480,17 +510,17 @@ impl Thinker for PpoThinker {
             let a = step
                 .action
                 .iter()
-                .map(|action| Tensor::from_floats(action.as_vec().as_slice()).unsqueeze())
+                .map(|action| Tensor::from_floats(action.as_vec(params).as_slice()).unsqueeze())
                 .collect::<Vec<_>>();
             let a: Tensor<Be, 2> = Tensor::cat(a, 0);
             let old_lp = step
                 .action
                 .iter()
-                .map(|action| action.metadata.unwrap().logp)
+                .map(|action| action.metadata().logp)
                 .collect::<Vec<_>>();
             let old_lp = Tensor::from_floats(old_lp.as_slice())
                 .to_device(&self.actor.devices()[0])
-                .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
+                .reshape([self.training_batch_size, 1]);
 
             let advantage = Tensor::from_floats(
                 step.advantage
@@ -501,16 +531,24 @@ impl Thinker for PpoThinker {
                     .as_slice(),
             )
             .to_device(&self.actor.devices()[0])
-            .reshape([AGENT_OPTIM_BATCH_SIZE, 1]);
+            .reshape([self.training_batch_size, 1]);
             let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
                 / (advantage.var(0).sqrt() + 1e-7);
 
             let (actor_com_h, actor_mu_h, actor_std_h, critic_h): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
-                step.hiddens
+                step.action
                     .into_iter()
-                    .map(|hs| (hs.actor_com_h, hs.actor_mu_h, hs.actor_std_h, hs.critic_h))
+                    .map(|hs| {
+                        let hiddens = hs.metadata().hiddens.as_ref().unwrap().to_owned();
+                        (
+                            hiddens.actor_com_h,
+                            hiddens.actor_mu_h,
+                            hiddens.actor_std_h,
+                            hiddens.critic_h,
+                        )
+                    })
                     .multiunzip();
-            // let mut meta = self.init_hidden_train(AGENT_OPTIM_BATCH_SIZE);
+
             let mut actor_com_h = Tensor::from_inner(Tensor::cat(actor_com_h, 0));
             let mut actor_mu_h = Tensor::from_inner(Tensor::cat(actor_mu_h, 0));
             let mut actor_std_h = Tensor::from_inner(Tensor::cat(actor_std_h, 0));
@@ -521,7 +559,7 @@ impl Thinker for PpoThinker {
                 &mut actor_mu_h,
                 &mut actor_std_h,
             );
-            let dist = MvNormal::<Be, ACTION_LEN> {
+            let dist = MvNormal {
                 mu,
                 cov_diag: std.clone() * std,
             };
@@ -544,7 +582,7 @@ impl Thinker for PpoThinker {
             total_pi_loss += policy_loss.clone().into_scalar();
             let entropy_loss = entropy.mean();
             total_entropy_loss += entropy_loss.clone().into_scalar();
-            let policy_loss = policy_loss - entropy_loss * AGENT_ENTROPY_BETA;
+            let policy_loss = policy_loss - entropy_loss * self.entropy_beta;
 
             let actor_grads = policy_loss.backward();
 
@@ -556,7 +594,7 @@ impl Thinker for PpoThinker {
             //     .map(|t| t.map(|t| println!("{}", t)));
             let mut visitor = CheckNanWeights;
             self.actor = self.actor_optim.step(
-                AGENT_ACTOR_LR,
+                self.actor_lr,
                 self.actor.clone(),
                 GradientsParams::from_grads(actor_grads, &self.actor),
             );
@@ -566,16 +604,8 @@ impl Thinker for PpoThinker {
             let value_loss = (val_err.clone() * val_err).mean();
             total_val_loss += value_loss.clone().into_scalar();
             let critic_grads = value_loss.backward();
-            // let g = critic_grads
-            //     .get(&self.critic.rnn.fc.weight.val().into_primitive())
-            //     .unwrap()
-            //     .tensor
-            //     .to_device(burn_tch::TchDevice::Cpu.into())
-            //     .isnan()
-            //     .any();
-            // println!("{}", g);
             self.critic = self.critic_optim.step(
-                AGENT_CRITIC_LR,
+                self.critic_lr,
                 self.critic.clone(),
                 GradientsParams::from_grads(critic_grads, &self.critic),
             );
