@@ -12,9 +12,14 @@ use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 
 use burn_tensor::backend::Backend;
-use envs::{ffa::Ffa, Env};
+use envs::{
+    ffa::Ffa,
+    maps::{tdm::TdmMap, Map},
+    tdm::Tdm,
+    Env,
+};
 use tensorboard_rs::summary_writer::SummaryWriter;
-use ui::{ui, LogText};
+use ui::LogText;
 
 pub mod brains;
 pub mod envs;
@@ -131,7 +136,7 @@ fn handle_input(
     }
 }
 
-fn run_env<E: Env>() {
+fn run_env<E: Env, M: Map>() {
     App::new()
         .insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
@@ -170,8 +175,8 @@ fn run_env<E: Env>() {
         .insert_resource(E::init())
         .add_plugins(EguiPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Startup, E::setup_system())
-        .add_systems(Update, ui)
+        .add_systems(Startup, E::setup_system::<M>())
+        .add_systems(Update, E::ui_system())
         .add_systems(Update, handle_input)
         .add_systems(Update, E::main_system())
         .run();
@@ -179,5 +184,5 @@ fn run_env<E: Env>() {
 
 fn main() {
     burn_tch::TchBackend::<f32>::seed(rand::random());
-    run_env::<Ffa>();
+    run_env::<Tdm, TdmMap>();
 }

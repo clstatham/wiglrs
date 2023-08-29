@@ -2,10 +2,14 @@ use bevy::{ecs::schedule::SystemConfigs, prelude::*};
 
 use crate::FrameStack;
 
+use self::maps::Map;
+
 pub mod ffa;
+pub mod maps;
+pub mod tdm;
 
 pub trait Action<E: Env> {
-    type Metadata;
+    type Metadata: Default;
     fn as_vec(&self, params: &E::Params) -> Vec<f32>;
     fn from_slice(v: &[f32], metadata: Self::Metadata, params: &E::Params) -> Self;
     fn metadata(&self) -> Self::Metadata;
@@ -29,13 +33,14 @@ where
 
     fn init() -> Self;
 
-    fn setup_system() -> SystemConfigs;
+    fn setup_system<M: Map>() -> SystemConfigs;
     fn observation_system() -> SystemConfigs;
     fn action_system() -> SystemConfigs;
     fn reward_system() -> SystemConfigs;
     fn terminal_system() -> SystemConfigs;
     fn update_system() -> SystemConfigs;
     fn learn_system() -> SystemConfigs;
+    fn ui_system() -> SystemConfigs;
 
     fn main_system() -> SystemConfigs {
         (

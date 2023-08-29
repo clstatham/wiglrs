@@ -9,7 +9,7 @@ use tokio::sync::{
 
 use self::{
     replay_buffer::PpoBuffer,
-    thinkers::{ppo::PpoThinker, Status, Thinker},
+    thinkers::{ppo::PpoThinker, RandomThinker, Status, Thinker},
 };
 use crate::{envs::Env, FrameStack, TbWriter, Timestamp};
 
@@ -94,18 +94,14 @@ impl<E: Env, T: Thinker<E>> Brain<E, T> {
                     obs,
                     params,
                 } => {
-                    // if frame_count % N_FRAME_STACK == 0 {
                     let meta = self.metadata.clone();
-                    let status = self.thinker.status().clone();
+                    let status = self.thinker.status();
                     let action = self.act(&obs, &params);
                     BrainStatus::NewStatus(ThinkerStatus {
                         last_action: action,
                         status: Some(status),
                         meta: Some(meta),
                     })
-                    // } else {
-                    //     BrainStatus::Ready
-                    // }
                 }
                 BrainControl::Learn {
                     frame_count,

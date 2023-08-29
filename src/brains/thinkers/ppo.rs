@@ -413,6 +413,7 @@ where
 {
     type Metadata = HiddenStates<TchBackend<f32>>;
     type Status = PpoStatus;
+    type ActionMetadata = PpoMetadata;
 
     fn status(&self) -> Self::Status {
         self.status.clone()

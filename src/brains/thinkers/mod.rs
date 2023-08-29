@@ -4,9 +4,13 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+use rand::thread_rng;
+use rand_distr::Distribution;
 
-
-use crate::{envs::Env, FrameStack, TbWriter};
+use crate::{
+    envs::{Action, Env},
+    FrameStack, TbWriter,
+};
 
 use super::replay_buffer::PpoBuffer;
 
@@ -25,6 +29,7 @@ impl Status for () {
 pub trait Thinker<E: Env> {
     type Metadata: Clone;
     type Status: Status + Clone + Default;
+    type ActionMetadata: Clone + Default;
     fn act(
         &mut self,
         obs: &FrameStack<E::Observation>,
@@ -75,6 +80,7 @@ impl<E: Env, T: Thinker<E>> SharedThinker<E, T> {
 
 impl<E: Env, T: Thinker<E>> Thinker<E> for SharedThinker<E, T> {
     type Metadata = T::Metadata;
+    type ActionMetadata = T::ActionMetadata;
     type Status = T::Status;
     fn act(
         &mut self,
@@ -96,4 +102,41 @@ impl<E: Env, T: Thinker<E>> Thinker<E> for SharedThinker<E, T> {
     fn status(&self) -> Self::Status {
         self.lock().status()
     }
+}
+
+pub struct RandomThinker;
+
+impl<E: Env> Thinker<E> for RandomThinker {
+    type Metadata = ();
+    type ActionMetadata = ();
+    type Status = ();
+
+    fn act(
+        &mut self,
+        _obs: &FrameStack<<E as Env>::Observation>,
+        _metadata: &mut Self::Metadata,
+        params: &<E as Env>::Params,
+    ) -> Option<<E as Env>::Action> {
+        let len = E::Action::default().as_vec(params).len();
+        let dist = rand_distr::Uniform::new(-1.0, 1.0);
+        let mut out = vec![];
+        for _ in 0..len {
+            out.push(dist.sample(&mut thread_rng()));
+        }
+        Some(E::Action::from_slice(
+            &out,
+            <E::Action as Action<E>>::Metadata::default(),
+            params,
+        ))
+    }
+
+    fn learn(&mut self, b: &PpoBuffer<E>, params: &<E as Env>::Params) {}
+
+    fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    fn init_metadata(&self, batch_size: usize) -> Self::Metadata {}
+
+    fn status(&self) -> Self::Status {}
 }

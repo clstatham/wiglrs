@@ -749,7 +749,10 @@ impl<B: Backend> Cfc<B> {
                 self.cell.forward(x, h, Tensor::ones_device([1], dev))
             };
             h = h_next;
-            let out = self.fc.forward(out).reshape([nbatch, 1, nout]);
+            let out = self
+                .fc
+                .forward(out.to_device(dev))
+                .reshape([nbatch, 1, nout]);
             outputs = outputs.slice_assign([0..nbatch, i..i + 1, 0..nout], out);
         }
         (outputs, h)
