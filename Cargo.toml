@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bevy = { version = "0.11.2" } # , features = ["dynamic_linking"]
+bevy = { version = "0.11.2" }
 bevy_rapier2d = "0.22.0"
 bevy_egui = "0.21"
 bevy_tasks = "0.11.2"
@@ -19,7 +19,6 @@ rand = "0.8.5"
 rand_distr = "0.4.3"
 tensorboard-rs = "0.5.9"
 serde = { version = "1.0", features = ["derive"] }
-postcard = { version = "1.0.6", default-features = false, features = ["alloc"] }
 kdam = { version = "0.4.1", features = ["rich"] }
 burn = { git = "https://github.com/burn-rs/burn.git", package = "burn" }
 burn-autodiff = { git = "https://github.com/burn-rs/burn.git", package = "burn-autodiff" }

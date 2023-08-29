@@ -1,16 +1,6 @@
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
-use bevy_egui::{
-    egui::{
-        self,
-        plot::{Bar, BarChart, Line},
-        Color32, Layout, Stroke,
-    },
-    EguiContexts,
-};
-
-use itertools::Itertools;
 
 #[derive(Debug, Default, Resource)]
 pub struct LogText(pub VecDeque<String>);

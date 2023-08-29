@@ -117,7 +117,7 @@ impl<E: Env> Thinker<E> for RandomThinker {
         _metadata: &mut Self::Metadata,
         params: &<E as Env>::Params,
     ) -> Option<<E as Env>::Action> {
-        let len = E::Action::default().as_vec(params).len();
+        let len = E::Action::default().as_slice(params).len();
         let dist = rand_distr::Uniform::new(-1.0, 1.0);
         let mut out = vec![];
         for _ in 0..len {
@@ -130,13 +130,13 @@ impl<E: Env> Thinker<E> for RandomThinker {
         ))
     }
 
-    fn learn(&mut self, b: &PpoBuffer<E>, params: &<E as Env>::Params) {}
+    fn learn(&mut self, _b: &PpoBuffer<E>, _params: &<E as Env>::Params) {}
 
-    fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+    fn save(&self, _path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
-    fn init_metadata(&self, batch_size: usize) -> Self::Metadata {}
+    fn init_metadata(&self, _batch_size: usize) -> Self::Metadata {}
 
     fn status(&self) -> Self::Status {}
 }

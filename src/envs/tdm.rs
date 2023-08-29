@@ -10,7 +10,7 @@ use bevy_egui::{
 use bevy_rapier2d::prelude::*;
 use bevy_tasks::AsyncComputeTaskPool;
 use itertools::Itertools;
-use std::{collections::BTreeMap, f32::consts::PI};
+use std::collections::BTreeMap;
 
 use crate::{
     brains::{
@@ -19,7 +19,7 @@ use crate::{
         AgentThinker, Brain, BrainBank,
     },
     ui::LogText,
-    FrameStack, Timestamp, Wall,
+    FrameStack, Timestamp,
 };
 
 use super::{
@@ -98,16 +98,16 @@ impl Observation<Tdm> for TdmObs {
         FrameStack(out.into())
     }
 
-    fn as_vec(&self, params: &<Tdm as Env>::Params) -> Vec<f32> {
-        let mut out = self.ffa_state.as_vec(&params.ffa_params);
+    fn as_slice(&self, params: &<Tdm as Env>::Params) -> Box<[f32]> {
+        let mut out = self.ffa_state.as_slice(&params.ffa_params).to_vec();
         for other in &self.teammate_states {
-            out.extend_from_slice(&other.ffa_state.as_vec(&params.ffa_params));
+            out.extend_from_slice(&other.ffa_state.as_slice(&params.ffa_params));
         }
         for other in &self.enemy_states {
-            out.extend_from_slice(&other.ffa_state.as_vec(&params.ffa_params));
+            out.extend_from_slice(&other.ffa_state.as_slice(&params.ffa_params));
         }
 
-        out
+        out.into_boxed_slice()
     }
 }
 
@@ -127,8 +127,8 @@ impl Action<Tdm> for TdmAction {
         }
     }
 
-    fn as_vec(&self, params: &<Tdm as Env>::Params) -> Vec<f32> {
-        self.ffa_action.as_vec(&params.ffa_params)
+    fn as_slice(&self, params: &<Tdm as Env>::Params) -> Box<[f32]> {
+        self.ffa_action.as_slice(&params.ffa_params)
     }
 
     fn metadata(&self) -> Self::Metadata {
@@ -236,7 +236,7 @@ fn setup(
 ) {
     let mut taken_names = vec![];
     let obs_len = TdmObs::new_frame_stack(&env.params).0[0]
-        .as_vec(&env.params)
+        .as_slice(&env.params)
         .len();
 
     for team_id in 0..env.params.num_teams {

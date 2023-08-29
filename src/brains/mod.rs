@@ -9,7 +9,7 @@ use tokio::sync::{
 
 use self::{
     replay_buffer::PpoBuffer,
-    thinkers::{ppo::PpoThinker, RandomThinker, Status, Thinker},
+    thinkers::{ppo::PpoThinker, Status, Thinker},
 };
 use crate::{envs::Env, FrameStack, TbWriter, Timestamp};
 

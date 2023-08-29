@@ -13,7 +13,6 @@ use bevy_rapier2d::prelude::*;
 
 use burn_tensor::backend::Backend;
 use envs::{
-    ffa::Ffa,
     maps::{tdm::TdmMap, Map},
     tdm::Tdm,
     Env,

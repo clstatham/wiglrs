@@ -20,11 +20,11 @@ use bevy_tasks::AsyncComputeTaskPool;
 use crate::{
     brains::{
         replay_buffer::{PpoBuffer, PpoMetadata, Sart},
-        thinkers::{ppo::PpoThinker, RandomThinker},
+        thinkers::ppo::PpoThinker,
         AgentThinker, Brain, BrainBank,
     },
     ui::LogText,
-    FrameStack, Timestamp, Wall,
+    FrameStack, Timestamp,
 };
 
 use super::{maps::Map, Action, Env, Observation};
@@ -79,11 +79,11 @@ pub struct OtherState {
 }
 
 impl Observation<Ffa> for OtherState {
-    fn new_frame_stack(params: &<Ffa as Env>::Params) -> FrameStack<Self> {
+    fn new_frame_stack(_params: &<Ffa as Env>::Params) -> FrameStack<Self> {
         unimplemented!()
     }
 
-    fn as_vec(&self, params: &<Ffa as Env>::Params) -> Vec<f32> {
+    fn as_slice(&self, _params: &<Ffa as Env>::Params) -> Box<[f32]> {
         vec![
             self.rel_pos.x / 2000.0,
             self.rel_pos.y / 2000.0,
@@ -93,6 +93,7 @@ impl Observation<Ffa> for OtherState {
             self.direction.y,
             if self.firing { 1.0 } else { 0.0 },
         ]
+        .into_boxed_slice()
     }
 }
 
@@ -134,7 +135,7 @@ impl Observation<Ffa> for FfaObs {
         )
     }
 
-    fn as_vec(&self, params: &FfaParams) -> Vec<f32> {
+    fn as_slice(&self, params: &FfaParams) -> Box<[f32]> {
         let mut out = vec![
             self.pos.x / 2000.0,
             self.pos.y / 2000.0,
@@ -159,7 +160,7 @@ impl Observation<Ffa> for FfaObs {
                 if other.firing { 1.0 } else { 0.0 },
             ]);
         }
-        out
+        out.into_boxed_slice()
     }
 }
 
@@ -185,13 +186,14 @@ impl Action<Ffa> for FfaAction {
         }
     }
 
-    fn as_vec(&self, _params: &FfaParams) -> Vec<f32> {
+    fn as_slice(&self, _params: &FfaParams) -> Box<[f32]> {
         vec![
             self.lin_force.x,
             self.lin_force.y,
             self.ang_force,
             self.shoot,
         ]
+        .into_boxed_slice()
     }
 
     fn metadata(&self) -> Self::Metadata {

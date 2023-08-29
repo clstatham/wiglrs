@@ -321,7 +321,7 @@ impl<B: Backend> PpoCritic<B> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Module)]
 pub struct HiddenStates<B: Backend> {
     pub actor_com_h: Tensor<B, 2>,
     pub actor_mu_h: Tensor<B, 2>,
@@ -331,8 +331,8 @@ pub struct HiddenStates<B: Backend> {
 
 #[derive(Debug, Clone, Default)]
 pub struct PpoStatus {
-    pub recent_mu: Vec<f32>,
-    pub recent_std: Vec<f32>,
+    pub recent_mu: Box<[f32]>,
+    pub recent_std: Box<[f32]>,
     pub recent_entropy: f32,
     pub recent_policy_loss: f32,
     pub recent_value_loss: f32,
@@ -434,11 +434,11 @@ where
         metadata: &mut Self::Metadata,
         params: &E::Params,
     ) -> Option<E::Action> {
-        let hiddens = metadata.clone();
+        let hiddens = metadata.clone().to_device(&TchDevice::Cpu);
         let obs = obs
             .as_vec()
             .into_iter()
-            .map(|o| Tensor::from_floats(o.as_vec(params).as_slice()).unsqueeze::<2>())
+            .map(|o| Tensor::from_floats(&*o.as_slice(params)).unsqueeze::<2>())
             .collect::<Vec<_>>();
         let obs = Tensor::cat(obs, 0).unsqueeze();
         let (mu, std) = self.actor.valid().forward(
@@ -447,8 +447,8 @@ where
             &mut metadata.actor_mu_h,
             &mut metadata.actor_std_h,
         );
-        self.status.recent_mu = mu.to_data().value;
-        self.status.recent_std = std.to_data().value;
+        self.status.recent_mu = mu.to_data().value.into_boxed_slice();
+        self.status.recent_std = std.to_data().value.into_boxed_slice();
         let dist = MvNormal {
             mu,
             cov_diag: std.clone() * std,
@@ -500,7 +500,7 @@ where
                         stack
                             .as_vec()
                             .into_iter()
-                            .map(|x| Tensor::from_floats(x.as_vec(params).as_slice()).unsqueeze())
+                            .map(|x| Tensor::from_floats(&*x.as_slice(params)).unsqueeze())
                             .collect::<Vec<_>>(),
                         1,
                     )
@@ -510,7 +510,7 @@ where
             let a = step
                 .action
                 .iter()
-                .map(|action| Tensor::from_floats(action.as_vec(params).as_slice()).unsqueeze())
+                .map(|action| Tensor::from_floats(&*action.as_slice(params)).unsqueeze())
                 .collect::<Vec<_>>();
             let a: Tensor<Be, 2> = Tensor::cat(a, 0);
             let old_lp = step
@@ -549,10 +549,11 @@ where
                     })
                     .multiunzip();
 
-            let mut actor_com_h = Tensor::from_inner(Tensor::cat(actor_com_h, 0));
-            let mut actor_mu_h = Tensor::from_inner(Tensor::cat(actor_mu_h, 0));
-            let mut actor_std_h = Tensor::from_inner(Tensor::cat(actor_std_h, 0));
-            let mut critic_h = Tensor::from_inner(Tensor::cat(critic_h, 0));
+            let dev = &self.actor.devices()[0];
+            let mut actor_com_h = Tensor::from_inner(Tensor::cat(actor_com_h, 0)).to_device(dev);
+            let mut actor_mu_h = Tensor::from_inner(Tensor::cat(actor_mu_h, 0)).to_device(dev);
+            let mut actor_std_h = Tensor::from_inner(Tensor::cat(actor_std_h, 0)).to_device(dev);
+            let mut critic_h = Tensor::from_inner(Tensor::cat(critic_h, 0)).to_device(dev);
             let (mu, std) = self.actor.forward(
                 s.clone(),
                 &mut actor_com_h,

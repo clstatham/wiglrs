@@ -6,11 +6,12 @@ use self::maps::Map;
 
 pub mod ffa;
 pub mod maps;
+pub mod modules;
 pub mod tdm;
 
 pub trait Action<E: Env> {
     type Metadata: Default;
-    fn as_vec(&self, params: &E::Params) -> Vec<f32>;
+    fn as_slice(&self, params: &E::Params) -> Box<[f32]>;
     fn from_slice(v: &[f32], metadata: Self::Metadata, params: &E::Params) -> Self;
     fn metadata(&self) -> Self::Metadata;
 }
@@ -19,7 +20,7 @@ pub trait Observation<E: Env>
 where
     Self: Sized,
 {
-    fn as_vec(&self, params: &E::Params) -> Vec<f32>;
+    fn as_slice(&self, params: &E::Params) -> Box<[f32]>;
     fn new_frame_stack(params: &E::Params) -> FrameStack<Self>;
 }
 
