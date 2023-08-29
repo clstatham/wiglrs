@@ -531,10 +531,8 @@ impl<B: Backend> Ltc<B> {
         let dev = &self.devices()[0];
         let [nbatch, nseq, nfeat] = xs.shape().dims;
         let nout = self.cell.output_len;
-        let mut h = h
-            .unwrap_or(Tensor::zeros([nbatch, self.cell.units]))
-            .to_device(dev);
-        let mut outputs = Tensor::zeros([nbatch, nseq, nout]).to_device(dev);
+        let mut h = h.unwrap_or(Tensor::zeros_device([nbatch, self.cell.units], dev));
+        let mut outputs = Tensor::zeros_device([nbatch, nseq, nout], dev);
 
         for i in 0..nseq {
             let x: Tensor<B, 2> = xs.clone().slice([0..nbatch, i..i + 1, 0..nfeat]).squeeze(1);
@@ -737,8 +735,8 @@ impl<B: Backend> Cfc<B> {
             .iter()
             .map(|l| l.ff1.weight.shape().dims[1])
             .sum::<usize>();
-        let mut h = h.unwrap_or(Tensor::zeros([nbatch, nhidden])).to_device(dev);
-        let mut outputs = Tensor::zeros([nbatch, nseq, nout]).to_device(dev);
+        let mut h = h.unwrap_or(Tensor::zeros_device([nbatch, nhidden], dev));
+        let mut outputs = Tensor::zeros_device([nbatch, nseq, nout], dev);
 
         for i in 0..nseq {
             let x: Tensor<B, 2> = xs.clone().slice([0..nbatch, i..i + 1, 0..nfeat]).squeeze(1);

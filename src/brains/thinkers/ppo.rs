@@ -173,9 +173,8 @@ impl<B: Backend> GruCell<B> {
         let dev = &self.devices()[0];
         let [nbatch, _] = x.shape().dims;
         let [nhidden] = self.b_h.shape().dims;
-        let mut h = h.unwrap_or(Tensor::zeros([nbatch, nhidden])).to_device(dev);
+        let mut h = h.unwrap_or(Tensor::zeros_device([nbatch, nhidden], dev));
 
-        // let x: Tensor<B, 2> = xs.clone().slice([0..nbatch, i..i + 1, 0..nfeat]).squeeze(1);
         let z = sigmoid(
             x.clone().matmul(self.w_xz.val())
                 + h.clone().matmul(self.w_hz.val())
