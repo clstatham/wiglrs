@@ -1,10 +1,13 @@
 use bevy::prelude::*;
 
 use self::{
-    replay_buffer::PpoBuffer,
+    replay_buffer::{PpoBuffer, PpoMetadata},
     thinkers::{ppo::PpoThinker, Status, Thinker},
 };
-use crate::{envs::Env, FrameStack, TbWriter, Timestamp};
+use crate::{
+    envs::{Action, Env},
+    FrameStack, TbWriter, Timestamp,
+};
 
 pub mod replay_buffer;
 pub mod thinkers;
@@ -56,7 +59,10 @@ impl<E: Env, T: Thinker<E>> Brain<E, T> {
         action
     }
 
-    pub fn learn(&mut self, frame_count: usize, rb: &PpoBuffer<E>, params: &E::Params) {
+    pub fn learn(&mut self, frame_count: usize, rb: &PpoBuffer<E>, params: &E::Params)
+    where
+        E::Action: Action<E, Metadata = PpoMetadata>,
+    {
         self.thinker.learn(rb, params);
         let status = self.thinker.status();
         status.log(&mut self.writer, frame_count);

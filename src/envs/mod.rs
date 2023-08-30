@@ -7,36 +7,35 @@ pub mod maps;
 pub mod modules;
 pub mod tdm;
 
-pub trait Action<E: Env> {
+pub trait Action<E: Env + ?Sized>: Clone + Default {
     type Metadata: Default;
     fn as_slice(&self, params: &E::Params) -> Box<[f32]>;
     fn from_slice(v: &[f32], metadata: Self::Metadata, params: &E::Params) -> Self;
     fn metadata(&self) -> Self::Metadata;
 }
 
-pub trait Observation<E: Env>
+pub trait Observation: Clone
 where
     Self: Sized,
 {
-    fn as_slice(&self, params: &E::Params) -> Box<[f32]>;
+    fn as_slice<P: Params>(&self, params: &P) -> Box<[f32]>;
 }
 
-pub trait DefaultFrameStack<E: Env>: Observation<E> {
+pub trait DefaultFrameStack<E: Env + ?Sized>: Observation {
     fn default_frame_stack(params: &E::Params) -> FrameStack<Self>;
 }
 
 pub trait Params {
     fn agent_radius(&self) -> f32;
     fn agent_max_health(&self) -> f32;
+    fn num_agents(&self) -> usize;
+    fn agent_frame_stack_len(&self) -> usize;
 }
 
-pub trait Env: Resource
-where
-    Self: Sized,
-{
+pub trait Env: Resource {
     type Params: Params + Default + Resource + Send + Sync;
-    type Observation: Observation<Self> + DefaultFrameStack<Self> + Component + Send + Sync + Clone;
-    type Action: Action<Self> + Component + Default + Send + Sync + Clone;
+    type Observation: Observation + DefaultFrameStack<Self> + Component + Send + Sync;
+    type Action: Action<Self> + Component + Send + Sync;
 
     fn init() -> Self;
 

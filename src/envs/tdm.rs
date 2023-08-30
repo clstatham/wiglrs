@@ -45,6 +45,14 @@ impl TdmParams {
 }
 
 impl Params for TdmParams {
+    fn num_agents(&self) -> usize {
+        self.ffa_params.num_agents
+    }
+
+    fn agent_frame_stack_len(&self) -> usize {
+        self.ffa_params.agent_frame_stack_len
+    }
+
     fn agent_radius(&self) -> f32 {
         self.ffa_params.agent_radius
     }
@@ -128,8 +136,8 @@ lazy_static::lazy_static! {
     pub static ref BASE_OBS_LEN: usize = PhysicalProperties::len() + CombatProperties::len() + MapInteractionProperties::len();
 }
 
-impl Observation<Tdm> for TdmObs {
-    fn as_slice(&self, _params: &<Tdm as Env>::Params) -> Box<[f32]> {
+impl Observation for TdmObs {
+    fn as_slice<P: Params>(&self, _params: &P) -> Box<[f32]> {
         let mut out = self.phys.as_slice().to_vec();
         out.extend_from_slice(&self.combat.as_slice());
         out.extend_from_slice(&self.map_interaction.as_slice());
@@ -150,7 +158,7 @@ impl Observation<Tdm> for TdmObs {
 }
 
 impl DefaultFrameStack<Tdm> for TdmObs {
-    fn default_frame_stack(params: &<Tdm as Env>::Params) -> crate::FrameStack<Self> {
+    fn default_frame_stack(params: &TdmParams) -> crate::FrameStack<Self> {
         let this = Self {
             phys: Default::default(),
             combat: Default::default(),
@@ -332,7 +340,6 @@ fn observation(
         left_wall_dist: params.ffa_params.distance_scaling,
         right_wall_dist: params.ffa_params.distance_scaling,
     };
-
     queries
         .iter()
         .for_each(|(agent, my_team, _action, velocity, transform, health)| {
@@ -351,7 +358,7 @@ fn observation(
                     .iter()
                     .filter(|q| q.0 != agent)
                     .sorted_by_key(|(_, _, _, _, t, _)| {
-                        t.translation.distance_squared(transform.translation) as i64
+                        t.translation.distance(transform.translation) as i64
                     })
             {
                 if my_team.0 == other_team.0 {
@@ -434,8 +441,10 @@ fn get_reward(
     names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
 ) {
+    for mut reward in rewards.iter_mut() {
+        reward.0 = 0.0;
+    }
     for agent_ent in agents.iter() {
-        rewards.get_mut(agent_ent).unwrap().0 = 0.0;
         let my_health = health.get(agent_ent).unwrap();
         let my_t = agent_transform.get(agent_ent).unwrap();
         if let Ok(action) = actions.get(agent_ent).cloned() {

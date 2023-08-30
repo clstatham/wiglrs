@@ -12,7 +12,7 @@ use crate::{
     FrameStack, TbWriter,
 };
 
-use super::replay_buffer::PpoBuffer;
+use super::replay_buffer::{PpoBuffer, PpoMetadata};
 
 pub mod ncp;
 pub mod ppo;
@@ -36,7 +36,9 @@ pub trait Thinker<E: Env>: Send + Sync + 'static {
         metadata: &mut Self::Metadata,
         params: &E::Params,
     ) -> Option<E::Action>;
-    fn learn(&mut self, b: &PpoBuffer<E>, params: &E::Params);
+    fn learn(&mut self, b: &PpoBuffer<E>, params: &E::Params)
+    where
+        E::Action: Action<E, Metadata = PpoMetadata>;
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>;
     fn init_metadata(&self, batch_size: usize) -> Self::Metadata;
     fn status(&self) -> Self::Status;
@@ -90,7 +92,10 @@ impl<E: Env, T: Thinker<E>> Thinker<E> for SharedThinker<E, T> {
     ) -> Option<E::Action> {
         self.lock().act(obs, metadata, params)
     }
-    fn learn(&mut self, b: &PpoBuffer<E>, params: &E::Params) {
+    fn learn(&mut self, b: &PpoBuffer<E>, params: &E::Params)
+    where
+        E::Action: Action<E, Metadata = PpoMetadata>,
+    {
         self.lock().learn(b, params)
     }
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
@@ -130,7 +135,11 @@ impl<E: Env> Thinker<E> for RandomThinker {
         ))
     }
 
-    fn learn(&mut self, _b: &PpoBuffer<E>, _params: &<E as Env>::Params) {}
+    fn learn(&mut self, _b: &PpoBuffer<E>, _params: &<E as Env>::Params)
+    where
+        E::Action: Action<E, Metadata = PpoMetadata>,
+    {
+    }
 
     fn save(&self, _path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())

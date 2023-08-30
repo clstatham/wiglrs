@@ -3,7 +3,7 @@
 use burn::{
     config::Config,
     module::{ADModule, Module, ModuleVisitor, Param, ParamId},
-    nn::Initializer,
+    nn::{Initializer, Linear, LinearConfig},
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -210,11 +210,10 @@ impl<B: Backend<FloatElem = f32>> ModuleVisitor<B> for CheckNanWeights {
 #[derive(Module, Debug)]
 pub struct PpoActor<B: Backend> {
     common: Cfc<B>,
-    mu_head: Cfc<B>,
-    std_head: Cfc<B>,
+    mu_head: Linear<B>,
+    std_head: Linear<B>,
     obs_len: usize,
     com_units: usize,
-    mustd_units: usize,
 }
 
 #[derive(Config, Debug)]
@@ -227,24 +226,17 @@ pub struct PpoActorConfig {
 impl PpoActorConfig {
     pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoActor<B> {
         let wiring_com = FullyConnected::new(self.obs_len, self.hidden_len, true);
-        let wiring_mu = FullyConnected::new(self.hidden_len, self.hidden_len, true);
-        let wiring_std = FullyConnected::new(self.hidden_len, self.hidden_len, true);
 
         PpoActor {
             obs_len: self.obs_len,
             com_units: wiring_com.units(),
-            mustd_units: wiring_mu.units(),
             common: CfcConfig::new(self.obs_len, self.hidden_len).init(
                 wiring_com,
                 CfcMode::MixedMemory,
                 CfcCellMode::Default,
             ),
-            mu_head: CfcConfig::new(self.hidden_len, self.hidden_len)
-                .with_projected_len(self.action_len)
-                .init(wiring_mu, CfcMode::MixedMemory, CfcCellMode::Default),
-            std_head: CfcConfig::new(self.hidden_len, self.hidden_len)
-                .with_projected_len(self.action_len)
-                .init(wiring_std, CfcMode::MixedMemory, CfcCellMode::Default),
+            mu_head: LinearConfig::new(self.hidden_len, self.action_len).init(),
+            std_head: LinearConfig::new(self.hidden_len, self.action_len).init(),
         }
     }
 }
@@ -253,16 +245,13 @@ impl<B: Backend<FloatElem = f32>> PpoActor<B> {
         &mut self,
         x: Tensor<B, 3>,
         common_h: &mut Tensor<B, 2>,
-        mu_h: &mut Tensor<B, 2>,
-        std_h: &mut Tensor<B, 2>,
     ) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let x = x.to_device(&self.devices()[0]);
 
         let (x, ch) = self.common.forward(x, Some(common_h.clone()));
         *common_h = ch;
-        let x = x.tanh();
-        let (mu, mh) = self.mu_head.forward(x.clone(), Some(mu_h.clone()));
-        *mu_h = mh;
+        // let x = x.tanh();
+        let mu = self.mu_head.forward(x.clone());
         let [nbatch, nstack, nfeat] = mu.shape().dims;
         let mu = mu
             .clone()
@@ -270,8 +259,7 @@ impl<B: Backend<FloatElem = f32>> PpoActor<B> {
             .squeeze(1);
         let mu = mu.tanh();
 
-        let (std, sh) = self.std_head.forward(x, Some(std_h.clone()));
-        *std_h = sh;
+        let std = self.std_head.forward(x);
         let [nbatch, nstack, nfeat] = std.shape().dims;
         let std = std
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
@@ -324,8 +312,6 @@ impl<B: Backend> PpoCritic<B> {
 #[derive(Debug, Module)]
 pub struct HiddenStates<B: Backend> {
     pub actor_com_h: Tensor<B, 2>,
-    pub actor_mu_h: Tensor<B, 2>,
-    pub actor_std_h: Tensor<B, 2>,
     pub critic_h: Tensor<B, 2>,
 }
 
@@ -391,14 +377,14 @@ impl PpoThinker {
         }
         .init()
         .fork(&TchDevice::Cuda(0));
-        // dbg!(actor.num_params());
+        dbg!(actor.num_params());
         let critic = PpoCriticConfig {
             obs_len,
             hidden_len,
         }
         .init()
         .fork(&TchDevice::Cuda(0));
-        // dbg!(critic.num_params());
+        dbg!(critic.num_params());
         let actor_optim = RMSPropConfig::new().with_momentum(0.0).init();
         let critic_optim = RMSPropConfig::new().with_momentum(0.0).init();
         Self {
@@ -432,8 +418,6 @@ where
         let dev = self.actor.devices()[0];
         HiddenStates {
             actor_com_h: Tensor::zeros_device([batch_size, self.actor.com_units], &dev),
-            actor_mu_h: Tensor::zeros_device([batch_size, self.actor.mustd_units], &dev),
-            actor_std_h: Tensor::zeros_device([batch_size, self.actor.mustd_units], &dev),
             critic_h: Tensor::zeros_device([batch_size, self.critic.rnn_units], &dev),
         }
     }
@@ -451,12 +435,10 @@ where
             .map(|o| Tensor::from_floats(&*o.as_slice(params)).unsqueeze::<2>())
             .collect::<Vec<_>>();
         let obs = Tensor::cat(obs, 0).unsqueeze();
-        let (mu, std) = self.actor.valid().forward(
-            obs.clone(),
-            &mut metadata.actor_com_h,
-            &mut metadata.actor_mu_h,
-            &mut metadata.actor_std_h,
-        );
+        let (mu, std) = self
+            .actor
+            .valid()
+            .forward(obs.clone(), &mut metadata.actor_com_h);
         self.status.recent_mu = mu.to_data().value.into_boxed_slice();
         self.status.recent_std = std.to_data().value.into_boxed_slice();
         let dist = MvNormal {
@@ -545,31 +527,19 @@ where
             let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
                 / (advantage.var(0).sqrt() + 1e-7);
 
-            let (actor_com_h, actor_mu_h, actor_std_h, critic_h): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
-                step.action
-                    .into_iter()
-                    .map(|hs| {
-                        let hiddens = hs.metadata().hiddens.as_ref().unwrap().to_owned();
-                        (
-                            hiddens.actor_com_h,
-                            hiddens.actor_mu_h,
-                            hiddens.actor_std_h,
-                            hiddens.critic_h,
-                        )
-                    })
-                    .multiunzip();
+            let (actor_com_h, critic_h): (Vec<_>, Vec<_>) = step
+                .action
+                .into_iter()
+                .map(|hs| {
+                    let hiddens = hs.metadata().hiddens.as_ref().unwrap().to_owned();
+                    (hiddens.actor_com_h, hiddens.critic_h)
+                })
+                .multiunzip();
 
             let dev = &self.actor.devices()[0];
             let mut actor_com_h = Tensor::from_inner(Tensor::cat(actor_com_h, 0)).to_device(dev);
-            let mut actor_mu_h = Tensor::from_inner(Tensor::cat(actor_mu_h, 0)).to_device(dev);
-            let mut actor_std_h = Tensor::from_inner(Tensor::cat(actor_std_h, 0)).to_device(dev);
             let mut critic_h = Tensor::from_inner(Tensor::cat(critic_h, 0)).to_device(dev);
-            let (mu, std) = self.actor.forward(
-                s.clone(),
-                &mut actor_com_h,
-                &mut actor_mu_h,
-                &mut actor_std_h,
-            );
+            let (mu, std) = self.actor.forward(s.clone(), &mut actor_com_h);
             let dist = MvNormal {
                 mu,
                 cov_diag: std.clone() * std,

@@ -60,7 +60,7 @@ impl Default for FfaParams {
     fn default() -> Self {
         Self {
             num_agents: 4,
-            agent_hidden_dim: 128,
+            agent_hidden_dim: 32,
             agent_actor_lr: 1e-5,
             agent_critic_lr: 1e-4,
             agent_training_epochs: 25,
@@ -80,6 +80,14 @@ impl Default for FfaParams {
 }
 
 impl Params for FfaParams {
+    fn num_agents(&self) -> usize {
+        self.num_agents
+    }
+
+    fn agent_frame_stack_len(&self) -> usize {
+        self.agent_frame_stack_len
+    }
+
     fn agent_radius(&self) -> f32 {
         self.agent_radius
     }
@@ -127,8 +135,8 @@ pub struct OtherState {
     pub firing: bool,
 }
 
-impl Observation<Ffa> for OtherState {
-    fn as_slice(&self, _params: &FfaParams) -> Box<[f32]> {
+impl Observation for OtherState {
+    fn as_slice<P: Params>(&self, _params: &P) -> Box<[f32]> {
         let mut out = self.phys.as_slice().to_vec();
         out.extend_from_slice(&self.combat.as_slice());
         out.extend_from_slice(&self.map_inter.as_slice());
@@ -149,8 +157,8 @@ pub struct FfaObs {
 
 pub const BASE_STATE_LEN: usize = 6 + 1 + 4;
 
-impl Observation<Ffa> for FfaObs {
-    fn as_slice(&self, params: &FfaParams) -> Box<[f32]> {
+impl Observation for FfaObs {
+    fn as_slice<P: Params>(&self, params: &P) -> Box<[f32]> {
         let mut out = self.phys.as_slice().to_vec();
         out.extend_from_slice(&self.combat.as_slice());
         out.extend_from_slice(&self.map_inter.as_slice());
@@ -169,9 +177,9 @@ impl DefaultFrameStack<Ffa> for FfaObs {
                     phys: Default::default(),
                     combat: Default::default(),
                     map_inter: Default::default(),
-                    other_states: vec![OtherState::default(); params.num_agents - 1],
+                    other_states: vec![OtherState::default(); params.num_agents() - 1],
                 };
-                params.agent_frame_stack_len
+                params.agent_frame_stack_len()
             ]
             .into(),
         )
@@ -348,7 +356,10 @@ pub struct Deaths(pub usize);
 pub struct Name(pub String);
 
 #[derive(Bundle)]
-pub struct AgentBundle<E: Env, T: Thinker<E>> {
+pub struct AgentBundle<E: Env, T: Thinker<E>>
+where
+    E::Action: Action<E, Metadata = PpoMetadata>,
+{
     pub rb: RigidBody,
     pub col: Collider,
     pub rest: Restitution,
@@ -661,8 +672,10 @@ fn get_reward(
     names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
 ) {
+    for mut reward in rewards.iter_mut() {
+        reward.0 = 0.0;
+    }
     for agent_ent in agents.iter() {
-        rewards.get_mut(agent_ent).unwrap().0 = 0.0;
         let my_health = health.get(agent_ent).unwrap();
         let my_t = agent_transform.get(agent_ent).unwrap();
         if let Ok(action) = actions.get(agent_ent).cloned() {
