@@ -1,3 +1,5 @@
+use bevy_prng::ChaCha8Rng;
+use bevy_rand::prelude::EntropyComponent;
 use rand::seq::SliceRandom;
 
 lazy_static::lazy_static! {
@@ -103,6 +105,6 @@ Keenan".split_ascii_whitespace();
     };
 }
 
-pub fn random_name() -> String {
-    NAMES.choose(&mut rand::thread_rng()).unwrap().to_owned()
+pub fn random_name(rng: &mut EntropyComponent<ChaCha8Rng>) -> String {
+    NAMES.choose(rng).unwrap().to_owned()
 }

@@ -1,4 +1,6 @@
 use bevy::prelude::*;
+use bevy_prng::ChaCha8Rng;
+use bevy_rand::prelude::EntropyComponent;
 
 use self::{
     replay_buffer::{PpoBuffer, PpoMetadata},
@@ -49,8 +51,9 @@ impl<E: Env, T: Thinker<E>> Brain<E, T> {
         &mut self,
         obs: &FrameStack<E::Observation>,
         params: &E::Params,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Option<E::Action> {
-        let action = self.thinker.act(obs, &mut self.metadata, params);
+        let action = self.thinker.act(obs, &mut self.metadata, params, rng);
         if let Some(ref action) = action {
             self.last_action = action.clone();
         }
@@ -59,11 +62,16 @@ impl<E: Env, T: Thinker<E>> Brain<E, T> {
         action
     }
 
-    pub fn learn(&mut self, frame_count: usize, rb: &PpoBuffer<E>, params: &E::Params)
-    where
+    pub fn learn(
+        &mut self,
+        frame_count: usize,
+        rb: &mut PpoBuffer<E>,
+        params: &E::Params,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) where
         E::Action: Action<E, Metadata = PpoMetadata>,
     {
-        self.thinker.learn(rb, params);
+        self.thinker.learn(rb, params, rng);
         let status = self.thinker.status();
         status.log(&mut self.writer, frame_count);
     }

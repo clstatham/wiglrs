@@ -30,6 +30,8 @@ tokio = { version = "1.32.0", features = ["sync"] }
 futures-lite = "1.13.0"
 bevy_framepace = "0.13.3"
 derive_more = "0.99.17"
+bevy_rand = "0.3.0"
+bevy_prng = { version = "0.1.0", features = ["rand_chacha"] }
 # [profile.dev.package."*"]
 # opt-level = 3
 

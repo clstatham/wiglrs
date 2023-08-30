@@ -2,8 +2,12 @@ use bevy::prelude::*;
 use bevy::{core::FrameCount, math::Vec3Swizzles};
 use bevy_egui::egui::plot::{Bar, BarChart, Line};
 use bevy_egui::EguiContexts;
+use bevy_prng::ChaCha8Rng;
+use bevy_rand::prelude::EntropyComponent;
+use bevy_rand::resource::GlobalEntropy;
 use bevy_rapier2d::prelude::*;
 use itertools::Itertools;
+use rand_distr::{Distribution, Uniform};
 
 use crate::brains::thinkers::ppo::PpoParams;
 use crate::brains::thinkers::Thinker;
@@ -261,9 +265,11 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     timestamp: Res<Timestamp>,
+    mut rng: ResMut<GlobalEntropy<ChaCha8Rng>>,
 ) {
     let mut taken_names = vec![];
     for team_id in 0..params.num_teams {
+        let mut rng_comp = EntropyComponent::from(&mut rng);
         let thinker = SharedThinker::<Tdm, _>::new(PpoThinker::new(
             *BASE_OBS_LEN
                 + *TEAMMATE_OBS_LEN * (params.agents_per_team() - 1)
@@ -275,26 +281,26 @@ fn setup(
             params.ffa_params.agent_entropy_beta,
             params.ffa_params.agent_actor_lr,
             params.ffa_params.agent_critic_lr,
+            &mut rng_comp,
         ));
+
         for _ in 0..params.agents_per_team() {
-            let mut name = names::random_name();
+            let mut name = names::random_name(&mut rng_comp);
             while taken_names.contains(&name) {
-                name = names::random_name();
+                name = names::random_name(&mut rng_comp);
             }
+            let dist = Uniform::new(-250.0, 250.0);
+            let agent_pos = Vec3::new(dist.sample(&mut rng_comp), dist.sample(&mut rng_comp), 0.0);
             taken_names.push(name.clone());
-            let pos = Vec3::new(
-                (rand::random::<f32>() - 0.5) * 500.0,
-                (rand::random::<f32>() - 0.5) * 500.0,
-                0.0,
-            );
             let mut agent = AgentBundle::<Tdm, _>::new(
-                pos,
+                agent_pos,
                 Some(params.team_colors[team_id]),
                 name.clone(),
                 Brain::<Tdm, _>::new(thinker.clone(), name, timestamp.clone()),
-                &mut meshes,
-                &mut materials,
+                meshes.reborrow(),
+                materials.reborrow(),
                 &*params,
+                &mut rng,
             );
             agent.health = Health(params.ffa_params.agent_max_health);
             let id = commands
@@ -407,6 +413,7 @@ fn action(
             &FrameStack<TdmObs>,
             &mut Brain<Tdm, SharedThinker<Tdm, PpoThinker>>,
             &mut TdmAction,
+            &mut EntropyComponent<ChaCha8Rng>,
         ),
         With<Agent>,
     >,
@@ -415,8 +422,8 @@ fn action(
     if frame_count.0 as usize % params.ffa_params.agent_frame_stack_len == 0 {
         obs_brains_actions
             .par_iter_mut()
-            .for_each_mut(|(obs, mut brain, mut actions)| {
-                let action = brain.act(obs, &*params);
+            .for_each_mut(|(obs, mut brain, mut actions, mut rng)| {
+                let action = brain.act(obs, &*params, &mut rng);
                 if let Some(action) = action {
                     *actions = action;
                 }

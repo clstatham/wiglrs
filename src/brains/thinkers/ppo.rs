@@ -1,5 +1,7 @@
 #![allow(clippy::single_range_in_vec_init)]
 
+use bevy_prng::ChaCha8Rng;
+use bevy_rand::prelude::EntropyComponent;
 use burn::{
     config::Config,
     module::{ADModule, Module, ModuleVisitor, Param, ParamId},
@@ -36,14 +38,19 @@ pub struct MvNormal<B: Backend<FloatElem = f32>> {
 }
 
 impl<B: Backend<FloatElem = f32>> MvNormal<B> {
-    pub fn sample(&self) -> Tensor<B, 2> {
+    pub fn sample(&self, rng: &mut EntropyComponent<ChaCha8Rng>) -> Tensor<B, 2> {
         let std = self.cov_diag.clone().sqrt();
         let [_, nfeat] = self.mu.shape().dims;
         let cov = std.to_data().value;
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
-        let z = Tensor::random([nbatch, nfeat], burn_tensor::Distribution::Normal(0.0, 1.0))
+        let mut sampler = burn_tensor::Distribution::<f32>::Normal(0.0, 1.0).sampler(rng);
+        let samples = (0..nbatch * nfeat).map(|_| sampler.sample()).collect_vec();
+        let z = Tensor::from_floats(samples.as_slice())
+            .reshape([nbatch, nfeat])
             .to_device(&self.mu.device());
+        // let z = Tensor::random([nbatch, nfeat]).to_device(&self.mu.device());
+
         self.mu.clone() + z * std
     }
 
@@ -224,8 +231,11 @@ pub struct PpoActorConfig {
 }
 
 impl PpoActorConfig {
-    pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoActor<B> {
-        let wiring_com = FullyConnected::new(self.obs_len, self.hidden_len, true);
+    pub fn init<B: Backend<FloatElem = f32>>(
+        &self,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) -> PpoActor<B> {
+        let wiring_com = FullyConnected::new(self.obs_len, self.hidden_len, true, rng);
 
         PpoActor {
             obs_len: self.obs_len,
@@ -284,8 +294,11 @@ pub struct PpoCriticConfig {
 }
 
 impl PpoCriticConfig {
-    pub fn init<B: Backend<FloatElem = f32>>(&self) -> PpoCritic<B> {
-        let wiring = FullyConnected::new(self.obs_len, self.hidden_len, true);
+    pub fn init<B: Backend<FloatElem = f32>>(
+        &self,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) -> PpoCritic<B> {
+        let wiring = FullyConnected::new(self.obs_len, self.hidden_len, true, rng);
         PpoCritic {
             obs_len: self.obs_len,
             rnn_units: wiring.units(),
@@ -369,20 +382,21 @@ impl PpoThinker {
         entropy_beta: f32,
         actor_lr: f64,
         critic_lr: f64,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Self {
         let actor = PpoActorConfig {
             obs_len,
             hidden_len,
             action_len,
         }
-        .init()
+        .init(rng)
         .fork(&TchDevice::Cuda(0));
         dbg!(actor.num_params());
         let critic = PpoCriticConfig {
             obs_len,
             hidden_len,
         }
-        .init()
+        .init(rng)
         .fork(&TchDevice::Cuda(0));
         dbg!(critic.num_params());
         let actor_optim = RMSPropConfig::new().with_momentum(0.0).init();
@@ -427,6 +441,7 @@ where
         obs: &FrameStack<E::Observation>,
         metadata: &mut Self::Metadata,
         params: &E::Params,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Option<E::Action> {
         let hiddens = metadata.clone().to_device(&TchDevice::Cpu);
         let obs = obs
@@ -446,7 +461,7 @@ where
             cov_diag: std.clone() * std,
         };
         self.status.recent_entropy = dist.entropy().into_scalar();
-        let action = dist.sample().clamp(-1.0, 1.0);
+        let action = dist.sample(rng).clamp(-1.0, 1.0);
         let val = self.critic.valid().forward(obs, &mut metadata.critic_h);
 
         let action_vec = action.to_data().value;
@@ -461,7 +476,12 @@ where
         ))
     }
 
-    fn learn(&mut self, rb: &PpoBuffer<E>, params: &E::Params) {
+    fn learn(
+        &mut self,
+        rb: &mut PpoBuffer<E>,
+        params: &E::Params,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) {
         let mut nstep = 0;
 
         let mut total_pi_loss = 0.0;
@@ -471,7 +491,7 @@ where
         for _epoch in kdam::tqdm!(0..self.training_epochs, desc = "Training") {
             nstep += 1;
 
-            let step = rb.sample_batch(self.training_batch_size).unwrap();
+            let step = rb.sample_batch(self.training_batch_size, rng).unwrap();
             let returns = Tensor::from_floats(
                 step.returns
                     .iter()

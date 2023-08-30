@@ -1,5 +1,7 @@
 //! implementation of https://github.com/mlech26l/ncps/
 
+use bevy_prng::ChaCha8Rng;
+use bevy_rand::prelude::EntropyComponent;
 use burn::{
     config::Config,
     module::{Module, Param, ParamId},
@@ -10,7 +12,7 @@ use burn::{
 use burn_tensor::Distribution;
 use itertools::Itertools;
 
-use rand::{seq::SliceRandom, thread_rng};
+use rand::seq::SliceRandom;
 
 use super::ppo::{sigmoid, GruCell, GruCellConfig};
 
@@ -93,7 +95,12 @@ impl<B: Backend> WiringConfig<B> for FullyConnected<B> {
 }
 
 impl<B: Backend> FullyConnected<B> {
-    pub fn new(input_dim: usize, output_dim: usize, self_connections: bool) -> Self {
+    pub fn new(
+        input_dim: usize,
+        output_dim: usize,
+        self_connections: bool,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) -> Self {
         let mut this = Wiring {
             adj_matrix: Tensor::zeros([output_dim, output_dim]),
             sensory_adj_matrix: Tensor::zeros([input_dim, output_dim]),
@@ -104,7 +111,7 @@ impl<B: Backend> FullyConnected<B> {
                     continue;
                 }
                 let polarity = [Polarity::Negative, Polarity::Positive, Polarity::Positive]
-                    .choose(&mut thread_rng())
+                    .choose(rng)
                     .copied()
                     .unwrap();
                 this.add_synapse(from, to, polarity);
@@ -113,7 +120,7 @@ impl<B: Backend> FullyConnected<B> {
         for from in 0..input_dim {
             for to in 0..output_dim {
                 let polarity = [Polarity::Negative, Polarity::Positive, Polarity::Positive]
-                    .choose(&mut thread_rng())
+                    .choose(rng)
                     .copied()
                     .unwrap();
                 this.add_sensory_synapse(from, to, polarity);
@@ -205,6 +212,7 @@ impl<B: Backend> Ncp<B> {
         inter_fanout: usize,
         recurrent_command_synapses: usize,
         motor_fanin: usize,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Ncp<B> {
         let units = inter_neurons + command_neurons + motor_neurons;
         let sensory = (0..sensory_neurons).collect_vec();
@@ -221,12 +229,12 @@ impl<B: Backend> Ncp<B> {
         // sensory -> inter layer
         let mut unreachable_inter_neurons = inter.clone();
         for src in sensory.iter() {
-            for dest in inter.choose_multiple(&mut thread_rng(), sensory_fanout) {
+            for dest in inter.choose_multiple(rng, sensory_fanout) {
                 if unreachable_inter_neurons.contains(dest) {
                     unreachable_inter_neurons.retain(|n| *n != *dest);
                 }
                 let polarity = [Polarity::Negative, Polarity::Positive]
-                    .choose(&mut thread_rng())
+                    .choose(rng)
                     .unwrap();
                 this.add_sensory_synapse(*src, *dest, *polarity);
             }
@@ -235,9 +243,9 @@ impl<B: Backend> Ncp<B> {
             (sensory_neurons as f32 * sensory_fanout as f32 / inter_neurons as f32) as usize;
         let mean_inter_neuron_fanin = mean_inter_neuron_fanin.clamp(1, sensory_neurons);
         for dest in unreachable_inter_neurons {
-            for src in sensory.choose_multiple(&mut thread_rng(), mean_inter_neuron_fanin) {
+            for src in sensory.choose_multiple(rng, mean_inter_neuron_fanin) {
                 let polarity = [Polarity::Negative, Polarity::Positive]
-                    .choose(&mut thread_rng())
+                    .choose(rng)
                     .unwrap();
                 this.add_sensory_synapse(*src, dest, *polarity);
             }
@@ -246,12 +254,12 @@ impl<B: Backend> Ncp<B> {
         // inter -> command layer
         let mut unreachable_command_neurons = command.clone();
         for src in inter.iter() {
-            for dest in command.choose_multiple(&mut thread_rng(), inter_fanout) {
+            for dest in command.choose_multiple(rng, inter_fanout) {
                 if unreachable_command_neurons.contains(dest) {
                     unreachable_command_neurons.retain(|n| *n != *dest);
                 }
                 let polarity = [Polarity::Negative, Polarity::Positive]
-                    .choose(&mut thread_rng())
+                    .choose(rng)
                     .unwrap();
                 this.add_synapse(*src, *dest, *polarity);
             }
@@ -260,9 +268,9 @@ impl<B: Backend> Ncp<B> {
             (inter_neurons as f32 * inter_fanout as f32 / command_neurons as f32) as usize;
         let mean_command_neuron_fanin = mean_command_neuron_fanin.clamp(1, command_neurons);
         for dest in unreachable_command_neurons {
-            for src in inter.choose_multiple(&mut thread_rng(), mean_command_neuron_fanin) {
+            for src in inter.choose_multiple(rng, mean_command_neuron_fanin) {
                 let polarity = [Polarity::Negative, Polarity::Positive]
-                    .choose(&mut thread_rng())
+                    .choose(rng)
                     .unwrap();
                 this.add_synapse(*src, dest, *polarity);
             }
@@ -270,10 +278,10 @@ impl<B: Backend> Ncp<B> {
 
         // recurrent command layer
         for _ in 0..recurrent_command_synapses {
-            let src = command.choose(&mut thread_rng()).unwrap();
-            let dest = command.choose(&mut thread_rng()).unwrap();
+            let src = command.choose(rng).unwrap();
+            let dest = command.choose(rng).unwrap();
             let polarity = [Polarity::Negative, Polarity::Positive]
-                .choose(&mut thread_rng())
+                .choose(rng)
                 .unwrap();
             this.add_synapse(*src, *dest, *polarity);
         }
@@ -281,12 +289,12 @@ impl<B: Backend> Ncp<B> {
         // command -> motor layer
         let mut unreachable_command_neurons = command.clone();
         for dest in motor.iter() {
-            for src in command.choose_multiple(&mut thread_rng(), motor_fanin) {
+            for src in command.choose_multiple(rng, motor_fanin) {
                 if unreachable_command_neurons.contains(src) {
                     unreachable_command_neurons.retain(|n| *n != *src);
                 }
                 let polarity = [Polarity::Negative, Polarity::Positive]
-                    .choose(&mut thread_rng())
+                    .choose(rng)
                     .unwrap();
                 this.add_synapse(*src, *dest, *polarity);
             }
@@ -295,9 +303,9 @@ impl<B: Backend> Ncp<B> {
             (motor_neurons as f32 * motor_fanin as f32 / command_neurons as f32) as usize;
         let mean_command_fanout = mean_command_fanout.clamp(1, motor_neurons);
         for src in unreachable_command_neurons {
-            for dest in motor.choose_multiple(&mut thread_rng(), mean_command_fanout) {
+            for dest in motor.choose_multiple(rng, mean_command_fanout) {
                 let polarity = [Polarity::Negative, Polarity::Positive]
-                    .choose(&mut thread_rng())
+                    .choose(rng)
                     .unwrap();
                 this.add_synapse(src, *dest, *polarity);
             }
@@ -317,6 +325,7 @@ impl<B: Backend> Ncp<B> {
         units: usize,
         output_dim: usize,
         sparsity_level: Option<f32>,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Ncp<B> {
         let sparsity_level = sparsity_level.unwrap_or(0.5);
         let density_level = 1.0 - sparsity_level;
@@ -337,6 +346,7 @@ impl<B: Backend> Ncp<B> {
             inter_fanout,
             recurrent_command_synapses,
             motor_fanin,
+            rng,
         )
     }
 }

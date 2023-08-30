@@ -7,6 +7,8 @@ use bevy_egui::{
     EguiContexts,
 };
 
+use bevy_prng::ChaCha8Rng;
+use bevy_rand::{prelude::EntropyComponent, resource::GlobalEntropy};
 use itertools::Itertools;
 
 use bevy::{
@@ -14,6 +16,7 @@ use bevy::{
     sprite::MaterialMesh2dBundle,
 };
 use bevy_rapier2d::prelude::*;
+use rand_distr::{Distribution, Uniform};
 
 use crate::{
     brains::{
@@ -380,6 +383,7 @@ where
     pub replay_buffer: PpoBuffer<E>,
     pub reward: Reward,
     pub terminal: Terminal,
+    pub rng: EntropyComponent<ChaCha8Rng>,
     marker: Agent,
 }
 impl<E: Env, T: Thinker<E>> AgentBundle<E, T>
@@ -392,11 +396,13 @@ where
         color: Option<Color>,
         name: String,
         brain: Brain<E, T>,
-        meshes: &mut ResMut<Assets<Mesh>>,
-        materials: &mut ResMut<Assets<ColorMaterial>>,
+        mut meshes: Mut<Assets<Mesh>>,
+        mut materials: Mut<Assets<ColorMaterial>>,
         params: &E::Params,
+        rng: &mut ResMut<GlobalEntropy<ChaCha8Rng>>,
     ) -> Self {
         Self {
+            rng: EntropyComponent::from(rng),
             obs: E::Observation::default_frame_stack(params),
             action: E::Action::default(),
             replay_buffer: PpoBuffer::new(Some(params.agent_rb_max_len())),
@@ -488,15 +494,16 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     timestamp: Res<Timestamp>,
+    mut rng: ResMut<GlobalEntropy<ChaCha8Rng>>,
 ) {
     let mut taken_names = vec![];
     let obs_len = OTHER_STATE_LEN * (params.num_agents - 1) + BASE_STATE_LEN;
-
     for _ in 0..params.num_agents {
+        let mut rng_comp = EntropyComponent::from(&mut rng);
         let ts = timestamp.clone();
-        let mut name = crate::names::random_name();
+        let mut name = crate::names::random_name(&mut rng_comp);
         while taken_names.contains(&name) {
-            name = crate::names::random_name();
+            name = crate::names::random_name(&mut rng_comp);
         }
         taken_names.push(name.clone());
         let brain_name = name.clone();
@@ -509,23 +516,20 @@ fn setup(
             params.agent_entropy_beta,
             params.agent_actor_lr,
             params.agent_critic_lr,
+            &mut EntropyComponent::from(&mut rng),
         );
-        // let thinker = RandomThinker;
-        // let brain_id = brains.insert(|| Brain::new(thinker, brain_name, ts));
-        let agent_pos = Vec3::new(
-            (rand::random::<f32>() - 0.5) * 500.0,
-            (rand::random::<f32>() - 0.5) * 500.0,
-            0.0,
-        );
+        let dist = Uniform::new(-250.0, 250.0);
+        let agent_pos = Vec3::new(dist.sample(&mut rng_comp), dist.sample(&mut rng_comp), 0.0);
         let color = Color::rgb(rand::random(), rand::random(), rand::random());
         let mut agent = AgentBundle::<Ffa, PpoThinker>::new(
             agent_pos,
             Some(color),
             name,
             Brain::new(thinker, brain_name, ts),
-            &mut meshes,
-            &mut materials,
+            meshes.reborrow(),
+            materials.reborrow(),
             &params,
+            &mut rng,
         );
         agent.health = Health(params.agent_max_health);
         let id = commands
@@ -637,6 +641,7 @@ fn get_action(
             &FrameStack<FfaObs>,
             &mut Brain<Ffa, PpoThinker>,
             &mut FfaAction,
+            &mut EntropyComponent<ChaCha8Rng>,
         ),
         With<Agent>,
     >,
@@ -645,8 +650,8 @@ fn get_action(
     if frame_count.0 as usize % params.agent_frame_stack_len == 0 {
         obs_brains_actions
             .par_iter_mut()
-            .for_each_mut(|(obs, mut brain, mut actions)| {
-                let action = brain.act(obs, &*params);
+            .for_each_mut(|(obs, mut brain, mut actions, mut rng)| {
+                let action = brain.act(obs, &*params, &mut rng);
                 if let Some(action) = action {
                     // if let Some(action) = status.last_action {
                     *actions = action;
@@ -824,6 +829,7 @@ pub fn check_dead<E: Env>(
     mut deaths: Query<&mut Deaths, With<Agent>>,
     mut rbs: Query<&mut PpoBuffer<E>, With<Agent>>,
     mut agent_transform: Query<&mut Transform, With<Agent>>,
+    mut rng: ResMut<GlobalEntropy<ChaCha8Rng>>,
 ) where
     E::Action: Action<E, Metadata = PpoMetadata>,
 {
@@ -836,11 +842,9 @@ pub fn check_dead<E: Env>(
 
             deaths.get_mut(agent_ent).unwrap().0 += 1;
             my_health.0 = params.agent_max_health();
-            let agent_pos = Vec3::new(
-                (rand::random::<f32>() - 0.5) * 500.0,
-                (rand::random::<f32>() - 0.5) * 500.0,
-                0.0,
-            );
+            let dist = Uniform::new(-250.0, 250.0);
+            let mut rng_comp = EntropyComponent::from(&mut rng);
+            let agent_pos = Vec3::new(dist.sample(&mut rng_comp), dist.sample(&mut rng_comp), 0.0);
             agent_transform.get_mut(agent_ent).unwrap().translation = agent_pos;
         }
     }
@@ -848,7 +852,16 @@ pub fn check_dead<E: Env>(
 
 pub fn learn<E: Env, T>(
     params: Res<E::Params>,
-    mut query: Query<(&PpoBuffer<E>, &Deaths, &Name, &mut Brain<E, T>), With<Agent>>,
+    mut query: Query<
+        (
+            &mut EntropyComponent<ChaCha8Rng>,
+            &mut PpoBuffer<E>,
+            &Deaths,
+            &Name,
+            &mut Brain<E, T>,
+        ),
+        With<Agent>,
+    >,
     frame_count: Res<FrameCount>,
     mut log: ResMut<LogText>,
 ) where
@@ -859,12 +872,12 @@ pub fn learn<E: Env, T>(
     if frame_count.0 > 1 && frame_count.0 as usize % params.agent_update_interval() == 0 {
         query
             .par_iter_mut()
-            .for_each_mut(|(rb, deaths, _name, mut brain)| {
+            .for_each_mut(|(mut rng, mut rb, deaths, _name, mut brain)| {
                 if deaths.0 > 0 {
-                    brain.learn(frame_count.0 as usize, rb, &*params);
+                    brain.learn(frame_count.0 as usize, &mut *rb, &*params, &mut rng);
                 }
             });
-        for (_, _, name, brain) in query.iter() {
+        for (_, _, _, name, brain) in query.iter() {
             let status = Thinker::<E>::status(&brain.thinker);
             log.push(format!(
                 "{} Policy Loss: {}",

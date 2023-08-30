@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
+use bevy_prng::ChaCha8Rng;
+use bevy_rand::prelude::EntropyComponent;
 use burn_tch::TchBackend;
+use rand::seq::IteratorRandom;
 
 use crate::{
     envs::{
@@ -78,6 +81,21 @@ pub struct PpoBuffer<E: Env> {
     current_trajectory_start: usize,
 }
 
+impl<E: Env> Default for PpoBuffer<E> {
+    fn default() -> Self {
+        Self {
+            obs: VecDeque::default(),
+            action: VecDeque::default(),
+            reward: VecDeque::default(),
+            advantage: VecDeque::default(),
+            returns: VecDeque::default(),
+            terminal: VecDeque::default(),
+            current_trajectory_start: 0,
+            max_len: None,
+        }
+    }
+}
+
 impl<E: Env> Clone for PpoBuffer<E> {
     fn clone(&self) -> Self {
         Self {
@@ -89,21 +107,6 @@ impl<E: Env> Clone for PpoBuffer<E> {
             advantage: self.advantage.clone(),
             terminal: self.terminal.clone(),
             current_trajectory_start: self.current_trajectory_start,
-        }
-    }
-}
-
-impl<E: Env> Default for PpoBuffer<E> {
-    fn default() -> Self {
-        Self {
-            max_len: None,
-            obs: VecDeque::default(),
-            action: VecDeque::default(),
-            reward: VecDeque::default(),
-            advantage: VecDeque::default(),
-            returns: VecDeque::default(),
-            terminal: VecDeque::default(),
-            current_trajectory_start: 0,
         }
     }
 }
@@ -188,12 +191,14 @@ where
         self.current_trajectory_start = 0;
     }
 
-    pub fn sample_batch(&self, batch_size: usize) -> Option<PpoBuffer<E>> {
-        use rand::prelude::*;
-
+    pub fn sample_batch(
+        &mut self,
+        batch_size: usize,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) -> Option<PpoBuffer<E>> {
         let end_of_last_traj = self.obs.len() - self.current_trajectory_start;
         let mut idxs = vec![0; batch_size];
-        (0..end_of_last_traj).choose_multiple_fill(&mut thread_rng(), &mut idxs);
+        (0..end_of_last_traj).choose_multiple_fill(rng, &mut idxs);
         let mut batch = PpoBuffer::default();
         for i in idxs {
             batch.obs.push_back(self.obs[i].to_owned());

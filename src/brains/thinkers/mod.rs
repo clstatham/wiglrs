@@ -4,7 +4,8 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use rand::thread_rng;
+use bevy_prng::ChaCha8Rng;
+use bevy_rand::prelude::EntropyComponent;
 use rand_distr::Distribution;
 
 use crate::{
@@ -35,9 +36,14 @@ pub trait Thinker<E: Env>: Send + Sync + 'static {
         obs: &FrameStack<E::Observation>,
         metadata: &mut Self::Metadata,
         params: &E::Params,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Option<E::Action>;
-    fn learn(&mut self, b: &PpoBuffer<E>, params: &E::Params)
-    where
+    fn learn(
+        &mut self,
+        b: &mut PpoBuffer<E>,
+        params: &E::Params,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) where
         E::Action: Action<E, Metadata = PpoMetadata>;
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>;
     fn init_metadata(&self, batch_size: usize) -> Self::Metadata;
@@ -89,14 +95,19 @@ impl<E: Env, T: Thinker<E>> Thinker<E> for SharedThinker<E, T> {
         obs: &FrameStack<E::Observation>,
         metadata: &mut Self::Metadata,
         params: &E::Params,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Option<E::Action> {
-        self.lock().act(obs, metadata, params)
+        self.lock().act(obs, metadata, params, rng)
     }
-    fn learn(&mut self, b: &PpoBuffer<E>, params: &E::Params)
-    where
+    fn learn(
+        &mut self,
+        b: &mut PpoBuffer<E>,
+        params: &E::Params,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) where
         E::Action: Action<E, Metadata = PpoMetadata>,
     {
-        self.lock().learn(b, params)
+        self.lock().learn(b, params, rng)
     }
     fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         self.lock().save(path)
@@ -121,12 +132,13 @@ impl<E: Env> Thinker<E> for RandomThinker {
         _obs: &FrameStack<<E as Env>::Observation>,
         _metadata: &mut Self::Metadata,
         params: &<E as Env>::Params,
+        rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Option<<E as Env>::Action> {
         let len = E::Action::default().as_slice(params).len();
         let dist = rand_distr::Uniform::new(-1.0, 1.0);
         let mut out = vec![];
         for _ in 0..len {
-            out.push(dist.sample(&mut thread_rng()));
+            out.push(dist.sample(rng));
         }
         Some(E::Action::from_slice(
             &out,
@@ -135,8 +147,12 @@ impl<E: Env> Thinker<E> for RandomThinker {
         ))
     }
 
-    fn learn(&mut self, _b: &PpoBuffer<E>, _params: &<E as Env>::Params)
-    where
+    fn learn(
+        &mut self,
+        _b: &mut PpoBuffer<E>,
+        _params: &<E as Env>::Params,
+        _rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) where
         E::Action: Action<E, Metadata = PpoMetadata>,
     {
     }

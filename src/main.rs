@@ -9,8 +9,10 @@ use bevy::{
     winit::WinitSettings,
 };
 use bevy_egui::EguiPlugin;
+use bevy_prng::ChaCha8Rng;
 use bevy_rapier2d::prelude::*;
 
+use bevy_rand::prelude::*;
 use burn_tensor::backend::Backend;
 use envs::{
     ffa::Ffa,
@@ -137,8 +139,7 @@ fn handle_input(
         }
     }
 }
-
-fn run_env<E: Env, M: Map>() {
+fn run_env<E: Env, M: Map>(seed: [u8; 32]) {
     App::new()
         .insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
@@ -148,6 +149,7 @@ fn run_env<E: Env, M: Map>() {
         .insert_resource(Timestamp::default())
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
+        .add_plugins(EntropyPlugin::<ChaCha8Rng>::with_seed(seed))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 present_mode: bevy::window::PresentMode::AutoNoVsync,
@@ -186,6 +188,8 @@ fn run_env<E: Env, M: Map>() {
 }
 
 fn main() {
-    burn_tch::TchBackend::<f32>::seed(rand::random());
-    run_env::<Tdm, TdmMap>();
+    let tch_seed: u64 = 0xcafebabe;
+    let bevy_seed: [u8; 32] = [42; 32];
+    burn_tch::TchBackend::<f32>::seed(tch_seed);
+    run_env::<Tdm, TdmMap>(bevy_seed);
 }
