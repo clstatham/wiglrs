@@ -2,12 +2,10 @@ use bevy::{ecs::schedule::SystemConfigs, prelude::*};
 
 use crate::FrameStack;
 
-use self::maps::Map;
-
 pub mod ffa;
 pub mod maps;
 pub mod modules;
-// pub mod tdm;
+pub mod tdm;
 
 pub trait Action<E: Env> {
     type Metadata: Default;
@@ -41,7 +39,7 @@ where
 
     fn init() -> Self;
 
-    fn setup_system<M: Map>() -> SystemConfigs;
+    fn setup_system() -> SystemConfigs;
     fn observation_system() -> SystemConfigs;
     fn action_system() -> SystemConfigs;
     fn reward_system() -> SystemConfigs;

@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use bevy_tasks::AsyncComputeTaskPool;
+use bevy_tasks::ComputeTaskPool;
 
 use std::{collections::BTreeMap, sync::atomic::AtomicUsize};
 use tokio::sync::{
@@ -75,10 +75,8 @@ impl<E: Env, T: Thinker<E>> Brain<E, T> {
 
     pub fn learn(&mut self, frame_count: usize, rb: &PpoBuffer<E>, params: &E::Params) {
         self.thinker.learn(rb, params);
-        let net_reward = rb.reward.iter().sum::<f32>();
         let status = self.thinker.status();
         status.log(&mut self.writer, frame_count);
-        self.writer.add_scalar("Reward", net_reward, frame_count);
     }
 
     pub async fn poll(&mut self) -> BrainStatus<E, T> {
@@ -102,6 +100,13 @@ impl<E: Env, T: Thinker<E>> Brain<E, T> {
                         status: Some(status),
                         meta: Some(meta),
                     })
+                }
+                BrainControl::NewReward {
+                    reward,
+                    frame_count,
+                } => {
+                    self.writer.add_scalar("Reward", reward, frame_count);
+                    BrainStatus::Ready
                 }
                 BrainControl::Learn {
                     frame_count,
@@ -165,6 +170,10 @@ pub enum BrainControl<E: Env> {
         obs: FrameStack<<E as Env>::Observation>,
         frame_count: usize,
         params: <E as Env>::Params,
+    },
+    NewReward {
+        reward: f32,
+        frame_count: usize,
     },
     Learn {
         rb: PpoBuffer<E>,
@@ -236,7 +245,7 @@ where
         frame_count: usize,
         params: E::Params,
     ) {
-        AsyncComputeTaskPool::get().scope(|scope| {
+        ComputeTaskPool::get().scope(|scope| {
             scope.spawn(async {
                 self.txs
                     .get(&brain)
@@ -245,6 +254,22 @@ where
                         obs,
                         frame_count,
                         params,
+                    })
+                    .await
+                    .unwrap();
+            })
+        });
+    }
+
+    pub fn send_reward(&self, brain: usize, reward: f32, frame_count: usize) {
+        ComputeTaskPool::get().scope(|scope| {
+            scope.spawn(async {
+                self.txs
+                    .get(&brain)
+                    .unwrap()
+                    .send(BrainControl::NewReward {
+                        reward,
+                        frame_count,
                     })
                     .await
                     .unwrap();
@@ -276,7 +301,7 @@ where
                     self.statuses.insert(brain, status);
                 }
                 BrainStatus::Wait(waker) => {
-                    AsyncComputeTaskPool::get().scope(|scope| {
+                    ComputeTaskPool::get().scope(|scope| {
                         scope.spawn(async {
                             waker.await.unwrap();
                         })

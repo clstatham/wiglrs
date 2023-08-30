@@ -182,7 +182,7 @@ fn run_env<E: Env, M: Map, T: Thinker<E> + 'static>() {
         .insert_resource(E::Params::default())
         .insert_resource(BrainBank::<E, T>::default())
         .add_systems(Startup, setup)
-        .add_systems(Startup, E::setup_system::<M>())
+        .add_systems(Startup, (M::setup_system(), E::setup_system()).chain())
         .add_systems(Update, E::ui_system())
         .add_systems(Update, handle_input)
         .add_systems(Update, E::main_system())

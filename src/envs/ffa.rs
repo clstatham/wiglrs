@@ -14,7 +14,7 @@ use bevy::{
     sprite::MaterialMesh2dBundle,
 };
 use bevy_rapier2d::prelude::*;
-use bevy_tasks::AsyncComputeTaskPool;
+use bevy_tasks::ComputeTaskPool;
 
 use crate::{
     brains::{
@@ -27,7 +27,6 @@ use crate::{
 };
 
 use super::{
-    maps::Map,
     modules::{
         map_interaction::MapInteractionProperties, Behavior, CombatBehaviors, CombatProperties,
         PhysicalBehaviors, PhysicalProperties, Property,
@@ -58,15 +57,15 @@ pub struct FfaParams {
 impl Default for FfaParams {
     fn default() -> Self {
         Self {
-            num_agents: 6,
+            num_agents: 4,
             agent_hidden_dim: 128,
             agent_actor_lr: 1e-5,
             agent_critic_lr: 1e-4,
             agent_training_epochs: 25,
             agent_training_batch_size: 128,
             agent_entropy_beta: 0.001,
-            agent_update_interval: 2_000,
-            agent_rb_max_len: 50_000,
+            agent_update_interval: 1_000,
+            agent_rb_max_len: 100_000,
             agent_frame_stack_len: 5,
             agent_radius: 20.0,
             agent_lin_move_force: 600.0,
@@ -401,8 +400,8 @@ impl Env for Ffa {
         Self
     }
 
-    fn setup_system<M: Map>() -> SystemConfigs {
-        (M::setup_system(), setup).chain()
+    fn setup_system() -> SystemConfigs {
+        setup.chain()
     }
 
     fn observation_system() -> SystemConfigs {
@@ -414,7 +413,7 @@ impl Env for Ffa {
     }
 
     fn reward_system() -> SystemConfigs {
-        get_reward.chain()
+        (get_reward, send_reward).chain()
     }
 
     fn terminal_system() -> SystemConfigs {
@@ -714,6 +713,22 @@ fn get_reward(
     }
 }
 
+fn send_reward(
+    agents: Query<Entity, With<Agent>>,
+    frame_count: Res<FrameCount>,
+    rewards: Query<&Reward, With<Agent>>,
+    brains: ResMut<BrainBank<Ffa, PpoThinker>>,
+    brain_ids: Query<&BrainId, With<Agent>>,
+) {
+    for agent_ent in agents.iter() {
+        brains.send_reward(
+            brain_ids.get(agent_ent).unwrap().0,
+            rewards.get(agent_ent).unwrap().0,
+            frame_count.0 as usize,
+        );
+    }
+}
+
 fn get_terminal(
     mut terminals: Query<&mut Terminal, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
@@ -843,7 +858,7 @@ fn learn(
                 let name = &names.get(agent_ent).unwrap().0;
                 log.push(format!("Training {id} {name}..."));
 
-                AsyncComputeTaskPool::get().scope(|scope| {
+                ComputeTaskPool::get().scope(|scope| {
                     scope.spawn(async {
                         brains.learn(id, frame_count.0 as usize, rb, *params).await;
                     });
