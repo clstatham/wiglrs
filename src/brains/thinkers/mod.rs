@@ -27,9 +27,9 @@ impl Status for () {
 }
 
 pub trait Thinker<E: Env> {
-    type Metadata: Clone;
-    type Status: Status + Clone + Default;
-    type ActionMetadata: Clone + Default;
+    type Metadata: Clone + Send + Sync;
+    type Status: Status + Clone + Default + Send + Sync;
+    type ActionMetadata: Clone + Default + Send + Sync;
     fn act(
         &mut self,
         obs: &FrameStack<E::Observation>,

@@ -2,6 +2,7 @@
 # linker = "clang"
 # rustflags = ["-Clink-arg=-fuse-ld=lld", "-Zshare-generics=y"]
 # runner = ".cargo/codelldb.sh"
+# rustflags = ["-Zsanitizer=thread"]
 
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"

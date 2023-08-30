@@ -7,7 +7,7 @@ use self::maps::Map;
 pub mod ffa;
 pub mod maps;
 pub mod modules;
-pub mod tdm;
+// pub mod tdm;
 
 pub trait Action<E: Env> {
     type Metadata: Default;
@@ -21,16 +21,23 @@ where
     Self: Sized,
 {
     fn as_slice(&self, params: &E::Params) -> Box<[f32]>;
-    fn new_frame_stack(params: &E::Params) -> FrameStack<Self>;
+}
+
+pub trait DefaultFrameStack<E: Env>: Observation<E> {
+    fn default_frame_stack(params: &E::Params) -> FrameStack<Self>;
+}
+
+pub trait Params {
+    fn agent_radius(&self) -> f32;
 }
 
 pub trait Env: Resource
 where
     Self: Sized,
 {
-    type Params: Default + Resource + Send + Sync;
-    type Observation: Observation<Self> + Send + Sync + Clone;
-    type Action: Action<Self> + Default + Send + Sync + Clone;
+    type Params: Params + Default + Resource + Send + Sync;
+    type Observation: Observation<Self> + DefaultFrameStack<Self> + Component + Send + Sync + Clone;
+    type Action: Action<Self> + Component + Default + Send + Sync + Clone;
 
     fn init() -> Self;
 

@@ -29,9 +29,9 @@ crossbeam-channel = "0.5.8"
 tokio = { version = "1.32.0", features = ["sync"] }
 futures-lite = "1.13.0"
 bevy_framepace = "0.13.3"
-
-[profile.dev.package."*"]
-opt-level = 3
+derive_more = "0.99.17"
+# [profile.dev.package."*"]
+# opt-level = 3
 
 [profile.release]
 debug = true

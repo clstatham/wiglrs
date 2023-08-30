@@ -28,7 +28,7 @@ use super::{
         NameText, NameTextBundle, ShootyLine, ShootyLineBundle,
     },
     maps::Map,
-    Action, Env, Observation,
+    Action, DefaultFrameStack, Env, Observation,
 };
 
 #[derive(Debug, Resource, Clone)]
@@ -81,8 +81,22 @@ pub struct TdmObs {
 pub const BASE_STATE_LEN: usize = ffa::BASE_STATE_LEN;
 
 impl Observation<Tdm> for TdmObs {
-    fn new_frame_stack(params: &<Tdm as Env>::Params) -> crate::FrameStack<Self> {
-        let ffa_fs = ffa::FfaObs::new_frame_stack(&params.ffa_params);
+    fn as_slice(&self, params: &<Tdm as Env>::Params) -> Box<[f32]> {
+        let mut out = self.ffa_state.as_slice(&params.ffa_params).to_vec();
+        for other in &self.teammate_states {
+            out.extend_from_slice(&other.ffa_state.as_slice(&params.ffa_params));
+        }
+        for other in &self.enemy_states {
+            out.extend_from_slice(&other.ffa_state.as_slice(&params.ffa_params));
+        }
+
+        out.into_boxed_slice()
+    }
+}
+
+impl DefaultFrameStack<Tdm> for TdmObs {
+    fn default_frame_stack(params: &<Tdm as Env>::Params) -> crate::FrameStack<Self> {
+        let ffa_fs = ffa::FfaObs::default_frame_stack(&params.ffa_params);
         let mut out = vec![];
         for mut ffa_fs in ffa_fs.as_vec() {
             ffa_fs.other_states.clear();
@@ -96,18 +110,6 @@ impl Observation<Tdm> for TdmObs {
             })
         }
         FrameStack(out.into())
-    }
-
-    fn as_slice(&self, params: &<Tdm as Env>::Params) -> Box<[f32]> {
-        let mut out = self.ffa_state.as_slice(&params.ffa_params).to_vec();
-        for other in &self.teammate_states {
-            out.extend_from_slice(&other.ffa_state.as_slice(&params.ffa_params));
-        }
-        for other in &self.enemy_states {
-            out.extend_from_slice(&other.ffa_state.as_slice(&params.ffa_params));
-        }
-
-        out.into_boxed_slice()
     }
 }
 
@@ -235,7 +237,7 @@ fn setup(
     timestamp: Res<Timestamp>,
 ) {
     let mut taken_names = vec![];
-    let obs_len = TdmObs::new_frame_stack(&env.params).0[0]
+    let obs_len = TdmObs::default_frame_stack(&env.params).0[0]
         .as_slice(&env.params)
         .len();
 
@@ -302,7 +304,7 @@ fn setup(
 
             let params = env.params.clone();
             env.observations
-                .insert(id, TdmObs::new_frame_stack(&params));
+                .insert(id, TdmObs::default_frame_stack(&params));
             env.rbs.insert(id, PpoBuffer::default());
             env.brains.assign_entity(brain_id, id);
         }

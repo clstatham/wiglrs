@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use bevy::prelude::Component;
 use burn_tch::TchBackend;
 
 use crate::{
@@ -62,6 +63,7 @@ pub struct PpoMetadata {
     pub hiddens: Option<HiddenStates<TchBackend<f32>>>,
 }
 
+#[derive(Component)]
 pub struct PpoBuffer<E: Env> {
     pub obs: VecDeque<FrameStack<E::Observation>>,
     pub action: VecDeque<E::Action>,
@@ -133,18 +135,20 @@ where
             terminal,
         } = step;
 
-        self.obs.push_back(obs);
-        self.action.push_back(action);
-        self.reward.push_back(reward);
-        self.terminal.push_back(terminal);
-        self.advantage.push_back(None);
-        self.returns.push_back(None);
+        if action.metadata().hiddens.is_some() {
+            self.obs.push_back(obs);
+            self.action.push_back(action);
+            self.reward.push_back(reward);
+            self.terminal.push_back(terminal);
+            self.advantage.push_back(None);
+            self.returns.push_back(None);
 
-        self.current_trajectory_start += 1;
-        if let Some(max_len) = max_len {
-            if self.current_trajectory_start >= max_len {
-                self.current_trajectory_start = max_len;
-                self.finish_trajectory(); // in case one of them is an ABSOLUTE GAMER and doesn't die for like 100_000 frames
+            self.current_trajectory_start += 1;
+            if let Some(max_len) = max_len {
+                if self.current_trajectory_start >= max_len {
+                    self.current_trajectory_start = max_len;
+                    self.finish_trajectory(); // in case one of them is an ABSOLUTE GAMER and doesn't die for like 100_000 frames
+                }
             }
         }
     }

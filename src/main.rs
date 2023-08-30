@@ -11,10 +11,15 @@ use bevy::{
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 
+use brains::{
+    thinkers::{ppo::PpoThinker, Thinker},
+    BrainBank,
+};
 use burn_tensor::backend::Backend;
 use envs::{
+    ffa::Ffa,
     maps::{tdm::TdmMap, Map},
-    tdm::Tdm,
+    // tdm::Tdm,
     Env,
 };
 use tensorboard_rs::summary_writer::SummaryWriter;
@@ -25,6 +30,7 @@ pub mod envs;
 pub mod names;
 pub mod ui;
 
+#[derive(Component)]
 pub struct FrameStack<O>(pub VecDeque<O>);
 
 impl<O> Clone for FrameStack<O>
@@ -135,7 +141,7 @@ fn handle_input(
     }
 }
 
-fn run_env<E: Env, M: Map>() {
+fn run_env<E: Env, M: Map, T: Thinker<E> + 'static>() {
     App::new()
         .insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
@@ -171,8 +177,10 @@ fn run_env<E: Env, M: Map>() {
         })
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
         // .add_plugins(RapierDebugRenderPlugin::default())
-        .insert_resource(E::init())
         .add_plugins(EguiPlugin)
+        .insert_resource(E::init())
+        .insert_resource(E::Params::default())
+        .insert_resource(BrainBank::<E, T>::default())
         .add_systems(Startup, setup)
         .add_systems(Startup, E::setup_system::<M>())
         .add_systems(Update, E::ui_system())
@@ -183,5 +191,5 @@ fn run_env<E: Env, M: Map>() {
 
 fn main() {
     burn_tch::TchBackend::<f32>::seed(rand::random());
-    run_env::<Tdm, TdmMap>();
+    run_env::<Ffa, TdmMap, PpoThinker>();
 }

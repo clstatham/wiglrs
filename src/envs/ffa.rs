@@ -6,7 +6,6 @@ use bevy_egui::{
     },
     EguiContexts,
 };
-use std::collections::BTreeMap;
 
 use itertools::Itertools;
 
@@ -21,13 +20,20 @@ use crate::{
     brains::{
         replay_buffer::{PpoBuffer, PpoMetadata, Sart},
         thinkers::ppo::PpoThinker,
-        AgentThinker, Brain, BrainBank,
+        Brain, BrainBank,
     },
     ui::LogText,
     FrameStack, Timestamp,
 };
 
-use super::{maps::Map, Action, Env, Observation};
+use super::{
+    maps::Map,
+    modules::{
+        map_interaction::MapInteractionProperties, Behavior, CombatBehaviors, CombatProperties,
+        PhysicalBehaviors, PhysicalProperties, Property,
+    },
+    Action, DefaultFrameStack, Env, Observation, Params,
+};
 
 #[derive(Debug, Resource, Clone, Copy)]
 pub struct FfaParams {
@@ -46,6 +52,7 @@ pub struct FfaParams {
     pub agent_ang_move_force: f32,
     pub agent_max_health: f32,
     pub agent_shoot_distance: f32,
+    pub distance_scaling: f32,
 }
 
 impl Default for FfaParams {
@@ -59,74 +66,74 @@ impl Default for FfaParams {
             agent_training_batch_size: 128,
             agent_entropy_beta: 0.001,
             agent_update_interval: 2_000,
-            agent_rb_max_len: 100_000,
+            agent_rb_max_len: 50_000,
             agent_frame_stack_len: 5,
             agent_radius: 20.0,
             agent_lin_move_force: 600.0,
             agent_ang_move_force: 1.0,
             agent_max_health: 100.0,
             agent_shoot_distance: 500.0,
+            distance_scaling: 1.0 / 2000.0,
         }
     }
 }
 
-#[derive(Default, Debug, Clone, Copy)]
+impl Params for FfaParams {
+    fn agent_radius(&self) -> f32 {
+        self.agent_radius
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct OtherState {
-    pub rel_pos: Vec2,
-    pub linvel: Vec2,
-    pub direction: Vec2,
+    pub phys: PhysicalProperties,
+    pub combat: CombatProperties,
+    pub map_inter: MapInteractionProperties,
     pub firing: bool,
 }
 
 impl Observation<Ffa> for OtherState {
-    fn new_frame_stack(_params: &<Ffa as Env>::Params) -> FrameStack<Self> {
-        unimplemented!()
-    }
-
-    fn as_slice(&self, _params: &<Ffa as Env>::Params) -> Box<[f32]> {
-        vec![
-            self.rel_pos.x / 2000.0,
-            self.rel_pos.y / 2000.0,
-            self.linvel.x / 2000.0,
-            self.linvel.y / 2000.0,
-            self.direction.x,
-            self.direction.y,
-            if self.firing { 1.0 } else { 0.0 },
-        ]
-        .into_boxed_slice()
+    fn as_slice(&self, _params: &FfaParams) -> Box<[f32]> {
+        let mut out = self.phys.as_slice().to_vec();
+        out.extend_from_slice(&self.combat.as_slice());
+        out.extend_from_slice(&self.map_inter.as_slice());
+        out.push(if self.firing { 1.0 } else { 0.0 });
+        out.into_boxed_slice()
     }
 }
 
-pub const OTHER_STATE_LEN: usize = 7;
+pub const OTHER_STATE_LEN: usize = 6 + 1 + 4 + 1;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Component)]
 pub struct FfaObs {
-    pub pos: Vec2,
-    pub linvel: Vec2,
-    pub direction: Vec2,
-    pub health: f32,
-    pub up_wall_dist: f32,
-    pub down_wall_dist: f32,
-    pub left_wall_dist: f32,
-    pub right_wall_dist: f32,
+    pub phys: PhysicalProperties,
+    pub combat: CombatProperties,
+    pub map_inter: MapInteractionProperties,
     pub other_states: Vec<OtherState>,
 }
 
-pub const BASE_STATE_LEN: usize = 11;
+pub const BASE_STATE_LEN: usize = 6 + 1 + 4;
 
 impl Observation<Ffa> for FfaObs {
-    fn new_frame_stack(params: &FfaParams) -> FrameStack<Self> {
+    fn as_slice(&self, params: &FfaParams) -> Box<[f32]> {
+        let mut out = self.phys.as_slice().to_vec();
+        out.extend_from_slice(&self.combat.as_slice());
+        out.extend_from_slice(&self.map_inter.as_slice());
+        for other in &self.other_states {
+            out.extend_from_slice(&other.as_slice(params));
+        }
+        out.into_boxed_slice()
+    }
+}
+
+impl DefaultFrameStack<Ffa> for FfaObs {
+    fn default_frame_stack(params: &FfaParams) -> FrameStack<Self> {
         FrameStack(
             vec![
                 Self {
-                    pos: Vec2::ZERO,
-                    linvel: Vec2::ZERO,
-                    direction: Vec2::ZERO,
-                    health: params.agent_max_health,
-                    up_wall_dist: 0.0,
-                    left_wall_dist: 0.0,
-                    right_wall_dist: 0.0,
-                    down_wall_dist: 0.0,
+                    phys: Default::default(),
+                    combat: Default::default(),
+                    map_inter: Default::default(),
                     other_states: vec![OtherState::default(); params.num_agents - 1],
                 };
                 params.agent_frame_stack_len
@@ -134,41 +141,12 @@ impl Observation<Ffa> for FfaObs {
             .into(),
         )
     }
-
-    fn as_slice(&self, params: &FfaParams) -> Box<[f32]> {
-        let mut out = vec![
-            self.pos.x / 2000.0,
-            self.pos.y / 2000.0,
-            self.linvel.x / 2000.0,
-            self.linvel.y / 2000.0,
-            self.direction.x,
-            self.direction.y,
-            self.up_wall_dist / 2000.0,
-            self.down_wall_dist / 2000.0,
-            self.left_wall_dist / 2000.0,
-            self.right_wall_dist / 2000.0,
-            self.health / params.agent_max_health,
-        ];
-        for other in &self.other_states {
-            out.extend_from_slice(&[
-                other.rel_pos.x / 2000.0,
-                other.rel_pos.y / 2000.0,
-                other.linvel.x / 2000.0,
-                other.linvel.y / 2000.0,
-                other.direction.x,
-                other.direction.y,
-                if other.firing { 1.0 } else { 0.0 },
-            ]);
-        }
-        out.into_boxed_slice()
-    }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Component)]
 pub struct FfaAction {
-    pub lin_force: Vec2,
-    pub ang_force: f32,
-    pub shoot: f32,
+    pub phys: PhysicalBehaviors,
+    pub combat: CombatBehaviors,
     pub metadata: PpoMetadata,
 }
 
@@ -179,21 +157,25 @@ impl Action<Ffa> for FfaAction {
 
     fn from_slice(action: &[f32], metadata: Self::Metadata, _params: &FfaParams) -> Self {
         Self {
-            lin_force: Vec2::new(action[0], action[1]).clamp(Vec2::splat(-1.0), Vec2::splat(1.0)),
-            ang_force: action[2].clamp(-1.0, 1.0),
-            shoot: action[3].clamp(-1.0, 1.0),
+            phys: PhysicalBehaviors {
+                force: Vec2::new(action[0], action[1]),
+                torque: action[2],
+            },
+            combat: CombatBehaviors {
+                shoot: action[3] > 0.0,
+            },
             metadata,
         }
     }
 
     fn as_slice(&self, _params: &FfaParams) -> Box<[f32]> {
-        vec![
-            self.lin_force.x,
-            self.lin_force.y,
-            self.ang_force,
-            self.shoot,
-        ]
-        .into_boxed_slice()
+        self.phys
+            .as_slice()
+            .iter()
+            .chain(self.combat.as_slice().iter())
+            .copied()
+            .collect_vec()
+            .into_boxed_slice()
     }
 
     fn metadata(&self) -> Self::Metadata {
@@ -316,6 +298,12 @@ impl HealthBarBundle {
 pub struct Agent;
 
 #[derive(Component)]
+pub struct Reward(pub f32);
+
+#[derive(Component)]
+pub struct Terminal(pub bool);
+
+#[derive(Component)]
 pub struct Kills(pub usize);
 
 #[derive(Component)]
@@ -328,7 +316,7 @@ pub struct BrainId(pub usize);
 pub struct Name(pub String);
 
 #[derive(Bundle)]
-pub struct FfaAgentBundle {
+pub struct AgentBundle<E: Env> {
     pub rb: RigidBody,
     pub col: Collider,
     pub rest: Restitution,
@@ -344,9 +332,14 @@ pub struct FfaAgentBundle {
     pub deaths: Deaths,
     pub brain_id: BrainId,
     pub name: Name,
-    pub marker: Agent,
+    pub obs: FrameStack<E::Observation>,
+    pub action: E::Action,
+    pub replay_buffer: PpoBuffer<E>,
+    pub reward: Reward,
+    pub terminal: Terminal,
+    marker: Agent,
 }
-impl FfaAgentBundle {
+impl<E: Env> AgentBundle<E> {
     pub fn new(
         pos: Vec3,
         color: Option<Color>,
@@ -354,12 +347,17 @@ impl FfaAgentBundle {
         brain_id: usize,
         meshes: &mut ResMut<Assets<Mesh>>,
         materials: &mut ResMut<Assets<ColorMaterial>>,
-        params: &FfaParams,
+        params: &E::Params,
     ) -> Self {
         Self {
+            obs: E::Observation::default_frame_stack(params),
+            action: E::Action::default(),
+            replay_buffer: PpoBuffer::default(),
+            reward: Reward(0.0),
+            terminal: Terminal(false),
             marker: Agent,
             rb: RigidBody::Dynamic,
-            col: Collider::ball(params.agent_radius),
+            col: Collider::ball(params.agent_radius()),
             rest: Restitution::coefficient(0.5),
             friction: Friction {
                 coefficient: 0.0,
@@ -377,12 +375,12 @@ impl FfaAgentBundle {
             mesh: MaterialMesh2dBundle {
                 material: materials.add(ColorMaterial::from(color.unwrap_or(Color::PURPLE))),
                 mesh: meshes
-                    .add(shape::Circle::new(params.agent_radius).into())
+                    .add(shape::Circle::new(params.agent_radius()).into())
                     .into(),
                 transform: Transform::from_translation(pos),
                 ..Default::default()
             },
-            health: Health(params.agent_max_health),
+            health: Health(0.0),
             name: Name(name),
             kills: Kills(0),
             deaths: Deaths(0),
@@ -392,15 +390,7 @@ impl FfaAgentBundle {
 }
 
 #[derive(Resource, Default)]
-pub struct Ffa {
-    pub params: FfaParams,
-    pub brains: BrainBank<Ffa, AgentThinker>,
-    pub rbs: BTreeMap<Entity, PpoBuffer<Ffa>>,
-    pub observations: BTreeMap<Entity, FrameStack<FfaObs>>,
-    pub actions: BTreeMap<Entity, FfaAction>,
-    pub rewards: BTreeMap<Entity, f32>,
-    pub terminals: BTreeMap<Entity, bool>,
-}
+pub struct Ffa;
 
 impl Env for Ffa {
     type Params = FfaParams;
@@ -408,7 +398,7 @@ impl Env for Ffa {
     type Action = FfaAction;
 
     fn init() -> Self {
-        Self::default()
+        Self
     }
 
     fn setup_system<M: Map>() -> SystemConfigs {
@@ -432,7 +422,7 @@ impl Env for Ffa {
     }
 
     fn update_system() -> SystemConfigs {
-        update.chain()
+        (update, store_sarts, check_dead).chain()
     }
 
     fn learn_system() -> SystemConfigs {
@@ -445,7 +435,8 @@ impl Env for Ffa {
 }
 
 fn setup(
-    mut env: ResMut<Ffa>,
+    params: Res<FfaParams>,
+    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -453,9 +444,9 @@ fn setup(
     timestamp: Res<Timestamp>,
 ) {
     let mut taken_names = vec![];
-    let obs_len = OTHER_STATE_LEN * (env.params.num_agents - 1) + BASE_STATE_LEN;
+    let obs_len = OTHER_STATE_LEN * (params.num_agents - 1) + BASE_STATE_LEN;
 
-    for _ in 0..env.params.num_agents {
+    for _ in 0..params.num_agents {
         let ts = timestamp.clone();
         let mut name = crate::names::random_name();
         while taken_names.contains(&name) {
@@ -465,33 +456,32 @@ fn setup(
         let brain_name = name.clone();
         let thinker = PpoThinker::new(
             obs_len,
-            env.params.agent_hidden_dim,
+            params.agent_hidden_dim,
             ACTION_LEN,
-            env.params.agent_training_epochs,
-            env.params.agent_training_batch_size,
-            env.params.agent_entropy_beta,
-            env.params.agent_actor_lr,
-            env.params.agent_critic_lr,
+            params.agent_training_epochs,
+            params.agent_training_batch_size,
+            params.agent_entropy_beta,
+            params.agent_actor_lr,
+            params.agent_critic_lr,
         );
         // let thinker = RandomThinker;
-        let brain_id = env
-            .brains
-            .spawn(|rx| Brain::new(thinker, brain_name, ts, rx));
+        let brain_id = brains.spawn(|rx| Brain::new(thinker, brain_name, ts, rx));
         let agent_pos = Vec3::new(
             (rand::random::<f32>() - 0.5) * 500.0,
             (rand::random::<f32>() - 0.5) * 500.0,
             0.0,
         );
         let color = Color::rgb(rand::random(), rand::random(), rand::random());
-        let agent = FfaAgentBundle::new(
+        let mut agent = AgentBundle::<Ffa>::new(
             agent_pos,
             Some(color),
             name,
             brain_id,
             &mut meshes,
             &mut materials,
-            &env.params,
+            &params,
         );
+        agent.health = Health(params.agent_max_health);
         let id = commands
             .spawn(agent)
             .insert(ActiveEvents::all())
@@ -504,7 +494,7 @@ fn setup(
                     parent,
                     meshes.reborrow(),
                     materials.reborrow(),
-                    env.params.agent_radius,
+                    params.agent_radius,
                 );
             })
             .id();
@@ -515,16 +505,14 @@ fn setup(
             id,
         ));
 
-        let params = env.params;
-        env.observations
-            .insert(id, FfaObs::new_frame_stack(&params));
-        env.rbs.insert(id, PpoBuffer::default());
-        env.brains.assign_entity(brain_id, id);
+        brains.assign_entity(brain_id, id);
     }
 }
 
 fn get_observation(
-    mut env: ResMut<Ffa>,
+    params: Res<FfaParams>,
+    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
+    mut observations: Query<&mut FrameStack<FfaObs>, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
     agent_velocity: Query<&Velocity, With<Agent>>,
     agent_transform: Query<&Transform, With<Agent>>,
@@ -532,103 +520,111 @@ fn get_observation(
     brain_ids: Query<&BrainId, With<Agent>>,
     cx: Res<RapierContext>,
 ) {
+    let phys_scaling = PhysicalProperties {
+        position: Vec2::splat(params.distance_scaling),
+        direction: Vec2::splat(1.0),
+        linvel: Vec2::splat(params.distance_scaling),
+    };
+    let map_scaling = MapInteractionProperties {
+        up_wall_dist: params.distance_scaling,
+        down_wall_dist: params.distance_scaling,
+        left_wall_dist: params.distance_scaling,
+        right_wall_dist: params.distance_scaling,
+    };
     for agent_ent in agents.iter() {
         let my_t = agent_transform.get(agent_ent).unwrap();
         let my_v = agent_velocity.get(agent_ent).unwrap();
         let my_h = agent_health.get(agent_ent).unwrap();
         let mut my_state = FfaObs {
-            pos: my_t.translation.xy(),
-            linvel: my_v.linvel,
-            direction: my_t.local_y().xy(),
-            health: my_h.0,
-            other_states: vec![OtherState::default(); env.params.num_agents - 1],
-            down_wall_dist: 0.0,
-            up_wall_dist: 0.0,
-            left_wall_dist: 0.0,
-            right_wall_dist: 0.0,
+            phys: PhysicalProperties {
+                position: my_t.translation.xy(),
+                direction: my_t.local_y().xy(),
+                linvel: my_v.linvel,
+            }
+            .scaled_by(&phys_scaling),
+            combat: CombatProperties { health: my_h.0 }.scaled_by(&CombatProperties {
+                health: 1.0 / params.agent_max_health,
+            }),
+            other_states: vec![],
+            map_inter: MapInteractionProperties::new(my_t, &cx).scaled_by(&map_scaling),
         };
 
-        let filter = QueryFilter::only_fixed();
-        if let Some((_, toi)) = cx.cast_ray(my_t.translation.xy(), Vec2::Y, 2000.0, true, filter) {
-            my_state.up_wall_dist = toi;
-        }
-        if let Some((_, toi)) =
-            cx.cast_ray(my_t.translation.xy(), Vec2::NEG_Y, 2000.0, true, filter)
-        {
-            my_state.down_wall_dist = toi;
-        }
-        if let Some((_, toi)) = cx.cast_ray(my_t.translation.xy(), Vec2::X, 2000.0, true, filter) {
-            my_state.right_wall_dist = toi;
-        }
-        if let Some((_, toi)) =
-            cx.cast_ray(my_t.translation.xy(), Vec2::NEG_X, 2000.0, true, filter)
-        {
-            my_state.left_wall_dist = toi;
-        }
-
-        for (i, other_ent) in agents
+        for other_ent in agents
             .iter()
             .filter(|a| *a != agent_ent)
             .sorted_by_key(|a| {
                 let other_t = agent_transform.get(*a).unwrap();
                 other_t.translation.distance(my_t.translation) as i64
             })
-            .enumerate()
         {
             let other_id = brain_ids.get(other_ent).unwrap();
             let other_t = agent_transform.get(other_ent).unwrap();
             let other_v = agent_velocity.get(other_ent).unwrap();
-            let status = env.brains.get_status(other_id.0);
+            let other_h = agent_health.get(other_ent).unwrap();
+            let status = brains.get_status(other_id.0);
             let other_state = OtherState {
-                rel_pos: my_t.translation.xy() - other_t.translation.xy(),
-                linvel: other_v.linvel,
-                direction: other_t.local_y().xy(),
+                phys: PhysicalProperties {
+                    position: my_t.translation.xy() - other_t.translation.xy(),
+                    direction: other_t.local_y().xy(),
+                    linvel: other_v.linvel,
+                }
+                .scaled_by(&phys_scaling),
+                combat: CombatProperties { health: other_h.0 }.scaled_by(&CombatProperties {
+                    health: 1.0 / params.agent_max_health,
+                }),
+                map_inter: MapInteractionProperties::new(other_t, &cx).scaled_by(&map_scaling),
+
                 firing: status
                     .unwrap_or_default()
                     .last_action
                     .unwrap_or_default()
-                    .shoot
-                    > 0.0,
+                    .combat
+                    .shoot,
             };
-            my_state.other_states[i] = other_state;
+
+            my_state.other_states.push(other_state);
         }
 
-        let max_len = env.params.agent_frame_stack_len;
-        env.observations
-            .get_mut(&agent_ent)
+        let max_len = params.agent_frame_stack_len;
+        observations
+            .get_mut(agent_ent)
             .unwrap()
             .push(my_state, Some(max_len));
     }
 }
 
 fn get_action(
-    mut env: ResMut<Ffa>,
+    params: Res<FfaParams>,
+    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
+    mut actions: Query<&mut FfaAction, With<Agent>>,
+    observations: Query<&FrameStack<FfaObs>, With<Agent>>,
     frame_count: Res<FrameCount>,
     agents: Query<Entity, With<Agent>>,
     brain_ids: Query<&BrainId, With<Agent>>,
 ) {
-    if frame_count.0 as usize % env.params.agent_frame_stack_len == 0 {
+    if frame_count.0 as usize % params.agent_frame_stack_len == 0 {
         for agent_ent in agents.iter() {
             let brain_id = brain_ids.get(agent_ent).unwrap().0;
-            env.brains.send_obs(
+            brains.send_obs(
                 brain_id,
-                env.observations[&agent_ent].clone(),
+                observations.get(agent_ent).unwrap().clone(),
                 frame_count.0 as usize,
-                env.params,
+                *params,
             );
-            let status = env.brains.get_status(brain_id);
+            let status = brains.get_status(brain_id);
             if let Some(status) = status {
-                status
-                    .last_action
-                    .and_then(|action| env.actions.insert(agent_ent, action));
+                // if let Some(action) = status.last_action {
+                *actions.get_mut(agent_ent).unwrap() = status.last_action.unwrap();
+                // }
             }
         }
     }
 }
 
 fn get_reward(
-    mut env: ResMut<Ffa>,
-    _commands: Commands,
+    params: Res<FfaParams>,
+    mut rewards: Query<&mut Reward, With<Agent>>,
+    actions: Query<&FfaAction, With<Agent>>,
     cx: Res<RapierContext>,
     agents: Query<Entity, With<Agent>>,
     agent_transform: Query<&Transform, With<Agent>>,
@@ -642,14 +638,14 @@ fn get_reward(
     mut log: ResMut<LogText>,
 ) {
     for agent_ent in agents.iter() {
-        env.rewards.insert(agent_ent, 0.0);
+        rewards.get_mut(agent_ent).unwrap().0 = 0.0;
         let my_health = health.get(agent_ent).unwrap();
         let my_t = agent_transform.get(agent_ent).unwrap();
-        if let Some(action) = env.actions.get(&agent_ent).cloned() {
-            if action.shoot > 0.0 && my_health.0 > 0.0 {
+        if let Ok(action) = actions.get(agent_ent).cloned() {
+            if action.combat.shoot && my_health.0 > 0.0 {
                 let (ray_dir, ray_pos) = {
                     let ray_dir = my_t.local_y().xy();
-                    let ray_pos = my_t.translation.xy() + ray_dir * (env.params.agent_radius + 2.0);
+                    let ray_pos = my_t.translation.xy() + ray_dir * (params.agent_radius + 2.0);
 
                     for child in childs.get(agent_ent).unwrap().iter() {
                         if let Ok(mut vis) = line_vis.get_mut(*child) {
@@ -661,13 +657,9 @@ fn get_reward(
 
                 let filter = QueryFilter::default().exclude_collider(agent_ent);
 
-                if let Some((hit_entity, toi)) = cx.cast_ray(
-                    ray_pos,
-                    ray_dir,
-                    env.params.agent_shoot_distance,
-                    false,
-                    filter,
-                ) {
+                if let Some((hit_entity, toi)) =
+                    cx.cast_ray(ray_pos, ray_dir, params.agent_shoot_distance, false, filter)
+                {
                     for child in childs.get(agent_ent).unwrap().iter() {
                         if let Ok(mut line) = line_transform.get_mut(*child) {
                             line.scale = Vec3::new(1.0, toi, 1.0);
@@ -678,11 +670,11 @@ fn get_reward(
                     if let Ok(mut health) = health.get_component_mut::<Health>(hit_entity) {
                         if health.0 > 0.0 {
                             health.0 -= 5.0;
-                            *env.rewards.get_mut(&agent_ent).unwrap() += 1.0;
-                            *env.rewards.get_mut(&hit_entity).unwrap() -= 1.0;
+                            rewards.get_mut(agent_ent).unwrap().0 += 1.0;
+                            rewards.get_mut(hit_entity).unwrap().0 -= 1.0;
                             if health.0 <= 0.0 {
-                                *env.rewards.get_mut(&agent_ent).unwrap() += 100.0;
-                                *env.rewards.get_mut(&hit_entity).unwrap() -= 100.0;
+                                rewards.get_mut(agent_ent).unwrap().0 += 100.0;
+                                rewards.get_mut(hit_entity).unwrap().0 -= 100.0;
                                 kills.get_mut(agent_ent).unwrap().0 += 1;
                                 let msg = format!(
                                     "{} killed {}! Nice!",
@@ -694,18 +686,18 @@ fn get_reward(
                         }
                     } else {
                         // hit a wall
-                        *env.rewards.get_mut(&agent_ent).unwrap() -= 4.0;
+                        rewards.get_mut(agent_ent).unwrap().0 -= 4.0;
                     }
                 } else {
                     // hit nothing
                     for child in childs.get(agent_ent).unwrap().iter() {
                         if let Ok(mut line) = line_transform.get_mut(*child) {
-                            line.scale = Vec3::new(1.0, env.params.agent_shoot_distance, 1.0);
+                            line.scale = Vec3::new(1.0, params.agent_shoot_distance, 1.0);
                             line.translation =
-                                Vec3::new(0.0, env.params.agent_shoot_distance / 2.0, 0.0);
+                                Vec3::new(0.0, params.agent_shoot_distance / 2.0, 0.0);
                         }
                     }
-                    *env.rewards.get_mut(&agent_ent).unwrap() -= 4.0;
+                    rewards.get_mut(agent_ent).unwrap().0 -= 4.0;
                 }
             } else {
                 for child in childs.get(agent_ent).unwrap().iter() {
@@ -716,29 +708,54 @@ fn get_reward(
             }
 
             let mut my_force = force.get_mut(agent_ent).unwrap();
-            my_force.force = action.lin_force * env.params.agent_lin_move_force;
-            my_force.torque = action.ang_force * env.params.agent_ang_move_force;
+            my_force.force = action.phys.force * params.agent_lin_move_force;
+            my_force.torque = action.phys.torque * params.agent_ang_move_force;
         }
     }
 }
 
 fn get_terminal(
-    mut env: ResMut<Ffa>,
+    mut terminals: Query<&mut Terminal, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
     health: Query<&Health, With<Agent>>,
 ) {
     for agent_ent in agents.iter() {
-        if health.get(agent_ent).unwrap().0 <= 0.0 {
-            env.terminals.insert(agent_ent, true);
-        } else {
-            env.terminals.insert(agent_ent, false);
-        }
+        terminals.get_mut(agent_ent).unwrap().0 = health.get(agent_ent).unwrap().0 <= 0.0;
+    }
+}
+
+fn store_sarts(
+    params: Res<FfaParams>,
+    observations: Query<&FrameStack<FfaObs>, With<Agent>>,
+    actions: Query<&FfaAction, With<Agent>>,
+    rewards: Query<&Reward, With<Agent>>,
+    mut rbs: Query<&mut PpoBuffer<Ffa>, With<Agent>>,
+    terminals: Query<&Terminal, With<Agent>>,
+    agents: Query<Entity, With<Agent>>,
+) {
+    for agent_ent in agents.iter() {
+        let (action, reward, terminal) = (
+            actions.get(agent_ent).unwrap().clone(),
+            rewards.get(agent_ent).unwrap().0,
+            terminals.get(agent_ent).unwrap().0,
+        );
+        let obs = observations.get(agent_ent).unwrap().clone();
+        let max_len = params.agent_rb_max_len;
+        rbs.get_mut(agent_ent).unwrap().remember_sart(
+            Sart {
+                obs,
+                action: action.to_owned(),
+                reward,
+                terminal,
+            },
+            Some(max_len),
+        );
     }
 }
 
 fn update(
     mut commands: Commands,
-    mut env: ResMut<Ffa>,
+    params: Res<FfaParams>,
     mut name_text_t: Query<
         (Entity, &mut Transform, &mut Text, &mut NameText),
         (With<NameText>, Without<Agent>),
@@ -747,17 +764,16 @@ fn update(
         (Entity, &mut Transform, &HealthBar),
         (Without<NameText>, Without<Agent>),
     >,
-    agents: Query<Entity, With<Agent>>,
     brain_ids: Query<&BrainId, With<Agent>>,
     names: Query<&Name, With<Agent>>,
     kills: Query<&Kills, With<Agent>>,
-    mut deaths: Query<&mut Deaths, With<Agent>>,
-    mut health: Query<&mut Health, With<Agent>>,
-    mut agent_transform: Query<&mut Transform, With<Agent>>,
+    deaths: Query<&Deaths, With<Agent>>,
+    health: Query<&Health, With<Agent>>,
+    agent_transform: Query<&Transform, With<Agent>>,
 ) {
     for (t_ent, mut t, mut text, text_comp) in name_text_t.iter_mut() {
         if let Ok(agent) = agent_transform.get(text_comp.entity_following) {
-            t.translation = agent.translation + Vec3::new(0.0, env.params.agent_radius + 20.0, 2.0);
+            t.translation = agent.translation + Vec3::new(0.0, params.agent_radius + 20.0, 2.0);
             text.sections[0].value = format!(
                 "{} {} {}-{}",
                 brain_ids.get(text_comp.entity_following).unwrap().0,
@@ -771,51 +787,33 @@ fn update(
     }
     for (t_ent, mut t, hb) in health_bar_t.iter_mut() {
         if let Ok(agent) = agent_transform.get(hb.entity_following) {
-            t.translation = agent.translation + Vec3::new(0.0, env.params.agent_radius + 5.0, 2.0);
+            t.translation = agent.translation + Vec3::new(0.0, params.agent_radius + 5.0, 2.0);
             let health = health.get(hb.entity_following).unwrap();
-            t.scale = Vec3::new(health.0 / env.params.agent_max_health * 100.0, 1.0, 1.0);
+            t.scale = Vec3::new(health.0 / params.agent_max_health * 100.0, 1.0, 1.0);
         } else {
             commands.entity(t_ent).despawn();
         }
     }
+}
 
-    for agent_ent in agents.iter() {
-        let _status = env.brains.get_status(brain_ids.get(agent_ent).unwrap().0);
-        let (action, reward, terminal) = (
-            env.actions.get(&agent_ent).cloned(),
-            env.rewards.get(&agent_ent).copied(),
-            env.terminals.get(&agent_ent).copied(),
-        );
-        let obs = env.observations[&agent_ent].clone();
-        let max_len = env.params.agent_rb_max_len;
-        // if let Some(status) = status {
-        if let Some(rb) = env.rbs.get_mut(&agent_ent) {
-            // if fresh {
-            if let (Some(action), Some(reward), Some(terminal)) = (action, reward, terminal) {
-                rb.remember_sart(
-                    Sart {
-                        obs,
-                        action: action.to_owned(),
-                        reward,
-                        terminal,
-                    },
-                    Some(max_len),
-                );
-            }
-        }
-        // }
-    }
-
+fn check_dead(
+    params: Res<FfaParams>,
+    agents: Query<Entity, With<Agent>>,
+    mut health: Query<&mut Health, With<Agent>>,
+    mut deaths: Query<&mut Deaths, With<Agent>>,
+    mut rbs: Query<&mut PpoBuffer<Ffa>, With<Agent>>,
+    mut agent_transform: Query<&mut Transform, With<Agent>>,
+) {
     for agent_ent in agents.iter() {
         let mut my_health = health.get_mut(agent_ent).unwrap();
         if my_health.0 <= 0.0 {
-            if let Some(rb) = env.rbs.get_mut(&agent_ent) {
+            if let Ok(mut rb) = rbs.get_mut(agent_ent) {
                 rb.finish_trajectory();
             }
 
             // let mut ent = commands.entity(agent);
             deaths.get_mut(agent_ent).unwrap().0 += 1;
-            my_health.0 = env.params.agent_max_health;
+            my_health.0 = params.agent_max_health;
             let agent_pos = Vec3::new(
                 (rand::random::<f32>() - 0.5) * 500.0,
                 (rand::random::<f32>() - 0.5) * 500.0,
@@ -827,7 +825,9 @@ fn update(
 }
 
 fn learn(
-    mut env: ResMut<Ffa>,
+    params: Res<FfaParams>,
+    rbs: Query<&PpoBuffer<Ffa>, With<Agent>>,
+    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
     frame_count: Res<FrameCount>,
     agents: Query<Entity, With<Agent>>,
     brain_ids: Query<&BrainId, With<Agent>>,
@@ -835,22 +835,20 @@ fn learn(
     names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
 ) {
-    if frame_count.0 > 1 && frame_count.0 as usize % env.params.agent_update_interval == 0 {
+    if frame_count.0 > 1 && frame_count.0 as usize % params.agent_update_interval == 0 {
         for agent_ent in agents.iter() {
             if deaths.get(agent_ent).unwrap().0 > 0 {
-                let rb = env.rbs[&agent_ent].clone();
+                let rb = rbs.get(agent_ent).unwrap().clone();
                 let id = brain_ids.get(agent_ent).unwrap().0;
                 let name = &names.get(agent_ent).unwrap().0;
                 log.push(format!("Training {id} {name}..."));
 
                 AsyncComputeTaskPool::get().scope(|scope| {
                     scope.spawn(async {
-                        env.brains
-                            .learn(id, frame_count.0 as usize, rb, env.params)
-                            .await;
+                        brains.learn(id, frame_count.0 as usize, rb, *params).await;
                     });
                 });
-                let status = env.brains.get_status(id);
+                let status = brains.get_status(id);
                 if let Some(status) = status.and_then(|s| s.status) {
                     log.push(format!(
                         "{} {} Policy Loss: {}",
@@ -876,13 +874,13 @@ fn learn(
 
 pub fn ui(
     mut cxs: EguiContexts,
-    mut env: ResMut<Ffa>,
     log: ResMut<LogText>,
     agents: Query<Entity, With<Agent>>,
     kills: Query<&Kills, With<Agent>>,
     deaths: Query<&Deaths, With<Agent>>,
     brain_ids: Query<&BrainId, With<Agent>>,
     names: Query<&Name, With<Agent>>,
+    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
 ) {
     egui::Window::new("Scores").show(cxs.ctx_mut(), |ui| {
         ui.vertical(|ui| {
@@ -934,8 +932,7 @@ pub fn ui(
                             ui.vertical(|ui| {
                                 ui.heading(&names.get(brain).unwrap().0);
                                 // ui.group(|ui| {
-                                let status = env
-                                    .brains
+                                let status = brains
                                     .get_status(brain_ids.get(brain).unwrap().0)
                                     .unwrap_or_default();
                                 let status = status.status.unwrap();
