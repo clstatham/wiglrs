@@ -1,12 +1,7 @@
 #![feature(return_position_impl_trait_in_trait)]
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
-use std::{
-    collections::VecDeque,
-    fmt,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::VecDeque, fmt, path::Path, sync::Arc};
 
 use bevy::{
     prelude::*,

@@ -1,5 +1,4 @@
 use crate::brains::thinkers::ppo::PpoParams;
-use crate::brains::thinkers::Thinker;
 use crate::ui::LogText;
 use crate::{
     brains::{
@@ -10,10 +9,9 @@ use crate::{
     envs::ffa::{check_dead, update},
     names, FrameStack, Timestamp,
 };
+use bevy::ecs::schedule::SystemConfigs;
 use bevy::prelude::*;
 use bevy::{core::FrameCount, math::Vec3Swizzles};
-use bevy_egui::egui::plot::{Bar, BarChart, Line};
-use bevy_egui::EguiContexts;
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use bevy_rand::resource::GlobalEntropy;
@@ -22,7 +20,7 @@ use itertools::Itertools;
 use rand_distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 
-use super::ffa::{learn, Deaths, Kills, Name, Reward, ShootyLine, Terminal};
+use super::ffa::{learn, send_reward, Kills, Name, Reward, ShootyLine, Terminal};
 use super::{
     ffa::{
         Agent, AgentBundle, Eyeballs, FfaParams, Health, HealthBarBundle, NameTextBundle,
@@ -225,36 +223,47 @@ impl Env for Tdm {
         Self
     }
 
-    fn setup_system() -> bevy::ecs::schedule::SystemConfigs {
+    fn setup_system() -> SystemConfigs {
         setup.chain()
     }
 
-    fn observation_system() -> bevy::ecs::schedule::SystemConfigs {
+    fn observation_system() -> SystemConfigs {
         observation.chain()
     }
 
-    fn action_system() -> bevy::ecs::schedule::SystemConfigs {
+    fn action_system() -> SystemConfigs {
         action.chain()
     }
 
-    fn reward_system() -> bevy::ecs::schedule::SystemConfigs {
-        (get_reward, send_reward).chain()
+    fn reward_system() -> SystemConfigs {
+        (
+            get_reward,
+            send_reward::<Tdm, SharedThinker<Tdm, PpoThinker>>,
+        )
+            .chain()
     }
 
-    fn terminal_system() -> bevy::ecs::schedule::SystemConfigs {
+    fn terminal_system() -> SystemConfigs {
         get_terminal.chain()
     }
 
-    fn update_system() -> bevy::ecs::schedule::SystemConfigs {
+    fn update_system() -> SystemConfigs {
         (update::<Tdm>, store_sarts::<Tdm>, check_dead::<Tdm>).chain()
     }
 
-    fn learn_system() -> bevy::ecs::schedule::SystemConfigs {
+    fn learn_system() -> SystemConfigs {
         learn::<Tdm, SharedThinker<Tdm, PpoThinker>>.chain()
     }
 
-    fn ui_system() -> bevy::ecs::schedule::SystemConfigs {
-        ui.chain()
+    fn ui_system() -> SystemConfigs {
+        use crate::ui::*;
+        (
+            kdr::<Tdm, SharedThinker<Tdm, PpoThinker>>,
+            action_space::<Tdm, SharedThinker<Tdm, PpoThinker>>,
+            log,
+            running_reward,
+        )
+            .chain()
     }
 }
 
@@ -539,21 +548,6 @@ fn get_reward(
     }
 }
 
-fn send_reward(
-    agents: Query<Entity, With<Agent>>,
-    frame_count: Res<FrameCount>,
-    rewards: Query<&Reward, With<Agent>>,
-    mut brains: Query<&mut Brain<Tdm, SharedThinker<Tdm, PpoThinker>>, With<Agent>>,
-) {
-    for agent_ent in agents.iter() {
-        brains.get_mut(agent_ent).unwrap().writer.add_scalar(
-            "Reward",
-            rewards.get(agent_ent).unwrap().0,
-            frame_count.0 as usize,
-        );
-    }
-}
-
 fn get_terminal(
     mut terminals: Query<&mut Terminal, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
@@ -562,145 +556,4 @@ fn get_terminal(
     for agent_ent in agents.iter() {
         terminals.get_mut(agent_ent).unwrap().0 = health.get(agent_ent).unwrap().0 <= 0.0;
     }
-}
-
-pub fn ui(
-    mut cxs: EguiContexts,
-    log: Res<LogText>,
-    agents: Query<Entity, With<Agent>>,
-    kills: Query<&Kills, With<Agent>>,
-    deaths: Query<&Deaths, With<Agent>>,
-    names: Query<&Name, With<Agent>>,
-    brains: Query<&Brain<Tdm, SharedThinker<Tdm, PpoThinker>>, With<Agent>>,
-) {
-    use bevy_egui::egui;
-    egui::Window::new("Scores").show(cxs.ctx_mut(), |ui| {
-        ui.vertical(|ui| {
-            for handle in agents
-                .iter()
-                .sorted_by_key(|b| kills.get(*b).unwrap().0)
-                .rev()
-            {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{}", names.get(handle).unwrap().0,))
-                            .text_style(egui::TextStyle::Heading),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}-{}",
-                                kills.get(handle).unwrap().0,
-                                deaths.get(handle).unwrap().0,
-                            ))
-                            .text_style(egui::TextStyle::Heading),
-                        );
-                    });
-                });
-            }
-        });
-    });
-    egui::Window::new("Action Mean/Std/Entropy")
-        .min_height(200.0)
-        .min_width(1200.0)
-        // .auto_sized()
-        .scroll2([true, false])
-        .resizable(true)
-        .show(cxs.ctx_mut(), |ui| {
-            ui.with_layout(
-                egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(false),
-                |ui| {
-                    // egui::Grid::new("mean/std grid").show(ui, |ui| {
-                    for (_i, brain) in agents.iter().enumerate() {
-                        ui.group(|ui| {
-                            ui.vertical(|ui| {
-                                ui.heading(&names.get(brain).unwrap().0);
-                                // ui.group(|ui| {
-                                let status =
-                                    Thinker::<Tdm>::status(&brains.get(brain).unwrap().thinker);
-                                let mut mu = "mu:".to_owned();
-                                for m in status.recent_mu.iter() {
-                                    mu.push_str(&format!(" {:.4}", m));
-                                }
-                                ui.label(mu);
-                                let mut std = "std:".to_owned();
-                                for s in status.recent_std.iter() {
-                                    std.push_str(&format!(" {:.4}", s));
-                                }
-                                ui.label(std);
-                                ui.label(format!("ent: {}", status.recent_entropy));
-                                // });
-
-                                // ui.horizontal_top(|ui| {
-
-                                let ms = status
-                                    .recent_mu
-                                    .iter()
-                                    .zip(status.recent_std.iter())
-                                    .enumerate()
-                                    .map(|(i, (mu, std))| {
-                                        // https://www.desmos.com/calculator/rkoehr8rve
-                                        let scale = std * 3.0;
-                                        let _rg =
-                                            Vec2::new(scale.exp(), (1.0 / scale).exp()).normalize();
-                                        let m = Bar::new(i as f64, *mu as f64)
-                                            // .fill(Color32::from_rgb(
-                                            //     (rg.x * 255.0) as u8,
-                                            //     (rg.y * 255.0) as u8,
-                                            //     0,
-                                            // ));
-                                            .fill(egui::Color32::RED);
-                                        let var = std * std;
-                                        let s = Line::new(vec![
-                                            [i as f64, *mu as f64 - var as f64],
-                                            [i as f64, *mu as f64 + var as f64],
-                                        ])
-                                        .stroke(egui::Stroke::new(4.0, egui::Color32::LIGHT_GREEN));
-                                        (m, s)
-                                        // .width(1.0 - *std as f64 / 6.0)
-                                    })
-                                    .collect_vec();
-
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.label("Action Space");
-                                            egui::plot::Plot::new(format!(
-                                                "ActionSpace{}",
-                                                names.get(brain).unwrap().0,
-                                            ))
-                                            .center_y_axis(true)
-                                            .data_aspect(1.0 / 2.0)
-                                            .height(80.0)
-                                            .width(220.0)
-                                            .show(
-                                                ui,
-                                                |plot| {
-                                                    let (mu, std): (Vec<Bar>, Vec<Line>) =
-                                                        ms.into_iter().multiunzip();
-                                                    plot.bar_chart(BarChart::new(mu));
-                                                    for std in std {
-                                                        plot.line(std);
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    });
-                                });
-                            });
-                        });
-                    }
-                },
-            );
-        });
-    egui::Window::new("Log")
-        .vscroll(true)
-        .hscroll(true)
-        .show(cxs.ctx_mut(), |ui| {
-            let s = format!("{}", *log);
-            ui.add_sized(
-                ui.available_size(),
-                egui::TextEdit::multiline(&mut s.as_str()).desired_rows(20),
-            );
-        });
 }

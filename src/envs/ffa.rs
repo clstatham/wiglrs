@@ -1,11 +1,4 @@
-use bevy_egui::{
-    egui::{
-        self,
-        plot::{Bar, BarChart, Line},
-        Color32, Layout, Stroke,
-    },
-    EguiContexts,
-};
+use std::collections::VecDeque;
 
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::{prelude::EntropyComponent, resource::GlobalEntropy};
@@ -348,6 +341,40 @@ pub struct Agent;
 pub struct Reward(pub f32);
 
 #[derive(Component)]
+pub struct RunningReward {
+    pub rewards: VecDeque<f32>,
+    pub history: VecDeque<f32>,
+    pub max_len: usize,
+    pub history_max_len: usize,
+}
+
+impl RunningReward {
+    pub fn update(&mut self, reward: f32) -> Option<f32> {
+        if self.rewards.len() >= self.max_len {
+            self.rewards.pop_front();
+        }
+        self.rewards.push_back(reward);
+        if let Some(r) = self.get() {
+            if self.history.len() >= self.history_max_len {
+                self.history.pop_front();
+            }
+            self.history.push_back(r);
+            Some(r)
+        } else {
+            None
+        }
+    }
+
+    pub fn get(&self) -> Option<f32> {
+        if self.rewards.len() == self.max_len {
+            Some(self.rewards.iter().sum::<f32>() / self.max_len as f32)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Component)]
 pub struct Terminal(pub bool);
 
 #[derive(Component)]
@@ -383,6 +410,7 @@ where
     pub action: E::Action,
     pub replay_buffer: PpoBuffer<E>,
     pub reward: Reward,
+    pub running_reward: RunningReward,
     pub terminal: Terminal,
     pub rng: EntropyComponent<ChaCha8Rng>,
     marker: Agent,
@@ -408,6 +436,12 @@ where
             action: E::Action::default(),
             replay_buffer: PpoBuffer::new(Some(params.agent_rb_max_len())),
             reward: Reward(0.0),
+            running_reward: RunningReward {
+                rewards: VecDeque::new(),
+                history: VecDeque::new(),
+                max_len: params.agent_frame_stack_len() * 100,
+                history_max_len: params.agent_frame_stack_len() * 100,
+            },
             terminal: Terminal(false),
             marker: Agent,
             rb: RigidBody::Dynamic,
@@ -468,7 +502,7 @@ impl Env for Ffa {
     }
 
     fn reward_system() -> SystemConfigs {
-        (get_reward, send_reward).chain()
+        (get_reward, send_reward::<Ffa, PpoThinker>).chain()
     }
 
     fn terminal_system() -> SystemConfigs {
@@ -484,7 +518,14 @@ impl Env for Ffa {
     }
 
     fn ui_system() -> SystemConfigs {
-        ui.chain()
+        use crate::ui::*;
+        (
+            kdr::<Ffa, PpoThinker>,
+            action_space::<Ffa, PpoThinker>,
+            log,
+            running_reward,
+        )
+            .chain()
     }
 }
 
@@ -757,18 +798,27 @@ fn get_reward(
     }
 }
 
-fn send_reward(
+pub fn send_reward<E: Env, T: Thinker<E>>(
     agents: Query<Entity, With<Agent>>,
     frame_count: Res<FrameCount>,
     rewards: Query<&Reward, With<Agent>>,
-    mut brains: Query<&mut Brain<Ffa, PpoThinker>, With<Agent>>,
+    mut running_rewards: Query<&mut RunningReward, With<Agent>>,
+    mut brains: Query<&mut Brain<E, T>, With<Agent>>,
 ) {
     for agent_ent in agents.iter() {
+        let reward = rewards.get(agent_ent).unwrap().0;
         brains.get_mut(agent_ent).unwrap().writer.add_scalar(
-            "Reward",
-            rewards.get(agent_ent).unwrap().0,
+            "Reward/Frame",
+            reward,
             frame_count.0 as usize,
         );
+        if let Some(running_reward) = running_rewards.get_mut(agent_ent).unwrap().update(reward) {
+            brains.get_mut(agent_ent).unwrap().writer.add_scalar(
+                "Reward/Running",
+                running_reward,
+                frame_count.0 as usize,
+            );
+        }
     }
 }
 
@@ -900,144 +950,4 @@ pub fn learn<E: Env, T>(
             ));
         }
     }
-}
-
-pub fn ui(
-    mut cxs: EguiContexts,
-    log: Res<LogText>,
-    agents: Query<Entity, With<Agent>>,
-    kills: Query<&Kills, With<Agent>>,
-    deaths: Query<&Deaths, With<Agent>>,
-    names: Query<&Name, With<Agent>>,
-    brains: Query<&Brain<Ffa, PpoThinker>, With<Agent>>,
-) {
-    egui::Window::new("Scores").show(cxs.ctx_mut(), |ui| {
-        ui.vertical(|ui| {
-            for handle in agents
-                .iter()
-                .sorted_by_key(|b| kills.get(*b).unwrap().0)
-                .rev()
-            {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{}", names.get(handle).unwrap().0,))
-                            .text_style(egui::TextStyle::Heading),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}-{}",
-                                kills.get(handle).unwrap().0,
-                                deaths.get(handle).unwrap().0,
-                            ))
-                            .text_style(egui::TextStyle::Heading),
-                        );
-                    });
-                });
-            }
-        });
-    });
-    egui::Window::new("Action Mean/Std/Entropy")
-        .min_height(200.0)
-        .min_width(1200.0)
-        // .auto_sized()
-        .scroll2([true, false])
-        .resizable(true)
-        .show(cxs.ctx_mut(), |ui| {
-            ui.with_layout(
-                Layout::left_to_right(egui::Align::Min).with_main_wrap(false),
-                |ui| {
-                    // egui::Grid::new("mean/std grid").show(ui, |ui| {
-                    for (_i, brain) in agents.iter().enumerate() {
-                        ui.group(|ui| {
-                            ui.vertical(|ui| {
-                                ui.heading(&names.get(brain).unwrap().0);
-                                // ui.group(|ui| {
-                                let status =
-                                    Thinker::<Ffa>::status(&brains.get(brain).unwrap().thinker);
-                                let mut mu = "mu:".to_owned();
-                                for m in status.recent_mu.iter() {
-                                    mu.push_str(&format!(" {:.4}", m));
-                                }
-                                ui.label(mu);
-                                let mut std = "std:".to_owned();
-                                for s in status.recent_std.iter() {
-                                    std.push_str(&format!(" {:.4}", s));
-                                }
-                                ui.label(std);
-                                ui.label(format!("ent: {}", status.recent_entropy));
-                                // });
-
-                                // ui.horizontal_top(|ui| {
-
-                                let ms = status
-                                    .recent_mu
-                                    .iter()
-                                    .zip(status.recent_std.iter())
-                                    .enumerate()
-                                    .map(|(i, (mu, std))| {
-                                        // https://www.desmos.com/calculator/rkoehr8rve
-                                        let scale = std * 3.0;
-                                        let _rg =
-                                            Vec2::new(scale.exp(), (1.0 / scale).exp()).normalize();
-                                        let m = Bar::new(i as f64, *mu as f64)
-                                            // .fill(Color32::from_rgb(
-                                            //     (rg.x * 255.0) as u8,
-                                            //     (rg.y * 255.0) as u8,
-                                            //     0,
-                                            // ));
-                                            .fill(Color32::RED);
-                                        let var = std * std;
-                                        let s = Line::new(vec![
-                                            [i as f64, *mu as f64 - var as f64],
-                                            [i as f64, *mu as f64 + var as f64],
-                                        ])
-                                        .stroke(Stroke::new(4.0, Color32::LIGHT_GREEN));
-                                        (m, s)
-                                        // .width(1.0 - *std as f64 / 6.0)
-                                    })
-                                    .collect_vec();
-
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.label("Action Space");
-                                            egui::plot::Plot::new(format!(
-                                                "ActionSpace{}",
-                                                names.get(brain).unwrap().0,
-                                            ))
-                                            .center_y_axis(true)
-                                            .data_aspect(1.0 / 2.0)
-                                            .height(80.0)
-                                            .width(220.0)
-                                            .show(
-                                                ui,
-                                                |plot| {
-                                                    let (mu, std): (Vec<Bar>, Vec<Line>) =
-                                                        ms.into_iter().multiunzip();
-                                                    plot.bar_chart(BarChart::new(mu));
-                                                    for std in std {
-                                                        plot.line(std);
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    });
-                                });
-                            });
-                        });
-                    }
-                },
-            );
-        });
-    egui::Window::new("Log")
-        .vscroll(true)
-        .hscroll(true)
-        .show(cxs.ctx_mut(), |ui| {
-            let s = format!("{}", *log);
-            ui.add_sized(
-                ui.available_size(),
-                egui::TextEdit::multiline(&mut s.as_str()).desired_rows(20),
-            );
-        });
 }
