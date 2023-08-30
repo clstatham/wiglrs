@@ -15,6 +15,7 @@ use burn_tensor::backend::Backend;
 use envs::{
     ffa::Ffa,
     maps::{tdm::TdmMap, Map},
+    tdm::Tdm,
     // tdm::Tdm,
     Env,
 };
@@ -186,5 +187,5 @@ fn run_env<E: Env, M: Map>() {
 
 fn main() {
     burn_tch::TchBackend::<f32>::seed(rand::random());
-    run_env::<Ffa, TdmMap>();
+    run_env::<Tdm, TdmMap>();
 }

@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
 
-use bevy::prelude::Component;
+use bevy::prelude::*;
 use burn_tch::TchBackend;
 
 use crate::{
-    envs::{Action, Env},
+    envs::{
+        ffa::{Agent, Reward, Terminal},
+        Action, Env,
+    },
     FrameStack,
 };
 
@@ -65,6 +68,7 @@ pub struct PpoMetadata {
 
 #[derive(Component)]
 pub struct PpoBuffer<E: Env> {
+    pub max_len: Option<usize>,
     pub obs: VecDeque<FrameStack<E::Observation>>,
     pub action: VecDeque<E::Action>,
     pub reward: VecDeque<f32>,
@@ -77,6 +81,7 @@ pub struct PpoBuffer<E: Env> {
 impl<E: Env> Clone for PpoBuffer<E> {
     fn clone(&self) -> Self {
         Self {
+            max_len: self.max_len,
             obs: self.obs.clone(),
             action: self.action.clone(),
             returns: self.returns.clone(),
@@ -91,6 +96,7 @@ impl<E: Env> Clone for PpoBuffer<E> {
 impl<E: Env> Default for PpoBuffer<E> {
     fn default() -> Self {
         Self {
+            max_len: None,
             obs: VecDeque::default(),
             action: VecDeque::default(),
             reward: VecDeque::default(),
@@ -106,8 +112,15 @@ impl<E: Env> PpoBuffer<E>
 where
     E::Action: Action<E, Metadata = PpoMetadata>,
 {
-    pub fn remember_sart(&mut self, step: Sart<E>, max_len: Option<usize>) {
-        if let Some(max_len) = max_len {
+    pub fn new(max_len: Option<usize>) -> Self {
+        Self {
+            max_len,
+            ..Default::default()
+        }
+    }
+
+    pub fn remember_sart(&mut self, step: Sart<E>) {
+        if let Some(max_len) = self.max_len {
             while self.obs.len() >= max_len {
                 self.obs.pop_front();
             }
@@ -144,7 +157,7 @@ where
             self.returns.push_back(None);
 
             self.current_trajectory_start += 1;
-            if let Some(max_len) = max_len {
+            if let Some(max_len) = self.max_len {
                 if self.current_trajectory_start >= max_len {
                     self.current_trajectory_start = max_len;
                     self.finish_trajectory(); // in case one of them is an ABSOLUTE GAMER and doesn't die for like 100_000 frames
@@ -191,5 +204,31 @@ where
             batch.returns.push_back(self.returns[i]);
         }
         Some(batch)
+    }
+}
+
+pub fn store_sarts<E: Env>(
+    observations: Query<&FrameStack<E::Observation>, With<Agent>>,
+    actions: Query<&E::Action, With<Agent>>,
+    rewards: Query<&Reward, With<Agent>>,
+    mut rbs: Query<&mut PpoBuffer<E>, With<Agent>>,
+    terminals: Query<&Terminal, With<Agent>>,
+    agents: Query<Entity, With<Agent>>,
+) where
+    E::Action: Action<E, Metadata = PpoMetadata>,
+{
+    for agent_ent in agents.iter() {
+        let (action, reward, terminal) = (
+            actions.get(agent_ent).unwrap().clone(),
+            rewards.get(agent_ent).unwrap().0,
+            terminals.get(agent_ent).unwrap().0,
+        );
+        let obs = observations.get(agent_ent).unwrap().clone();
+        rbs.get_mut(agent_ent).unwrap().remember_sart(Sart {
+            obs,
+            action: action.to_owned(),
+            reward,
+            terminal,
+        });
     }
 }

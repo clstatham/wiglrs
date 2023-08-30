@@ -17,8 +17,11 @@ use bevy_rapier2d::prelude::*;
 
 use crate::{
     brains::{
-        replay_buffer::{PpoBuffer, PpoMetadata, Sart},
-        thinkers::{ppo::PpoThinker, Thinker},
+        replay_buffer::{store_sarts, PpoBuffer, PpoMetadata},
+        thinkers::{
+            ppo::{PpoParams, PpoStatus, PpoThinker},
+            Thinker,
+        },
         Brain,
     },
     ui::LogText,
@@ -79,6 +82,40 @@ impl Default for FfaParams {
 impl Params for FfaParams {
     fn agent_radius(&self) -> f32 {
         self.agent_radius
+    }
+
+    fn agent_max_health(&self) -> f32 {
+        self.agent_max_health
+    }
+}
+
+impl PpoParams for FfaParams {
+    fn actor_lr(&self) -> f64 {
+        self.agent_actor_lr
+    }
+
+    fn agent_rb_max_len(&self) -> usize {
+        self.agent_rb_max_len
+    }
+
+    fn critic_lr(&self) -> f64 {
+        self.agent_critic_lr
+    }
+
+    fn entropy_beta(&self) -> f32 {
+        self.agent_entropy_beta
+    }
+
+    fn training_batch_size(&self) -> usize {
+        self.agent_training_batch_size
+    }
+
+    fn training_epochs(&self) -> usize {
+        self.agent_training_epochs
+    }
+
+    fn agent_update_interval(&self) -> usize {
+        self.agent_update_interval
     }
 }
 
@@ -334,7 +371,11 @@ pub struct AgentBundle<E: Env, T: Thinker<E>> {
     pub terminal: Terminal,
     marker: Agent,
 }
-impl<E: Env, T: Thinker<E>> AgentBundle<E, T> {
+impl<E: Env, T: Thinker<E>> AgentBundle<E, T>
+where
+    E::Params: PpoParams,
+    E::Action: Action<E, Metadata = PpoMetadata>,
+{
     pub fn new(
         pos: Vec3,
         color: Option<Color>,
@@ -347,7 +388,7 @@ impl<E: Env, T: Thinker<E>> AgentBundle<E, T> {
         Self {
             obs: E::Observation::default_frame_stack(params),
             action: E::Action::default(),
-            replay_buffer: PpoBuffer::default(),
+            replay_buffer: PpoBuffer::new(Some(params.agent_rb_max_len())),
             reward: Reward(0.0),
             terminal: Terminal(false),
             marker: Agent,
@@ -417,11 +458,11 @@ impl Env for Ffa {
     }
 
     fn update_system() -> SystemConfigs {
-        (update, store_sarts, check_dead).chain()
+        (update::<Ffa>, store_sarts::<Ffa>, check_dead::<Ffa>).chain()
     }
 
     fn learn_system() -> SystemConfigs {
-        learn.chain()
+        learn::<Ffa, PpoThinker>.chain()
     }
 
     fn ui_system() -> SystemConfigs {
@@ -588,7 +629,6 @@ fn get_action(
         ),
         With<Agent>,
     >,
-    // mut actions: Query<&mut FfaAction, With<Agent>>,
     frame_count: Res<FrameCount>,
 ) {
     if frame_count.0 as usize % params.agent_frame_stack_len == 0 {
@@ -713,7 +753,7 @@ fn send_reward(
     }
 }
 
-fn get_terminal(
+pub fn get_terminal(
     mut terminals: Query<&mut Terminal, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
     health: Query<&Health, With<Agent>>,
@@ -723,38 +763,9 @@ fn get_terminal(
     }
 }
 
-fn store_sarts(
-    params: Res<FfaParams>,
-    observations: Query<&FrameStack<FfaObs>, With<Agent>>,
-    actions: Query<&FfaAction, With<Agent>>,
-    rewards: Query<&Reward, With<Agent>>,
-    mut rbs: Query<&mut PpoBuffer<Ffa>, With<Agent>>,
-    terminals: Query<&Terminal, With<Agent>>,
-    agents: Query<Entity, With<Agent>>,
-) {
-    for agent_ent in agents.iter() {
-        let (action, reward, terminal) = (
-            actions.get(agent_ent).unwrap().clone(),
-            rewards.get(agent_ent).unwrap().0,
-            terminals.get(agent_ent).unwrap().0,
-        );
-        let obs = observations.get(agent_ent).unwrap().clone();
-        let max_len = params.agent_rb_max_len;
-        rbs.get_mut(agent_ent).unwrap().remember_sart(
-            Sart {
-                obs,
-                action: action.to_owned(),
-                reward,
-                terminal,
-            },
-            Some(max_len),
-        );
-    }
-}
-
-fn update(
+pub fn update<E: Env>(
     mut commands: Commands,
-    params: Res<FfaParams>,
+    params: Res<E::Params>,
     mut name_text_t: Query<
         (Entity, &mut Transform, &mut Text, &mut NameText),
         (With<NameText>, Without<Agent>),
@@ -771,7 +782,7 @@ fn update(
 ) {
     for (t_ent, mut t, mut text, text_comp) in name_text_t.iter_mut() {
         if let Ok(agent) = agent_transform.get(text_comp.entity_following) {
-            t.translation = agent.translation + Vec3::new(0.0, params.agent_radius + 20.0, 2.0);
+            t.translation = agent.translation + Vec3::new(0.0, params.agent_radius() + 20.0, 2.0);
             text.sections[0].value = format!(
                 "{} {}-{}",
                 names.get(text_comp.entity_following).unwrap().0,
@@ -784,23 +795,25 @@ fn update(
     }
     for (t_ent, mut t, hb) in health_bar_t.iter_mut() {
         if let Ok(agent) = agent_transform.get(hb.entity_following) {
-            t.translation = agent.translation + Vec3::new(0.0, params.agent_radius + 5.0, 2.0);
+            t.translation = agent.translation + Vec3::new(0.0, params.agent_radius() + 5.0, 2.0);
             let health = health.get(hb.entity_following).unwrap();
-            t.scale = Vec3::new(health.0 / params.agent_max_health * 100.0, 1.0, 1.0);
+            t.scale = Vec3::new(health.0 / params.agent_max_health() * 100.0, 1.0, 1.0);
         } else {
             commands.entity(t_ent).despawn();
         }
     }
 }
 
-fn check_dead(
-    params: Res<FfaParams>,
+pub fn check_dead<E: Env>(
+    params: Res<E::Params>,
     agents: Query<Entity, With<Agent>>,
     mut health: Query<&mut Health, With<Agent>>,
     mut deaths: Query<&mut Deaths, With<Agent>>,
-    mut rbs: Query<&mut PpoBuffer<Ffa>, With<Agent>>,
+    mut rbs: Query<&mut PpoBuffer<E>, With<Agent>>,
     mut agent_transform: Query<&mut Transform, With<Agent>>,
-) {
+) where
+    E::Action: Action<E, Metadata = PpoMetadata>,
+{
     for agent_ent in agents.iter() {
         let mut my_health = health.get_mut(agent_ent).unwrap();
         if my_health.0 <= 0.0 {
@@ -808,9 +821,8 @@ fn check_dead(
                 rb.finish_trajectory();
             }
 
-            // let mut ent = commands.entity(agent);
             deaths.get_mut(agent_ent).unwrap().0 += 1;
-            my_health.0 = params.agent_max_health;
+            my_health.0 = params.agent_max_health();
             let agent_pos = Vec3::new(
                 (rand::random::<f32>() - 0.5) * 500.0,
                 (rand::random::<f32>() - 0.5) * 500.0,
@@ -821,22 +833,26 @@ fn check_dead(
     }
 }
 
-fn learn(
-    params: Res<FfaParams>,
-    mut query: Query<(&PpoBuffer<Ffa>, &Deaths, &Name, &mut Brain<Ffa, PpoThinker>), With<Agent>>,
+pub fn learn<E: Env, T>(
+    params: Res<E::Params>,
+    mut query: Query<(&PpoBuffer<E>, &Deaths, &Name, &mut Brain<E, T>), With<Agent>>,
     frame_count: Res<FrameCount>,
     mut log: ResMut<LogText>,
-) {
-    if frame_count.0 > 1 && frame_count.0 as usize % params.agent_update_interval == 0 {
+) where
+    E::Params: PpoParams,
+    E::Action: Action<E, Metadata = PpoMetadata>,
+    T: Thinker<E, Status = PpoStatus>,
+{
+    if frame_count.0 > 1 && frame_count.0 as usize % params.agent_update_interval() == 0 {
         query
             .par_iter_mut()
-            .for_each_mut(|(rb, deaths, name, mut brain)| {
+            .for_each_mut(|(rb, deaths, _name, mut brain)| {
                 if deaths.0 > 0 {
                     brain.learn(frame_count.0 as usize, rb, &*params);
                 }
             });
         for (_, _, name, brain) in query.iter() {
-            let status = Thinker::<Ffa>::status(&brain.thinker);
+            let status = Thinker::<E>::status(&brain.thinker);
             log.push(format!(
                 "{} Policy Loss: {}",
                 name.0, status.recent_policy_loss

@@ -16,7 +16,7 @@ use std::f32::consts::PI;
 
 use crate::{
     brains::replay_buffer::{PpoBuffer, PpoMetadata},
-    envs::Observation,
+    envs::{Observation, Params},
 };
 use crate::{
     envs::{Action, Env},
@@ -348,6 +348,16 @@ impl Status for PpoStatus {
         writer.add_scalar("Policy/ClampRatio", self.recent_nclamp, step);
         writer.add_scalar("Value/Loss", self.recent_value_loss, step);
     }
+}
+
+pub trait PpoParams: Params {
+    fn actor_lr(&self) -> f64;
+    fn critic_lr(&self) -> f64;
+    fn entropy_beta(&self) -> f32;
+    fn training_batch_size(&self) -> usize;
+    fn training_epochs(&self) -> usize;
+    fn agent_rb_max_len(&self) -> usize;
+    fn agent_update_interval(&self) -> usize;
 }
 
 pub struct PpoThinker {

@@ -27,6 +27,7 @@ pub trait DefaultFrameStack<E: Env>: Observation<E> {
 
 pub trait Params {
     fn agent_radius(&self) -> f32;
+    fn agent_max_health(&self) -> f32;
 }
 
 pub trait Env: Resource
