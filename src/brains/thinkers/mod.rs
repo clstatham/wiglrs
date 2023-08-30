@@ -26,7 +26,7 @@ impl Status for () {
     fn log(&self, _writer: &mut TbWriter, _step: usize) {}
 }
 
-pub trait Thinker<E: Env> {
+pub trait Thinker<E: Env>: Send + Sync + 'static {
     type Metadata: Clone + Send + Sync;
     type Status: Status + Clone + Default + Send + Sync;
     type ActionMetadata: Clone + Default + Send + Sync;

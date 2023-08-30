@@ -11,10 +11,6 @@ use bevy::{
 use bevy_egui::EguiPlugin;
 use bevy_rapier2d::prelude::*;
 
-use brains::{
-    thinkers::{ppo::PpoThinker, Thinker},
-    BrainBank,
-};
 use burn_tensor::backend::Backend;
 use envs::{
     ffa::Ffa,
@@ -141,7 +137,7 @@ fn handle_input(
     }
 }
 
-fn run_env<E: Env, M: Map, T: Thinker<E> + 'static>() {
+fn run_env<E: Env, M: Map>() {
     App::new()
         .insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
@@ -180,7 +176,6 @@ fn run_env<E: Env, M: Map, T: Thinker<E> + 'static>() {
         .add_plugins(EguiPlugin)
         .insert_resource(E::init())
         .insert_resource(E::Params::default())
-        .insert_resource(BrainBank::<E, T>::default())
         .add_systems(Startup, setup)
         .add_systems(Startup, (M::setup_system(), E::setup_system()).chain())
         .add_systems(Update, E::ui_system())
@@ -191,5 +186,5 @@ fn run_env<E: Env, M: Map, T: Thinker<E> + 'static>() {
 
 fn main() {
     burn_tch::TchBackend::<f32>::seed(rand::random());
-    run_env::<Ffa, TdmMap, PpoThinker>();
+    run_env::<Ffa, TdmMap>();
 }

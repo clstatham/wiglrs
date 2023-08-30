@@ -1,11 +1,4 @@
 use bevy::prelude::*;
-use bevy_tasks::ComputeTaskPool;
-
-use std::{collections::BTreeMap, sync::atomic::AtomicUsize};
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    oneshot,
-};
 
 use self::{
     replay_buffer::PpoBuffer,
@@ -16,6 +9,7 @@ use crate::{envs::Env, FrameStack, TbWriter, Timestamp};
 pub mod replay_buffer;
 pub mod thinkers;
 
+#[derive(Component)]
 pub struct Brain<E: Env, T: Thinker<E>> {
     pub name: String,
     pub timestamp: Timestamp,
@@ -23,18 +17,10 @@ pub struct Brain<E: Env, T: Thinker<E>> {
     pub thinker: T,
     pub writer: TbWriter,
     pub metadata: T::Metadata,
-    last_trained_at: usize,
-    learn_waker: Option<(oneshot::Sender<()>, usize, PpoBuffer<E>, E::Params)>,
-    rx: Receiver<BrainControl<E>>,
 }
 
 impl<E: Env, T: Thinker<E>> Brain<E, T> {
-    pub fn new(
-        thinker: T,
-        name: String,
-        timestamp: Timestamp,
-        rx: Receiver<BrainControl<E>>,
-    ) -> Self {
+    pub fn new(thinker: T, name: String, timestamp: Timestamp) -> Self {
         let mut writer = TbWriter::default();
         writer.init(Some(name.as_str()), &timestamp);
         Self {
@@ -44,9 +30,6 @@ impl<E: Env, T: Thinker<E>> Brain<E, T> {
             thinker,
             writer,
             name,
-            rx,
-            learn_waker: None,
-            last_trained_at: 0,
         }
     }
 
@@ -77,49 +60,6 @@ impl<E: Env, T: Thinker<E>> Brain<E, T> {
         self.thinker.learn(rb, params);
         let status = self.thinker.status();
         status.log(&mut self.writer, frame_count);
-    }
-
-    pub async fn poll(&mut self) -> BrainStatus<E, T> {
-        if let Some((waker, frame_count, rb, params)) = self.learn_waker.take() {
-            self.learn(frame_count, &rb, &params);
-            self.last_trained_at = frame_count;
-            waker.send(()).unwrap();
-        }
-        match self.rx.recv().await {
-            Some(ctrl) => match ctrl {
-                BrainControl::NewObs {
-                    frame_count: _,
-                    obs,
-                    params,
-                } => {
-                    let meta = self.metadata.clone();
-                    let status = self.thinker.status();
-                    let action = self.act(&obs, &params);
-                    BrainStatus::NewStatus(ThinkerStatus {
-                        last_action: action,
-                        status: Some(status),
-                        meta: Some(meta),
-                    })
-                }
-                BrainControl::NewReward {
-                    reward,
-                    frame_count,
-                } => {
-                    self.writer.add_scalar("Reward", reward, frame_count);
-                    BrainStatus::Ready
-                }
-                BrainControl::Learn {
-                    frame_count,
-                    rb,
-                    params,
-                } => {
-                    let (tx, rx) = oneshot::channel();
-                    self.learn_waker = Some((tx, frame_count, rb, params));
-                    BrainStatus::Wait(rx)
-                }
-            },
-            None => BrainStatus::Error,
-        }
     }
 }
 
@@ -155,169 +95,5 @@ where
             status: self.status.clone(),
             meta: self.meta.clone(),
         }
-    }
-}
-
-pub enum BrainStatus<E: Env, T: Thinker<E>> {
-    NewStatus(ThinkerStatus<E, T>),
-    Ready,
-    Wait(oneshot::Receiver<()>),
-    Error,
-}
-
-pub enum BrainControl<E: Env> {
-    NewObs {
-        obs: FrameStack<<E as Env>::Observation>,
-        frame_count: usize,
-        params: <E as Env>::Params,
-    },
-    NewReward {
-        reward: f32,
-        frame_count: usize,
-    },
-    Learn {
-        rb: PpoBuffer<E>,
-        frame_count: usize,
-        params: <E as Env>::Params,
-    },
-}
-
-#[derive(Resource)]
-pub struct BrainBank<E: Env, T: Thinker<E>> {
-    rxs: BTreeMap<usize, Receiver<BrainStatus<E, T>>>,
-    txs: BTreeMap<usize, Sender<BrainControl<E>>>,
-    statuses: BTreeMap<usize, ThinkerStatus<E, T>>,
-    n_brains: usize,
-    pub entity_to_brain: BTreeMap<Entity, usize>,
-}
-
-impl<E: Env, T: Thinker<E>> Default for BrainBank<E, T> {
-    fn default() -> Self {
-        Self {
-            rxs: BTreeMap::default(),
-            txs: BTreeMap::default(),
-            statuses: BTreeMap::default(),
-            n_brains: 0,
-            entity_to_brain: BTreeMap::default(),
-        }
-    }
-}
-
-impl<E: Env + 'static, T: Thinker<E>> BrainBank<E, T>
-where
-    T: Send + 'static,
-    T::Metadata: Send + Sync,
-    T::Status: Send + Sync,
-{
-    pub fn spawn(
-        &mut self,
-        cons: impl FnOnce(Receiver<BrainControl<E>>) -> Brain<E, T> + Send + 'static,
-    ) -> usize {
-        static BRAIN_IDS: AtomicUsize = AtomicUsize::new(0);
-        let id = BRAIN_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.n_brains += 1;
-        let (tx, rx) = mpsc::channel(4);
-        let (c_tx, c_rx) = mpsc::channel(4);
-        let mut brain = cons(c_rx);
-        println!("Brain {id} constructed");
-        // run the brain on its own thread, not bevy's
-        std::thread::spawn(move || {
-            futures_lite::future::block_on(async {
-                loop {
-                    let status = brain.poll().await;
-                    match status {
-                        BrainStatus::Error => panic!("Brain returned error status"),
-                        BrainStatus::Ready => std::thread::yield_now(),
-                        status => tx.send(status).await.unwrap(),
-                    }
-                }
-            });
-        });
-        self.rxs.insert(id, rx);
-        self.txs.insert(id, c_tx);
-        id
-    }
-
-    pub fn send_obs(
-        &self,
-        brain: usize,
-        obs: FrameStack<E::Observation>,
-        frame_count: usize,
-        params: E::Params,
-    ) {
-        ComputeTaskPool::get().scope(|scope| {
-            scope.spawn(async {
-                self.txs
-                    .get(&brain)
-                    .unwrap()
-                    .send(BrainControl::NewObs {
-                        obs,
-                        frame_count,
-                        params,
-                    })
-                    .await
-                    .unwrap();
-            })
-        });
-    }
-
-    pub fn send_reward(&self, brain: usize, reward: f32, frame_count: usize) {
-        ComputeTaskPool::get().scope(|scope| {
-            scope.spawn(async {
-                self.txs
-                    .get(&brain)
-                    .unwrap()
-                    .send(BrainControl::NewReward {
-                        reward,
-                        frame_count,
-                    })
-                    .await
-                    .unwrap();
-            })
-        });
-    }
-
-    pub async fn learn(
-        &self,
-        brain: usize,
-        frame_count: usize,
-        rb: PpoBuffer<E>,
-        params: E::Params,
-    ) {
-        let tx = self.txs.get(&brain).unwrap();
-        tx.send(BrainControl::Learn {
-            frame_count,
-            rb,
-            params,
-        })
-        .await
-        .unwrap();
-    }
-
-    pub fn get_status(&mut self, brain: usize) -> Option<ThinkerStatus<E, T>> {
-        while let Ok(status) = self.rxs.get_mut(&brain).unwrap().try_recv() {
-            match status {
-                BrainStatus::NewStatus(status) => {
-                    self.statuses.insert(brain, status);
-                }
-                BrainStatus::Wait(waker) => {
-                    ComputeTaskPool::get().scope(|scope| {
-                        scope.spawn(async {
-                            waker.await.unwrap();
-                        })
-                    });
-                }
-                _ => {}
-            }
-        }
-        self.statuses.get(&brain).cloned()
-    }
-
-    pub fn assign_entity(&mut self, brain: usize, ent: Entity) {
-        self.entity_to_brain.insert(ent, brain);
-    }
-
-    pub fn brain_iter(&self) -> impl Iterator<Item = usize> {
-        0..self.n_brains
     }
 }

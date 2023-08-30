@@ -14,13 +14,12 @@ use bevy::{
     sprite::MaterialMesh2dBundle,
 };
 use bevy_rapier2d::prelude::*;
-use bevy_tasks::ComputeTaskPool;
 
 use crate::{
     brains::{
         replay_buffer::{PpoBuffer, PpoMetadata, Sart},
-        thinkers::ppo::PpoThinker,
-        Brain, BrainBank,
+        thinkers::{ppo::PpoThinker, Thinker},
+        Brain,
     },
     ui::LogText,
     FrameStack, Timestamp,
@@ -309,13 +308,10 @@ pub struct Kills(pub usize);
 pub struct Deaths(pub usize);
 
 #[derive(Component)]
-pub struct BrainId(pub usize);
-
-#[derive(Component)]
 pub struct Name(pub String);
 
 #[derive(Bundle)]
-pub struct AgentBundle<E: Env> {
+pub struct AgentBundle<E: Env, T: Thinker<E>> {
     pub rb: RigidBody,
     pub col: Collider,
     pub rest: Restitution,
@@ -329,8 +325,8 @@ pub struct AgentBundle<E: Env> {
     pub health: Health,
     pub kills: Kills,
     pub deaths: Deaths,
-    pub brain_id: BrainId,
     pub name: Name,
+    pub brain: Brain<E, T>,
     pub obs: FrameStack<E::Observation>,
     pub action: E::Action,
     pub replay_buffer: PpoBuffer<E>,
@@ -338,12 +334,12 @@ pub struct AgentBundle<E: Env> {
     pub terminal: Terminal,
     marker: Agent,
 }
-impl<E: Env> AgentBundle<E> {
+impl<E: Env, T: Thinker<E>> AgentBundle<E, T> {
     pub fn new(
         pos: Vec3,
         color: Option<Color>,
         name: String,
-        brain_id: usize,
+        brain: Brain<E, T>,
         meshes: &mut ResMut<Assets<Mesh>>,
         materials: &mut ResMut<Assets<ColorMaterial>>,
         params: &E::Params,
@@ -383,7 +379,7 @@ impl<E: Env> AgentBundle<E> {
             name: Name(name),
             kills: Kills(0),
             deaths: Deaths(0),
-            brain_id: BrainId(brain_id),
+            brain,
         }
     }
 }
@@ -435,7 +431,6 @@ impl Env for Ffa {
 
 fn setup(
     params: Res<FfaParams>,
-    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -464,18 +459,18 @@ fn setup(
             params.agent_critic_lr,
         );
         // let thinker = RandomThinker;
-        let brain_id = brains.spawn(|rx| Brain::new(thinker, brain_name, ts, rx));
+        // let brain_id = brains.insert(|| Brain::new(thinker, brain_name, ts));
         let agent_pos = Vec3::new(
             (rand::random::<f32>() - 0.5) * 500.0,
             (rand::random::<f32>() - 0.5) * 500.0,
             0.0,
         );
         let color = Color::rgb(rand::random(), rand::random(), rand::random());
-        let mut agent = AgentBundle::<Ffa>::new(
+        let mut agent = AgentBundle::<Ffa, PpoThinker>::new(
             agent_pos,
             Some(color),
             name,
-            brain_id,
+            Brain::new(thinker, brain_name, ts),
             &mut meshes,
             &mut materials,
             &params,
@@ -503,20 +498,17 @@ fn setup(
             materials.reborrow(),
             id,
         ));
-
-        brains.assign_entity(brain_id, id);
     }
 }
 
 fn get_observation(
     params: Res<FfaParams>,
-    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
     mut observations: Query<&mut FrameStack<FfaObs>, With<Agent>>,
+    actions: Query<&FfaAction, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
     agent_velocity: Query<&Velocity, With<Agent>>,
     agent_transform: Query<&Transform, With<Agent>>,
     agent_health: Query<&Health, With<Agent>>,
-    brain_ids: Query<&BrainId, With<Agent>>,
     cx: Res<RapierContext>,
 ) {
     let phys_scaling = PhysicalProperties {
@@ -556,11 +548,10 @@ fn get_observation(
                 other_t.translation.distance(my_t.translation) as i64
             })
         {
-            let other_id = brain_ids.get(other_ent).unwrap();
             let other_t = agent_transform.get(other_ent).unwrap();
             let other_v = agent_velocity.get(other_ent).unwrap();
             let other_h = agent_health.get(other_ent).unwrap();
-            let status = brains.get_status(other_id.0);
+            // let status = brains.with_brain(other_id.0, |brain| brain.thinker.status());
             let other_state = OtherState {
                 phys: PhysicalProperties {
                     position: my_t.translation.xy() - other_t.translation.xy(),
@@ -573,12 +564,7 @@ fn get_observation(
                 }),
                 map_inter: MapInteractionProperties::new(other_t, &cx).scaled_by(&map_scaling),
 
-                firing: status
-                    .unwrap_or_default()
-                    .last_action
-                    .unwrap_or_default()
-                    .combat
-                    .shoot,
+                firing: actions.get(other_ent).unwrap().combat.shoot,
             };
 
             my_state.other_states.push(other_state);
@@ -594,29 +580,28 @@ fn get_observation(
 
 fn get_action(
     params: Res<FfaParams>,
-    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
-    mut actions: Query<&mut FfaAction, With<Agent>>,
-    observations: Query<&FrameStack<FfaObs>, With<Agent>>,
+    mut obs_brains_actions: Query<
+        (
+            &FrameStack<FfaObs>,
+            &mut Brain<Ffa, PpoThinker>,
+            &mut FfaAction,
+        ),
+        With<Agent>,
+    >,
+    // mut actions: Query<&mut FfaAction, With<Agent>>,
     frame_count: Res<FrameCount>,
-    agents: Query<Entity, With<Agent>>,
-    brain_ids: Query<&BrainId, With<Agent>>,
 ) {
     if frame_count.0 as usize % params.agent_frame_stack_len == 0 {
-        for agent_ent in agents.iter() {
-            let brain_id = brain_ids.get(agent_ent).unwrap().0;
-            brains.send_obs(
-                brain_id,
-                observations.get(agent_ent).unwrap().clone(),
-                frame_count.0 as usize,
-                *params,
-            );
-            let status = brains.get_status(brain_id);
-            if let Some(status) = status {
-                // if let Some(action) = status.last_action {
-                *actions.get_mut(agent_ent).unwrap() = status.last_action.unwrap();
-                // }
-            }
-        }
+        obs_brains_actions
+            .par_iter_mut()
+            .for_each_mut(|(obs, mut brain, mut actions)| {
+                let action = brain.act(obs, &*params);
+                if let Some(action) = action {
+                    // if let Some(action) = status.last_action {
+                    *actions = action;
+                    // }
+                }
+            });
     }
 }
 
@@ -717,12 +702,11 @@ fn send_reward(
     agents: Query<Entity, With<Agent>>,
     frame_count: Res<FrameCount>,
     rewards: Query<&Reward, With<Agent>>,
-    brains: ResMut<BrainBank<Ffa, PpoThinker>>,
-    brain_ids: Query<&BrainId, With<Agent>>,
+    mut brains: Query<&mut Brain<Ffa, PpoThinker>, With<Agent>>,
 ) {
     for agent_ent in agents.iter() {
-        brains.send_reward(
-            brain_ids.get(agent_ent).unwrap().0,
+        brains.get_mut(agent_ent).unwrap().writer.add_scalar(
+            "Reward",
             rewards.get(agent_ent).unwrap().0,
             frame_count.0 as usize,
         );
@@ -779,7 +763,6 @@ fn update(
         (Entity, &mut Transform, &HealthBar),
         (Without<NameText>, Without<Agent>),
     >,
-    brain_ids: Query<&BrainId, With<Agent>>,
     names: Query<&Name, With<Agent>>,
     kills: Query<&Kills, With<Agent>>,
     deaths: Query<&Deaths, With<Agent>>,
@@ -790,8 +773,7 @@ fn update(
         if let Ok(agent) = agent_transform.get(text_comp.entity_following) {
             t.translation = agent.translation + Vec3::new(0.0, params.agent_radius + 20.0, 2.0);
             text.sections[0].value = format!(
-                "{} {} {}-{}",
-                brain_ids.get(text_comp.entity_following).unwrap().0,
+                "{} {}-{}",
                 names.get(text_comp.entity_following).unwrap().0,
                 kills.get(text_comp.entity_following).unwrap().0,
                 deaths.get(text_comp.entity_following).unwrap().0,
@@ -841,61 +823,48 @@ fn check_dead(
 
 fn learn(
     params: Res<FfaParams>,
-    rbs: Query<&PpoBuffer<Ffa>, With<Agent>>,
-    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
+    mut query: Query<(&PpoBuffer<Ffa>, &Deaths, &Name, &mut Brain<Ffa, PpoThinker>), With<Agent>>,
     frame_count: Res<FrameCount>,
-    agents: Query<Entity, With<Agent>>,
-    brain_ids: Query<&BrainId, With<Agent>>,
-    deaths: Query<&Deaths, With<Agent>>,
-    names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
 ) {
     if frame_count.0 > 1 && frame_count.0 as usize % params.agent_update_interval == 0 {
-        for agent_ent in agents.iter() {
-            if deaths.get(agent_ent).unwrap().0 > 0 {
-                let rb = rbs.get(agent_ent).unwrap().clone();
-                let id = brain_ids.get(agent_ent).unwrap().0;
-                let name = &names.get(agent_ent).unwrap().0;
-                log.push(format!("Training {id} {name}..."));
-
-                ComputeTaskPool::get().scope(|scope| {
-                    scope.spawn(async {
-                        brains.learn(id, frame_count.0 as usize, rb, *params).await;
-                    });
-                });
-                let status = brains.get_status(id);
-                if let Some(status) = status.and_then(|s| s.status) {
-                    log.push(format!(
-                        "{} {} Policy Loss: {}",
-                        id, name, status.recent_policy_loss
-                    ));
-                    log.push(format!(
-                        "{} {} Policy Entropy: {}",
-                        id, name, status.recent_entropy_loss
-                    ));
-                    log.push(format!(
-                        "{} {} Policy Clip Ratio: {}",
-                        id, name, status.recent_nclamp
-                    ));
-                    log.push(format!(
-                        "{} {} Value Loss: {}",
-                        id, name, status.recent_value_loss
-                    ));
+        query
+            .par_iter_mut()
+            .for_each_mut(|(rb, deaths, name, mut brain)| {
+                if deaths.0 > 0 {
+                    brain.learn(frame_count.0 as usize, rb, &*params);
                 }
-            }
+            });
+        for (_, _, name, brain) in query.iter() {
+            let status = Thinker::<Ffa>::status(&brain.thinker);
+            log.push(format!(
+                "{} Policy Loss: {}",
+                name.0, status.recent_policy_loss
+            ));
+            log.push(format!(
+                "{} Policy Entropy: {}",
+                name.0, status.recent_entropy_loss
+            ));
+            log.push(format!(
+                "{} Policy Clip Ratio: {}",
+                name.0, status.recent_nclamp
+            ));
+            log.push(format!(
+                "{} Value Loss: {}",
+                name.0, status.recent_value_loss
+            ));
         }
     }
 }
 
 pub fn ui(
     mut cxs: EguiContexts,
-    log: ResMut<LogText>,
+    log: Res<LogText>,
     agents: Query<Entity, With<Agent>>,
     kills: Query<&Kills, With<Agent>>,
     deaths: Query<&Deaths, With<Agent>>,
-    brain_ids: Query<&BrainId, With<Agent>>,
     names: Query<&Name, With<Agent>>,
-    mut brains: ResMut<BrainBank<Ffa, PpoThinker>>,
+    brains: Query<&Brain<Ffa, PpoThinker>, With<Agent>>,
 ) {
     egui::Window::new("Scores").show(cxs.ctx_mut(), |ui| {
         ui.vertical(|ui| {
@@ -906,12 +875,8 @@ pub fn ui(
             {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{} {}",
-                            brain_ids.get(handle).unwrap().0,
-                            names.get(handle).unwrap().0,
-                        ))
-                        .text_style(egui::TextStyle::Heading),
+                        egui::RichText::new(format!("{}", names.get(handle).unwrap().0,))
+                            .text_style(egui::TextStyle::Heading),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                         ui.label(
@@ -938,19 +903,13 @@ pub fn ui(
                 Layout::left_to_right(egui::Align::Min).with_main_wrap(false),
                 |ui| {
                     // egui::Grid::new("mean/std grid").show(ui, |ui| {
-                    for (_i, brain) in agents
-                        .iter()
-                        .sorted_by_key(|h| brain_ids.get(*h).unwrap().0)
-                        .enumerate()
-                    {
+                    for (_i, brain) in agents.iter().enumerate() {
                         ui.group(|ui| {
                             ui.vertical(|ui| {
                                 ui.heading(&names.get(brain).unwrap().0);
                                 // ui.group(|ui| {
-                                let status = brains
-                                    .get_status(brain_ids.get(brain).unwrap().0)
-                                    .unwrap_or_default();
-                                let status = status.status.unwrap();
+                                let status =
+                                    Thinker::<Ffa>::status(&brains.get(brain).unwrap().thinker);
                                 let mut mu = "mu:".to_owned();
                                 for m in status.recent_mu.iter() {
                                     mu.push_str(&format!(" {:.4}", m));
@@ -1000,7 +959,7 @@ pub fn ui(
                                             ui.label("Action Space");
                                             egui::plot::Plot::new(format!(
                                                 "ActionSpace{}",
-                                                brain_ids.get(brain).unwrap().0,
+                                                names.get(brain).unwrap().0,
                                             ))
                                             .center_y_axis(true)
                                             .data_aspect(1.0 / 2.0)
