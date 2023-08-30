@@ -1,7 +1,12 @@
 #![feature(return_position_impl_trait_in_trait)]
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
-use std::{collections::VecDeque, fmt, sync::Arc};
+use std::{
+    collections::VecDeque,
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use bevy::{
     prelude::*,
@@ -17,10 +22,12 @@ use burn_tensor::backend::Backend;
 use envs::{
     ffa::Ffa,
     maps::{tdm::TdmMap, Map},
-    tdm::Tdm,
+    tdm::{Tdm, TdmParams},
     // tdm::Tdm,
     Env,
+    Params,
 };
+use serde::Serialize;
 use tensorboard_rs::summary_writer::SummaryWriter;
 use ui::LogText;
 
@@ -139,14 +146,23 @@ fn handle_input(
         }
     }
 }
-fn run_env<E: Env, M: Map>(seed: [u8; 32]) {
+fn run_env<E: Env, M: Map>(seed: [u8; 32], params: E::Params)
+where
+    E::Params: Serialize,
+{
+    let ts = Timestamp::default();
+    let mut p = Path::new("./training").to_path_buf();
+    p.push(ts.to_string());
+    std::fs::create_dir_all(&p).ok();
+    p.push("env.json");
+    params.to_json_file(p).ok();
     App::new()
         .insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
             focused_mode: bevy::winit::UpdateMode::Continuous,
             ..default()
         })
-        .insert_resource(Timestamp::default())
+        .insert_resource(ts)
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
         .add_plugins(EntropyPlugin::<ChaCha8Rng>::with_seed(seed))
@@ -178,7 +194,7 @@ fn run_env<E: Env, M: Map>(seed: [u8; 32]) {
         // .add_plugins(RapierDebugRenderPlugin::default())
         .add_plugins(EguiPlugin)
         .insert_resource(E::init())
-        .insert_resource(E::Params::default())
+        .insert_resource(params)
         .add_systems(Startup, setup)
         .add_systems(Startup, (M::setup_system(), E::setup_system()).chain())
         .add_systems(Update, E::ui_system())
@@ -191,5 +207,17 @@ fn main() {
     let tch_seed: u64 = 0xcafebabe;
     let bevy_seed: [u8; 32] = [42; 32];
     burn_tch::TchBackend::<f32>::seed(tch_seed);
-    run_env::<Tdm, TdmMap>(bevy_seed);
+
+    let params = match TdmParams::from_json_file("tdm.json").ok() {
+        Some(params) => {
+            println!("Loaded environment parameters:\n{:?}", params);
+            params
+        }
+        None => {
+            println!("Using default environment parameters.");
+            Default::default()
+        }
+    };
+
+    run_env::<Tdm, TdmMap>(bevy_seed, params);
 }

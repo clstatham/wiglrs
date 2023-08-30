@@ -1,14 +1,3 @@
-use bevy::prelude::*;
-use bevy::{core::FrameCount, math::Vec3Swizzles};
-use bevy_egui::egui::plot::{Bar, BarChart, Line};
-use bevy_egui::EguiContexts;
-use bevy_prng::ChaCha8Rng;
-use bevy_rand::prelude::EntropyComponent;
-use bevy_rand::resource::GlobalEntropy;
-use bevy_rapier2d::prelude::*;
-use itertools::Itertools;
-use rand_distr::{Distribution, Uniform};
-
 use crate::brains::thinkers::ppo::PpoParams;
 use crate::brains::thinkers::Thinker;
 use crate::ui::LogText;
@@ -21,6 +10,17 @@ use crate::{
     envs::ffa::{check_dead, update},
     names, FrameStack, Timestamp,
 };
+use bevy::prelude::*;
+use bevy::{core::FrameCount, math::Vec3Swizzles};
+use bevy_egui::egui::plot::{Bar, BarChart, Line};
+use bevy_egui::EguiContexts;
+use bevy_prng::ChaCha8Rng;
+use bevy_rand::prelude::EntropyComponent;
+use bevy_rand::resource::GlobalEntropy;
+use bevy_rapier2d::prelude::*;
+use itertools::Itertools;
+use rand_distr::{Distribution, Uniform};
+use serde::{Deserialize, Serialize};
 
 use super::ffa::{learn, Deaths, Kills, Name, Reward, ShootyLine, Terminal};
 use super::{
@@ -35,7 +35,7 @@ use super::{
     Action, DefaultFrameStack, Env, Observation, Params,
 };
 
-#[derive(Resource, Debug, Clone)]
+#[derive(Resource, Debug, Clone, Serialize, Deserialize)]
 pub struct TdmParams {
     pub ffa_params: FfaParams,
     pub num_teams: usize,

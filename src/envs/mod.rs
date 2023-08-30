@@ -1,6 +1,12 @@
-use bevy::{ecs::schedule::SystemConfigs, prelude::*};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::Path,
+};
 
 use crate::FrameStack;
+use bevy::{ecs::schedule::SystemConfigs, prelude::*};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod ffa;
 pub mod maps;
@@ -30,6 +36,39 @@ pub trait Params {
     fn agent_max_health(&self) -> f32;
     fn num_agents(&self) -> usize;
     fn agent_frame_stack_len(&self) -> usize;
+    fn to_json(&self) -> Result<String, Box<dyn std::error::Error>>
+    where
+        Self: Serialize,
+    {
+        let s = serde_json::to_string(self)?;
+        Ok(s)
+    }
+    fn to_json_file(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>
+    where
+        Self: Serialize,
+    {
+        let mut f = File::create(path)?;
+        let s = self.to_json()?;
+        write!(f, "{}", s)?;
+        Ok(())
+    }
+    fn from_json<'a>(json: &'a str) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        Self: Deserialize<'a>,
+    {
+        let this = serde_json::from_str(json)?;
+        Ok(this)
+    }
+    fn from_json_file(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        Self: DeserializeOwned,
+    {
+        let mut f = File::open(path)?;
+        let mut s = String::new();
+        f.read_to_string(&mut s)?;
+        let this = Self::from_json(s.as_str())?;
+        Ok(this)
+    }
 }
 
 pub trait Env: Resource {

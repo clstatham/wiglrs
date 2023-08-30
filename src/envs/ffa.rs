@@ -17,6 +17,7 @@ use bevy::{
 };
 use bevy_rapier2d::prelude::*;
 use rand_distr::{Distribution, Uniform};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     brains::{
@@ -39,7 +40,7 @@ use super::{
     Action, DefaultFrameStack, Env, Observation, Params,
 };
 
-#[derive(Debug, Resource, Clone, Copy)]
+#[derive(Debug, Resource, Clone, Copy, Serialize, Deserialize)]
 pub struct FfaParams {
     pub num_agents: usize,
     pub agent_hidden_dim: usize,
@@ -66,12 +67,12 @@ impl Default for FfaParams {
             agent_hidden_dim: 64,
             agent_actor_lr: 1e-4,
             agent_critic_lr: 1e-3,
-            agent_training_epochs: 25,
-            agent_training_batch_size: 128,
+            agent_training_epochs: 5,
+            agent_training_batch_size: 4096,
             agent_entropy_beta: 0.001,
             agent_update_interval: 1_000,
             agent_rb_max_len: 100_000,
-            agent_frame_stack_len: 5,
+            agent_frame_stack_len: 2,
             agent_radius: 20.0,
             agent_lin_move_force: 600.0,
             agent_ang_move_force: 1.0,
@@ -869,7 +870,9 @@ pub fn learn<E: Env, T>(
     E::Action: Action<E, Metadata = PpoMetadata>,
     T: Thinker<E, Status = PpoStatus>,
 {
-    if frame_count.0 > 1 && frame_count.0 as usize % params.agent_update_interval() == 0 {
+    if frame_count.0 as usize >= params.training_batch_size()
+        && frame_count.0 as usize % params.agent_update_interval() == 0
+    {
         query
             .par_iter_mut()
             .for_each_mut(|(mut rng, mut rb, deaths, _name, mut brain)| {
