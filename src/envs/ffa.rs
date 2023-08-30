@@ -63,9 +63,9 @@ impl Default for FfaParams {
     fn default() -> Self {
         Self {
             num_agents: 4,
-            agent_hidden_dim: 32,
-            agent_actor_lr: 1e-5,
-            agent_critic_lr: 1e-4,
+            agent_hidden_dim: 64,
+            agent_actor_lr: 1e-4,
+            agent_critic_lr: 1e-3,
             agent_training_epochs: 25,
             agent_training_batch_size: 128,
             agent_entropy_beta: 0.001,

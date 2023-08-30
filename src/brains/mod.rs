@@ -46,6 +46,15 @@ impl<E: Env, T: Thinker<E>> Brain<E, T> {
     }
 }
 
+impl<E: Env, T: Thinker<E>> Drop for Brain<E, T> {
+    fn drop(&mut self) {
+        info!("Saving {}...", self.name);
+        if let Err(e) = self.save() {
+            error!("Save failed: {:?}", e);
+        }
+    }
+}
+
 impl<E: Env, T: Thinker<E>> Brain<E, T> {
     pub fn act(
         &mut self,
