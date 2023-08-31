@@ -100,11 +100,11 @@ pub fn action_space<E: Env, T: Thinker<E, Status = PpoStatus>>(
                                     mu.push_str(&format!(" {:.4}", m));
                                 }
                                 ui.label(mu);
-                                let mut std = "std:".to_owned();
-                                for s in status.recent_std.iter() {
-                                    std.push_str(&format!(" {:.4}", s));
+                                let mut cov = "cov:".to_owned();
+                                for s in status.recent_cov.iter() {
+                                    cov.push_str(&format!(" {:.4}", s));
                                 }
-                                ui.label(std);
+                                ui.label(cov);
                                 ui.label(format!("ent: {}", status.recent_entropy));
                                 // });
 
@@ -113,11 +113,11 @@ pub fn action_space<E: Env, T: Thinker<E, Status = PpoStatus>>(
                                 let ms = status
                                     .recent_mu
                                     .iter()
-                                    .zip(status.recent_std.iter())
+                                    .zip(status.recent_cov.iter())
                                     .enumerate()
-                                    .map(|(i, (mu, std))| {
+                                    .map(|(i, (mu, cov))| {
                                         // https://www.desmos.com/calculator/rkoehr8rve
-                                        let scale = std * 3.0;
+                                        let scale = cov.sqrt() * 3.0;
                                         let _rg =
                                             Vec2::new(scale.exp(), (1.0 / scale).exp()).normalize();
                                         let m = Bar::new(i as f64, *mu as f64)
@@ -127,10 +127,10 @@ pub fn action_space<E: Env, T: Thinker<E, Status = PpoStatus>>(
                                             //     0,
                                             // ));
                                             .fill(egui::Color32::RED);
-                                        let var = std * std;
+                                        let std = cov.sqrt();
                                         let s = Line::new(vec![
-                                            [i as f64, *mu as f64 - var as f64],
-                                            [i as f64, *mu as f64 + var as f64],
+                                            [i as f64, *mu as f64 - std as f64],
+                                            [i as f64, *mu as f64 + std as f64],
                                         ])
                                         .stroke(egui::Stroke::new(4.0, egui::Color32::LIGHT_GREEN));
                                         (m, s)

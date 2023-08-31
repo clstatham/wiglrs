@@ -573,8 +573,10 @@ fn get_reward(
             }
 
             let mut my_force = force.get_mut(agent_ent).unwrap();
-            my_force.force = action.phys.force * params.ffa_params.agent_lin_move_force;
-            my_force.torque = action.phys.torque * params.ffa_params.agent_ang_move_force;
+            my_force.force = action.phys.force.clamp(Vec2::splat(-1.0), Vec2::splat(1.0))
+                * params.ffa_params.agent_lin_move_force;
+            my_force.torque =
+                action.phys.torque.clamp(-1.0, 1.0) * params.ffa_params.agent_ang_move_force;
         }
     }
 }

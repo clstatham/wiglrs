@@ -34,55 +34,66 @@ use super::{linalg::orthogonal, Status, Thinker};
 
 pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
 
+#[cfg(test)]
+mod tests {
+    use burn_tch::TchBackend;
+    use burn_tensor::Tensor;
+
+    use super::MvNormal;
+
+    #[test]
+    fn test_logpdf() {
+        let mu = Tensor::<TchBackend<f32>, 1>::from_floats([0.0, 1.0, -1.0]).unsqueeze();
+        let std = Tensor::<TchBackend<f32>, 1>::from_floats([0.1, 0.7, 1.5]).unsqueeze();
+        let xs = Tensor::<TchBackend<f32>, 1>::from_floats([0.2, -0.9, 1.5]).unsqueeze();
+        let dist = MvNormal { mu, cov: std };
+        let lp = dist.log_prob(xs).into_scalar();
+        assert!((lp - -6.4918).abs() < 1e-4);
+    }
+}
+
 pub struct MvNormal<B: Backend<FloatElem = f32>> {
     pub mu: Tensor<B, 2>,
-    pub std: Tensor<B, 2>,
+    pub cov: Tensor<B, 2>,
 }
 
 impl<B: Backend<FloatElem = f32>> MvNormal<B> {
     pub fn sample(&self, rng: &mut EntropyComponent<ChaCha8Rng>) -> Tensor<B, 2> {
-        let std = self.std.clone();
+        let cov = self.cov.clone();
         let [_, nfeat] = self.mu.shape().dims;
-        let cov = std.to_data().value;
-        assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
         let mut sampler = burn_tensor::Distribution::<f32>::Normal(0.0, 1.0).sampler(rng);
         let samples = (0..nbatch * nfeat).map(|_| sampler.sample()).collect_vec();
         let z = Tensor::from_floats(samples.as_slice())
             .reshape([nbatch, nfeat])
             .to_device(&self.mu.device());
-        // let z = Tensor::random([nbatch, nfeat]).to_device(&self.mu.device());
 
-        self.mu.clone() + z * std
+        self.mu.clone() + z * cov
     }
 
     // https://online.stat.psu.edu/stat505/book/export/html/636
     pub fn log_prob(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let [nbatch, nfeat] = self.mu.shape().dims;
+        let [nbatch, _nfeat] = self.mu.shape().dims;
         let x = x.to_device(&self.mu.device());
-        let first = self.std.ones_like() / (self.std.clone() * 2.0 * PI).sqrt();
+        let first = self.cov.ones_like() / (self.cov.clone() * 2.0 * PI).sqrt();
         let second = {
-            let a = self.std.ones_like().neg() / (self.std.clone() * 2.0);
+            let a = self.cov.ones_like().neg() / (self.cov.clone() * 2.0);
             let b = x.clone() - self.mu.clone();
             (a * b.clone() * b).exp()
         };
         let factors = first * second;
 
-        let mut prod = Tensor::<B, 2>::ones([nbatch, 1]).to_device(&self.mu.device());
-        for i in 0..nfeat {
-            prod = prod * factors.clone().slice([0..nbatch, i..i + 1]);
-        }
-        prod.log()
+        factors.log().sum_dim(1).reshape([nbatch, 1])
     }
 
     pub fn entropy(&self) -> Tensor<B, 2> {
-        let cov = self.std.to_data().value;
+        let cov = self.cov.to_data().value;
         let [_, nfeat] = self.mu.shape().dims;
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
-        let mut g = Tensor::ones([nbatch, 1]).to_device(&self.std.device());
+        let mut g = Tensor::ones([nbatch, 1]).to_device(&self.cov.device());
         for i in 0..nfeat {
-            g = g * self.std.clone().slice([0..nbatch, i..i + 1]);
+            g = g * self.cov.clone().slice([0..nbatch, i..i + 1]);
         }
         let second_term = (nfeat as f32 * 0.5) * (1.0 + (2.0 * PI).ln());
         g.log() * 0.5 + second_term
@@ -219,8 +230,8 @@ pub struct PpoActor<B: Backend> {
     common1: Linear<B>,
     common2: Linear<B>,
     mu_head: Linear<B>,
-    // std_head: Param<Tensor<B, 1>>,
-    std_head: Linear<B>,
+    // cov_head: Param<Tensor<B, 1>>,
+    cov_head: Linear<B>,
     obs_len: usize,
 }
 
@@ -251,14 +262,10 @@ impl PpoActorConfig {
                 weight: Param::from(orthogonal([self.hidden_len, self.action_len].into(), 0.01)),
                 bias: Some(Param::from(Tensor::zeros([self.action_len]))),
             },
-            std_head: Linear {
+            cov_head: Linear {
                 weight: Param::from(orthogonal([self.hidden_len, self.action_len].into(), 0.01)),
                 bias: Some(Param::from(Tensor::zeros([self.action_len]))),
             },
-            // std_head: Param::new(
-            //     ParamId::new(),
-            //     Tensor::zeros([self.action_len]).require_grad(),
-            // ),
         }
     }
 }
@@ -281,9 +288,9 @@ impl<B: Backend<FloatElem = f32>> PpoActor<B> {
 
         // let mu = mu.tanh();
 
-        let std = self.std_head.forward(x);
-        let std: Tensor<B, 2> = (std.exp() + 1.0).log();
-        (mu, std)
+        let cov = self.cov_head.forward(x);
+        let cov: Tensor<B, 2> = (cov.exp() + 1.0).log();
+        (mu, cov)
     }
 }
 
@@ -341,7 +348,7 @@ pub struct HiddenStates<B: Backend> {
 #[derive(Debug, Clone, Default)]
 pub struct PpoStatus {
     pub recent_mu: Box<[f32]>,
-    pub recent_std: Box<[f32]>,
+    pub recent_cov: Box<[f32]>,
     pub recent_entropy: f32,
     pub recent_policy_loss: f32,
     pub recent_value_loss: f32,
@@ -503,12 +510,12 @@ where
             .map(|o| Tensor::from_floats(&*o).unsqueeze::<2>())
             .collect::<Vec<_>>();
         let obs = Tensor::cat(obs, 0).unsqueeze();
-        let (mu, std) = self.actor.valid().forward(obs.clone());
+        let (mu, cov) = self.actor.valid().forward(obs.clone());
         self.status.recent_mu = mu.to_data().value.into_boxed_slice();
-        self.status.recent_std = std.to_data().value.into_boxed_slice();
-        let dist = MvNormal { mu, std };
+        self.status.recent_cov = cov.to_data().value.into_boxed_slice();
+        let dist = MvNormal { mu, cov: cov };
         self.status.recent_entropy = dist.entropy().into_scalar();
-        let action = dist.sample(rng).tanh();
+        let action = dist.sample(rng);
         let val = self.critic.valid().forward(obs);
 
         let action_vec = action.to_data().value;
@@ -604,10 +611,10 @@ where
                     / (advantage.var(0).sqrt() + 1e-7);
                 let returns = advantage.clone() + old_val;
 
-                let (mu, std) = self.actor.forward(s.clone());
+                let (mu, cov) = self.actor.forward(s.clone());
                 let dist = MvNormal {
                     mu: mu.clone(),
-                    std: std.clone(),
+                    cov: cov.clone(),
                 };
                 let entropy = dist.entropy();
                 let lp = dist.log_prob(a);
@@ -642,7 +649,7 @@ where
                 if pl.is_nan() {
                     dbg!(
                         mu.to_data(),
-                        std.to_data(),
+                        cov.to_data(),
                         advantage.to_data(),
                         ratio.to_data(),
                         log_ratio.to_data()
