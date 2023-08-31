@@ -362,17 +362,6 @@ fn observation(
     >,
     queries: Query<(Entity, &TeamId, &TdmAction, &Velocity, &Transform, &Health), With<Agent>>,
 ) {
-    let phys_scaling = PhysicalProperties {
-        position: Vec2::splat(params.ffa_params.distance_scaling),
-        direction: Vec2::splat(1.0),
-        linvel: Vec2::splat(params.ffa_params.distance_scaling),
-    };
-    let map_scaling = MapInteractionProperties {
-        up_wall_dist: params.ffa_params.distance_scaling,
-        down_wall_dist: params.ffa_params.distance_scaling,
-        left_wall_dist: params.ffa_params.distance_scaling,
-        right_wall_dist: params.ffa_params.distance_scaling,
-    };
     queries
         .iter()
         .for_each(|(agent, my_team, _action, velocity, transform, health)| {
@@ -397,7 +386,7 @@ fn observation(
                 if my_team.0 == other_team.0 {
                     my_state.teammates.push(TeammateObs {
                         phys: PhysicalProperties {
-                            position: transform.translation.xy() - other_transform.translation.xy(),
+                            position: other_transform.translation.xy() - transform.translation.xy(),
                             direction: other_transform.local_y().xy(),
                             linvel: other_vel.linvel,
                         },
@@ -410,20 +399,49 @@ fn observation(
                         firing: other_action.combat.shoot > 0.0,
                     });
                 } else {
-                    my_state.enemies.push(EnemyObs {
-                        phys: PhysicalProperties {
-                            position: transform.translation.xy() - other_transform.translation.xy(),
-                            direction: other_transform.local_y().xy(),
-                            linvel: other_vel.linvel,
-                        },
-                        // .scaled_by(&phys_scaling),
-                        combat: CombatProperties {
-                            health: other_health.0, // / params.ffa_params.agent_max_health,
-                        },
-                        map_interaction: MapInteractionProperties::new(other_transform, &cx),
-                        // .scaled_by(&map_scaling),
-                        firing: other_action.combat.shoot > 0.0,
-                    });
+                    // check line of sight
+                    let mut filter = QueryFilter::new();
+                    for (ent, tm, _, _, _, _) in queries.iter() {
+                        if tm.0 == my_team.0 {
+                            filter = filter.exclude_collider(ent);
+                        }
+                    }
+                    if let Some((hit_ent, _)) = cx.cast_ray(
+                        transform.translation.xy(),
+                        (other_transform.translation.xy() - transform.translation.xy()).normalize(),
+                        Real::MAX,
+                        true,
+                        filter,
+                    ) {
+                        // is it an agent or a wall?
+                        if queries.get(hit_ent).is_ok() {
+                            // we can see the enemy
+                            my_state.enemies.push(EnemyObs {
+                                phys: PhysicalProperties {
+                                    position: other_transform.translation.xy()
+                                        - transform.translation.xy(),
+                                    direction: other_transform.local_y().xy(),
+                                    linvel: other_vel.linvel,
+                                },
+                                // .scaled_by(&phys_scaling),
+                                combat: CombatProperties {
+                                    health: other_health.0, // / params.ffa_params.agent_max_health,
+                                },
+                                map_interaction: MapInteractionProperties::new(
+                                    other_transform,
+                                    &cx,
+                                ),
+                                // .scaled_by(&map_scaling),
+                                firing: other_action.combat.shoot > 0.0,
+                            });
+                        } else {
+                            // obscured by a wall
+                            my_state.enemies.push(EnemyObs::default());
+                        }
+                    } else {
+                        // ray hit nothing???
+                        my_state.enemies.push(EnemyObs::default());
+                    }
                 }
             }
 
@@ -459,9 +477,6 @@ fn get_reward(
     names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
 ) {
-    for mut reward in rewards.iter_mut() {
-        reward.0 = 0.0;
-    }
     for agent_ent in agents.iter() {
         let my_health = health.get(agent_ent).unwrap();
         let my_t = agent_transform.get(agent_ent).unwrap();

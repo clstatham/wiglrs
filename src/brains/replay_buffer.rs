@@ -178,9 +178,9 @@ where
         idxs.shuffle(rng);
         let mut counter = 0;
         let mut batches = vec![];
-        while counter < idxs.len() {
+        while counter + batch_size < idxs.len() {
             let mut batch = PpoBuffer::new(None);
-            let end = (counter + batch_size).min(idxs.len());
+            let end = counter + batch_size;
             let batch_idxs = &idxs[counter..end];
             for i in batch_idxs {
                 batch.obs.push_back(self.obs[*i].to_owned());

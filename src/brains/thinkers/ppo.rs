@@ -222,8 +222,8 @@ pub struct PpoActor<B: Backend> {
     common1: Linear<B>,
     common2: Linear<B>,
     mu_head: Linear<B>,
-    // std_head: Param<Tensor<B, 1>>,
-    std_head: Linear<B>,
+    std_head: Param<Tensor<B, 1>>,
+    // std_head: Linear<B>,
     obs_len: usize,
 }
 
@@ -245,12 +245,15 @@ impl PpoActorConfig {
             common1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
             common2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
             mu_head: LinearConfig::new(self.hidden_len, self.action_len)
-                .with_initializer(Initializer::XavierUniform { gain: 1.0 })
+                .with_initializer(Initializer::XavierUniform { gain: 0.01 })
                 .init(),
-            std_head: LinearConfig::new(self.hidden_len, self.action_len)
-                .with_initializer(Initializer::XavierUniform { gain: 1.0 })
-                .init(),
-            // std_head: Param::new(ParamId::new(), Initializer::Zeros.init([self.action_len])),
+            // std_head: LinearConfig::new(self.hidden_len, self.action_len)
+            //     .with_initializer(Initializer::XavierUniform { gain: 1.0 })
+            //     .init(),
+            std_head: Param::new(
+                ParamId::new(),
+                Tensor::zeros([self.action_len]).require_grad(),
+            ),
         }
     }
 }
@@ -273,7 +276,7 @@ impl<B: Backend<FloatElem = f32>> PpoActor<B> {
 
         // let mu = mu.tanh();
 
-        let std = self.std_head.forward(x).exp();
+        let std = self.std_head.val().exp().unsqueeze().repeat(0, nbatch);
         // let std = std + 1e-7;
         // let [nbatch, nstack, nfeat] = std.shape().dims;
         // let std = std
@@ -435,15 +438,15 @@ impl PpoThinker {
             hidden_len,
             action_len,
         }
-        .init(rng);
-        // .fork(&TchDevice::Cuda(0));
+        .init(rng)
+        .fork(&TchDevice::Cuda(0));
         dbg!(actor.num_params());
         let critic = PpoCriticConfig {
             obs_len,
             hidden_len,
         }
-        .init(rng);
-        // .fork(&TchDevice::Cuda(0));
+        .init(rng)
+        .fork(&TchDevice::Cuda(0));
         dbg!(critic.num_params());
         let actor_optim = RMSPropConfig::new()
             .with_momentum(0.0)
@@ -540,7 +543,10 @@ where
         let mut total_entropy_loss = 0.0;
         let mut total_nclamp = 0.0;
         let mut total_kl = 0.0;
-        let mut it = tqdm!(total = self.training_epochs, desc = "Training");
+        let mut it = tqdm!(
+            total = self.training_epochs * self.training_batch_size,
+            desc = "Training"
+        );
         for _epoch in 0..self.training_epochs {
             let steps = rb.shuffled_and_batched(self.training_batch_size, rng);
             let mut epoch_kl = 0.0;
@@ -600,7 +606,10 @@ where
                 let returns = advantage.clone() + old_val;
 
                 let (mu, std) = self.actor.forward(s.clone());
-                let dist = MvNormal { mu, std };
+                let dist = MvNormal {
+                    mu: mu.clone(),
+                    std: std.clone(),
+                };
                 let entropy = dist.entropy();
                 let lp = dist.log_prob(a);
                 let log_ratio = lp.clone() - old_lp;
@@ -618,20 +627,33 @@ where
                 let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
                 total_nclamp += nclamp.mean().into_scalar();
 
-                let surr2 = ratio.clone().clamp(0.8, 1.2) * advantage;
+                let surr2 = ratio.clone().clamp(0.8, 1.2) * advantage.clone();
                 let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
                 let policy_loss = -masked.mean();
 
-                total_pi_loss += policy_loss.clone().into_scalar();
                 let entropy_loss = entropy.mean();
                 total_entropy_loss += entropy_loss.clone().into_scalar();
                 let policy_loss = policy_loss - entropy_loss * self.entropy_beta;
-                let kl = ((ratio - 1.0) - log_ratio.clone()).mean().into_scalar();
+                let kl = ((ratio.clone() - 1.0) - log_ratio.clone())
+                    .mean()
+                    .into_scalar();
                 total_kl += kl;
                 epoch_kl += kl;
+                let pl = policy_loss.clone().into_scalar();
+                if pl.is_nan() {
+                    dbg!(
+                        mu.to_data(),
+                        std.to_data(),
+                        advantage.to_data(),
+                        ratio.to_data(),
+                        log_ratio.to_data()
+                    );
+                    panic!("NaN Loss");
+                }
+                total_pi_loss += pl;
                 it.set_postfix(format!(
                     "pl={} kl={} p={}",
-                    policy_loss.clone().into_scalar(),
+                    pl,
                     kl,
                     lp.clone().exp().mean().into_scalar(),
                 ));
