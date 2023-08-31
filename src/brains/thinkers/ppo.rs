@@ -22,11 +22,8 @@ use itertools::Itertools;
 use std::{f32::consts::PI, marker::PhantomData};
 
 use crate::{
-    brains::{
-        replay_buffer::{PpoBuffer, PpoMetadata},
-        thinkers::stats::{diag, diag2d},
-    },
-    envs::{Observation, Params},
+    brains::replay_buffer::{PpoBuffer, PpoMetadata},
+    envs::Params,
 };
 use crate::{
     envs::{Action, Env},
@@ -222,8 +219,8 @@ pub struct PpoActor<B: Backend> {
     common1: Linear<B>,
     common2: Linear<B>,
     mu_head: Linear<B>,
-    std_head: Param<Tensor<B, 1>>,
-    // std_head: Linear<B>,
+    // std_head: Param<Tensor<B, 1>>,
+    std_head: Linear<B>,
     obs_len: usize,
 }
 
@@ -245,15 +242,15 @@ impl PpoActorConfig {
             common1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
             common2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
             mu_head: LinearConfig::new(self.hidden_len, self.action_len)
-                .with_initializer(Initializer::XavierUniform { gain: 0.01 })
+                .with_initializer(Initializer::XavierNormal { gain: 0.01 })
                 .init(),
-            // std_head: LinearConfig::new(self.hidden_len, self.action_len)
-            //     .with_initializer(Initializer::XavierUniform { gain: 1.0 })
-            //     .init(),
-            std_head: Param::new(
-                ParamId::new(),
-                Tensor::zeros([self.action_len]).require_grad(),
-            ),
+            std_head: LinearConfig::new(self.hidden_len, self.action_len)
+                .with_initializer(Initializer::XavierNormal { gain: 0.01 })
+                .init(),
+            // std_head: Param::new(
+            //     ParamId::new(),
+            //     Tensor::zeros([self.action_len]).require_grad(),
+            // ),
         }
     }
 }
@@ -276,14 +273,8 @@ impl<B: Backend<FloatElem = f32>> PpoActor<B> {
 
         // let mu = mu.tanh();
 
-        let std = self.std_head.val().exp().unsqueeze().repeat(0, nbatch);
-        // let std = std + 1e-7;
-        // let [nbatch, nstack, nfeat] = std.shape().dims;
-        // let std = std
-        //     .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
-        //     .squeeze(1);
-        // softplus
-        // let std: Tensor<B, 2> = (std.exp() + 1.0).log() + 1e-7;
+        let std = self.std_head.forward(x);
+        let std: Tensor<B, 2> = (std.exp() + 1.0).log();
         (mu, std)
     }
 }

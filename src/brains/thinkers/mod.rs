@@ -15,9 +15,9 @@ use crate::{
 
 use super::replay_buffer::{PpoBuffer, PpoMetadata};
 
+pub mod linalg;
 pub mod ncp;
 pub mod ppo;
-pub mod stats;
 
 pub trait Status {
     fn log(&self, writer: &mut TbWriter, step: usize);

@@ -477,6 +477,15 @@ fn get_reward(
     names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
 ) {
+    macro_rules! reward_team {
+        ($team:expr, $reward:expr) => {
+            for agent in agents.iter() {
+                if team_id.get(agent).unwrap().0 == $team {
+                    rewards.get_mut(agent).unwrap().0 += $reward;
+                }
+            }
+        };
+    }
     for agent_ent in agents.iter() {
         let my_health = health.get(agent_ent).unwrap();
         let my_t = agent_transform.get(agent_ent).unwrap();
@@ -525,10 +534,10 @@ fn get_reward(
                                 rewards.get_mut(hit_entity).unwrap().0 +=
                                     params.ffa_params.reward_for_getting_hit;
                                 if health.0 <= 0.0 {
-                                    rewards.get_mut(agent_ent).unwrap().0 +=
-                                        params.ffa_params.reward_for_kill;
-                                    rewards.get_mut(hit_entity).unwrap().0 +=
-                                        params.ffa_params.reward_for_death;
+                                    // rewards.get_mut(agent_ent).unwrap().0 +=
+                                    //     params.ffa_params.reward_for_kill;
+                                    reward_team!(my_team.0, params.ffa_params.reward_for_kill);
+                                    reward_team!(other_team.0, params.ffa_params.reward_for_death);
                                     kills.get_mut(agent_ent).unwrap().0 += 1;
                                     let msg = format!(
                                         "{} killed {}! Nice!",
