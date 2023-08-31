@@ -44,9 +44,9 @@ mod tests {
     #[test]
     fn test_logpdf() {
         let mu = Tensor::<TchBackend<f32>, 1>::from_floats([0.0, 1.0, -1.0]).unsqueeze();
-        let std = Tensor::<TchBackend<f32>, 1>::from_floats([0.1, 0.7, 1.5]).unsqueeze();
+        let cov = Tensor::<TchBackend<f32>, 1>::from_floats([0.1, 0.7, 1.5]).unsqueeze();
         let xs = Tensor::<TchBackend<f32>, 1>::from_floats([0.2, -0.9, 1.5]).unsqueeze();
-        let dist = MvNormal { mu, cov: std };
+        let dist = MvNormal { mu, cov };
         let lp = dist.log_prob(xs).into_scalar();
         assert!((lp - -6.4918).abs() < 1e-4);
     }
@@ -251,11 +251,17 @@ impl PpoActorConfig {
             obs_len: self.obs_len,
             // common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 1, 3).init(),
             common1: Linear {
-                weight: Param::from(orthogonal([self.obs_len, self.hidden_len].into(), 1.0)),
+                weight: Param::from(orthogonal(
+                    [self.obs_len, self.hidden_len].into(),
+                    2.0f32.sqrt(),
+                )),
                 bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
             },
             common2: Linear {
-                weight: Param::from(orthogonal([self.hidden_len, self.hidden_len].into(), 1.0)),
+                weight: Param::from(orthogonal(
+                    [self.hidden_len, self.hidden_len].into(),
+                    2.0f32.sqrt(),
+                )),
                 bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
             },
             mu_head: Linear {
@@ -316,9 +322,24 @@ impl PpoCriticConfig {
         PpoCritic {
             obs_len: self.obs_len,
             // common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 1, 3).init(),
-            common1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
-            common2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
-            head: LinearConfig::new(self.hidden_len, 1).init(),
+            common1: Linear {
+                weight: Param::from(orthogonal(
+                    [self.obs_len, self.hidden_len].into(),
+                    2.0f32.sqrt(),
+                )),
+                bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
+            },
+            common2: Linear {
+                weight: Param::from(orthogonal(
+                    [self.hidden_len, self.hidden_len].into(),
+                    2.0f32.sqrt(),
+                )),
+                bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
+            },
+            head: Linear {
+                weight: Param::from(orthogonal([self.hidden_len, 1].into(), 1.0)),
+                bias: Some(Param::from(Tensor::zeros([1]))),
+            },
         }
     }
 }
@@ -355,6 +376,7 @@ pub struct PpoStatus {
     pub recent_entropy_loss: f32,
     pub recent_nclamp: f32,
     pub recent_kl: f32,
+    pub recent_explained_var: f32,
 }
 
 impl Status for PpoStatus {
@@ -364,6 +386,7 @@ impl Status for PpoStatus {
         writer.add_scalar("Policy/ClampRatio", self.recent_nclamp, step);
         writer.add_scalar("Policy/KL", self.recent_kl, step);
         writer.add_scalar("Value/Loss", self.recent_value_loss, step);
+        writer.add_scalar("Value/ExplainedVariance", self.recent_explained_var, step);
     }
 }
 
@@ -381,7 +404,11 @@ pub trait PpoParams: Params {
 pub struct RmsNormalize<B: Backend, const D: usize> {
     mean: Tensor<B, D>,
     var: Tensor<B, D>,
+    ret_mean: Tensor<B, 1>,
+    ret_var: Tensor<B, 1>,
     count: f32,
+    ret_count: f32,
+    returns: Tensor<B, 1>,
 }
 
 impl<B: Backend, const D: usize> RmsNormalize<B, D> {
@@ -389,13 +416,18 @@ impl<B: Backend, const D: usize> RmsNormalize<B, D> {
         Self {
             mean: Tensor::zeros(shape.clone()),
             var: Tensor::ones(shape),
+            ret_mean: Tensor::zeros([1]),
+            ret_var: Tensor::ones([1]),
             count: 1e-4,
+            ret_count: 1e-4,
+            returns: Tensor::zeros([1]),
         }
     }
 
     // https://github.com/openai/baselines/blob/ea25b9e8b234e6ee1bca43083f8f3cf974143998/baselines/common/running_mean_std.py#L12
-    fn update(&mut self, x: Tensor<B, D>) {
+    fn update_obs(&mut self, x: Tensor<B, D>) {
         let batch_count = x.shape().dims[0] as f32;
+        assert_eq!(x.shape().dims[0], 1);
         let batch_mean = x.mean_dim(0);
 
         let delta = batch_mean.clone() - self.mean.clone();
@@ -408,9 +440,28 @@ impl<B: Backend, const D: usize> RmsNormalize<B, D> {
         self.count = tot_count;
     }
 
-    pub fn forward(&mut self, x: Tensor<B, D>) -> Tensor<B, D> {
-        self.update(x.clone());
+    pub fn forward_obs(&mut self, x: Tensor<B, D>) -> Tensor<B, D> {
+        self.update_obs(x.clone());
         (x - self.mean.clone()) / (self.var.clone() + 1e-4).sqrt()
+    }
+
+    fn update_ret(&mut self, ret: Tensor<B, 1>) {
+        let batch_count = ret.shape().dims[0] as f32;
+        assert_eq!(ret.shape().dims[0], 1);
+        let batch_mean = ret.mean_dim(0);
+        let delta = batch_mean.clone() - self.ret_mean.clone();
+        let tot_count = batch_count + self.ret_count;
+        self.ret_mean = self.ret_mean.clone() + delta.clone() * batch_count / tot_count;
+        let m_a = self.ret_var.clone() * self.ret_count;
+        let m2 = m_a + (delta.clone() * delta) * self.ret_count * batch_count / tot_count;
+        self.ret_var = m2 / tot_count;
+        self.ret_count = tot_count;
+    }
+
+    pub fn forward_ret(&mut self, rew: Tensor<B, 1>) -> Tensor<B, 1> {
+        self.returns = self.returns.clone() * 0.99 + rew.clone();
+        self.update_ret(self.returns.clone());
+        rew / (self.ret_var.clone() + 1e-4).sqrt()
     }
 }
 
@@ -513,7 +564,7 @@ where
         let (mu, cov) = self.actor.valid().forward(obs.clone());
         self.status.recent_mu = mu.to_data().value.into_boxed_slice();
         self.status.recent_cov = cov.to_data().value.into_boxed_slice();
-        let dist = MvNormal { mu, cov: cov };
+        let dist = MvNormal { mu, cov };
         self.status.recent_entropy = dist.entropy().into_scalar();
         let action = dist.sample(rng);
         let val = self.critic.valid().forward(obs);
@@ -549,6 +600,7 @@ where
         let mut total_entropy_loss = 0.0;
         let mut total_nclamp = 0.0;
         let mut total_kl = 0.0;
+        let mut total_explained_var = 0.0;
         let mut it = tqdm!(
             total = self.training_epochs * self.training_batch_size,
             desc = "Training"
@@ -607,8 +659,8 @@ where
                 )
                 .to_device(&self.actor.devices()[0])
                 .reshape([0, 1]);
-                let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
-                    / (advantage.var(0).sqrt() + 1e-7);
+                // let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
+                //     / (advantage.var(0).sqrt() + 1e-7);
                 let returns = advantage.clone() + old_val;
 
                 let (mu, cov) = self.actor.forward(s.clone());
@@ -629,11 +681,11 @@ where
                 let nclamp = ratio
                     .clone()
                     .zeros_like()
-                    .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
-                let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
+                    .mask_fill(ratio.clone().lower_elem(0.1), 1.0);
+                let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.1), 1.0);
                 total_nclamp += nclamp.mean().into_scalar();
 
-                let surr2 = ratio.clone().clamp(0.8, 1.2) * advantage.clone();
+                let surr2 = ratio.clone().clamp(0.9, 1.1) * advantage.clone();
                 let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
                 let policy_loss = -masked.mean();
 
@@ -657,13 +709,7 @@ where
                     panic!("NaN Loss");
                 }
                 total_pi_loss += pl;
-                it.set_postfix(format!(
-                    "pl={} kl={} p={}",
-                    pl,
-                    kl,
-                    lp.clone().exp().mean().into_scalar(),
-                ));
-                it.update(1).ok();
+
                 let actor_grads = policy_loss.backward();
 
                 let mut visitor = CheckNanWeights;
@@ -673,10 +719,19 @@ where
                     GradientsParams::from_grads(actor_grads, &self.actor),
                 );
                 self.actor.visit(&mut visitor);
+
                 let val = self.critic.forward(s);
-                let val_err = val - returns.squeeze(1);
+                let val_err = val.clone() - returns.clone().squeeze(1);
                 let value_loss = (val_err.clone() * val_err * 0.5).mean();
                 total_val_loss += value_loss.clone().into_scalar();
+                let y_true = returns.clone().squeeze(1);
+                let explained_var = if y_true.clone().var(0).into_scalar() == 0.0 {
+                    f32::NAN
+                } else {
+                    1.0 - ((y_true.clone() - val.clone().detach()).var(0) / y_true.var(0))
+                        .into_scalar()
+                };
+                total_explained_var += explained_var;
                 let critic_grads = value_loss.backward();
                 self.critic = self.critic_optim.step(
                     self.critic_lr,
@@ -684,6 +739,9 @@ where
                     GradientsParams::from_grads(critic_grads, &self.critic),
                 );
                 self.critic.visit(&mut visitor);
+
+                it.set_postfix(format!("pl={} kl={} ev={}", pl, kl, explained_var));
+                it.update(1).ok();
             }
 
             if epoch_kl / steps.len() as f32 > 0.02 {
@@ -697,6 +755,7 @@ where
         self.status.recent_entropy_loss = total_entropy_loss / nstep as f32;
         self.status.recent_nclamp = total_nclamp / nstep as f32;
         self.status.recent_kl = total_kl / nstep as f32;
+        self.status.recent_explained_var = total_explained_var / nstep as f32;
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {

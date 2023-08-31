@@ -449,7 +449,7 @@ fn observation(
                 .get_mut(agent)
                 .unwrap()
                 .1
-                .forward(Tensor::from_floats(&*my_state.as_slice()).unsqueeze())
+                .forward_obs(Tensor::from_floats(&*my_state.as_slice()).unsqueeze())
                 .into_data()
                 .value
                 .into_boxed_slice();
@@ -462,7 +462,7 @@ fn observation(
 
 fn get_reward(
     params: Res<TdmParams>,
-    mut rewards: Query<&mut Reward, With<Agent>>,
+    mut rewards: Query<(&mut Reward, &mut RmsNormalize<TchBackend<f32>, 2>), With<Agent>>,
     actions: Query<&TdmAction, With<Agent>>,
     cx: Res<RapierContext>,
     agents: Query<Entity, With<Agent>>,
@@ -481,7 +481,7 @@ fn get_reward(
         ($team:expr, $reward:expr) => {
             for agent in agents.iter() {
                 if team_id.get(agent).unwrap().0 == $team {
-                    rewards.get_mut(agent).unwrap().0 += $reward;
+                    rewards.get_component_mut::<Reward>(agent).unwrap().0 += $reward;
                 }
             }
         };
@@ -525,13 +525,13 @@ fn get_reward(
                         if let Ok(other_team) = team_id.get(hit_entity) {
                             if my_team.0 == other_team.0 {
                                 // friendly fire!
-                                rewards.get_mut(agent_ent).unwrap().0 +=
+                                rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
                                     params.reward_for_friendly_fire;
                             } else if health.0 > 0.0 {
                                 health.0 -= 5.0;
-                                rewards.get_mut(agent_ent).unwrap().0 +=
+                                rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
                                     params.ffa_params.reward_for_hit;
-                                rewards.get_mut(hit_entity).unwrap().0 +=
+                                rewards.get_component_mut::<Reward>(hit_entity).unwrap().0 +=
                                     params.ffa_params.reward_for_getting_hit;
                                 if health.0 <= 0.0 {
                                     // rewards.get_mut(agent_ent).unwrap().0 +=
@@ -550,7 +550,7 @@ fn get_reward(
                         }
                     } else {
                         // hit a wall
-                        rewards.get_mut(agent_ent).unwrap().0 -= 4.0;
+                        rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 -= 4.0;
                     }
                 } else {
                     // hit nothing
@@ -562,7 +562,7 @@ fn get_reward(
                                 Vec3::new(0.0, params.ffa_params.agent_shoot_distance / 2.0, 0.0);
                         }
                     }
-                    rewards.get_mut(agent_ent).unwrap().0 -= 4.0;
+                    rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 -= 4.0;
                 }
             } else {
                 for child in childs.get(agent_ent).unwrap().iter() {
@@ -578,6 +578,10 @@ fn get_reward(
             my_force.torque =
                 action.phys.torque.clamp(-1.0, 1.0) * params.ffa_params.agent_ang_move_force;
         }
+    }
+
+    for (mut rew, mut norm) in rewards.iter_mut() {
+        rew.0 = norm.forward_ret(Tensor::from_floats([rew.0])).into_scalar();
     }
 }
 

@@ -696,7 +696,7 @@ fn get_observation(
             .get_mut(agent_ent)
             .unwrap()
             .1
-            .forward(Tensor::from_floats(&*my_state.as_slice()).unsqueeze())
+            .forward_obs(Tensor::from_floats(&*my_state.as_slice()).unsqueeze())
             .into_data()
             .value
             .into_boxed_slice();
