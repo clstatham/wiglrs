@@ -6,6 +6,7 @@ use std::{
 
 use crate::FrameStack;
 use bevy::{ecs::schedule::SystemConfigs, prelude::*};
+use burn_tensor::{backend::Backend, Tensor};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod ffa;
@@ -24,7 +25,10 @@ pub trait Observation: Clone
 where
     Self: Sized,
 {
-    fn as_slice<P: Params>(&self, params: &P) -> Box<[f32]>;
+    fn as_slice(&self) -> Box<[f32]>;
+    fn as_tensor<B: Backend>(&self) -> Tensor<B, 1> {
+        Tensor::from_floats(self.as_slice().to_vec().as_slice())
+    }
 }
 
 pub trait DefaultFrameStack<E: Env + ?Sized>: Observation {

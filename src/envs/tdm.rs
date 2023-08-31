@@ -1,4 +1,4 @@
-use crate::brains::thinkers::ppo::PpoParams;
+use crate::brains::thinkers::ppo::{PpoParams, RmsNormalize};
 use crate::ui::LogText;
 use crate::{
     brains::{
@@ -16,11 +16,13 @@ use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use bevy_rand::resource::GlobalEntropy;
 use bevy_rapier2d::prelude::*;
+use burn_tch::TchBackend;
+use burn_tensor::Tensor;
 use itertools::Itertools;
 use rand_distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 
-use super::ffa::{learn, send_reward, Kills, Name, Reward, ShootyLine, Terminal};
+use super::ffa::{get_action, learn, send_reward, Kills, Name, Reward, ShootyLine, Terminal};
 use super::{
     ffa::{
         Agent, AgentBundle, Eyeballs, FfaParams, Health, HealthBarBundle, NameTextBundle,
@@ -36,6 +38,7 @@ use super::{
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
 pub struct TdmParams {
     pub ffa_params: FfaParams,
+    pub reward_for_friendly_fire: f32,
     pub num_teams: usize,
     pub team_colors: Vec<Color>,
 }
@@ -101,6 +104,7 @@ impl Default for TdmParams {
                 num_agents: 6,
                 ..Default::default()
             },
+            reward_for_friendly_fire: -10.0,
             num_teams: 3,
             team_colors: vec![
                 Color::RED,
@@ -146,7 +150,7 @@ lazy_static::lazy_static! {
 }
 
 impl Observation for TdmObs {
-    fn as_slice<P: Params>(&self, _params: &P) -> Box<[f32]> {
+    fn as_slice(&self) -> Box<[f32]> {
         let mut out = self.phys.as_slice().to_vec();
         out.extend_from_slice(&self.combat.as_slice());
         out.extend_from_slice(&self.map_interaction.as_slice());
@@ -239,7 +243,7 @@ impl Env for Tdm {
     }
 
     fn action_system() -> SystemConfigs {
-        action.chain()
+        get_action::<Tdm, SharedThinker<Tdm, PpoThinker>>.chain()
     }
 
     fn reward_system() -> SystemConfigs {
@@ -284,23 +288,23 @@ fn setup(
     mut rng: ResMut<GlobalEntropy<ChaCha8Rng>>,
 ) {
     let mut taken_names = vec![];
+    let obs_len = *BASE_OBS_LEN
+        + *TEAMMATE_OBS_LEN * (params.agents_per_team() - 1)
+        + *ENEMY_OBS_LEN * params.agents_per_team() * (params.num_teams - 1);
     for team_id in 0..params.num_teams {
-        let mut rng_comp = EntropyComponent::from(&mut rng);
-        let thinker = SharedThinker::<Tdm, _>::new(PpoThinker::new(
-            *BASE_OBS_LEN
-                + *TEAMMATE_OBS_LEN * (params.agents_per_team() - 1)
-                + *ENEMY_OBS_LEN * params.agents_per_team() * (params.num_teams - 1),
-            params.ffa_params.agent_hidden_dim,
-            *ACTION_LEN,
-            params.ffa_params.agent_training_epochs,
-            params.ffa_params.agent_training_batch_size,
-            params.ffa_params.agent_entropy_beta,
-            params.ffa_params.agent_actor_lr,
-            params.ffa_params.agent_critic_lr,
-            &mut rng_comp,
-        ));
-
         for _ in 0..params.agents_per_team() {
+            let mut rng_comp = EntropyComponent::from(&mut rng);
+            let thinker = SharedThinker::<Tdm, _>::new(PpoThinker::new(
+                obs_len,
+                params.ffa_params.agent_hidden_dim,
+                *ACTION_LEN,
+                params.ffa_params.agent_training_epochs,
+                params.ffa_params.agent_training_batch_size,
+                params.ffa_params.agent_entropy_beta,
+                params.ffa_params.agent_actor_lr,
+                params.ffa_params.agent_critic_lr,
+                &mut rng_comp,
+            ));
             let mut name = names::random_name(&mut rng_comp);
             while taken_names.contains(&name) {
                 name = names::random_name(&mut rng_comp);
@@ -316,6 +320,7 @@ fn setup(
                 meshes.reborrow(),
                 materials.reborrow(),
                 &*params,
+                obs_len,
                 &mut rng,
             );
             agent.health = Health(params.ffa_params.agent_max_health);
@@ -348,7 +353,13 @@ fn setup(
 fn observation(
     params: Res<TdmParams>,
     cx: Res<RapierContext>,
-    mut fs: Query<&mut FrameStack<TdmObs>, With<Agent>>,
+    mut fs: Query<
+        (
+            &mut FrameStack<Box<[f32]>>,
+            &mut RmsNormalize<TchBackend<f32>, 2>,
+        ),
+        With<Agent>,
+    >,
     queries: Query<(Entity, &TeamId, &TdmAction, &Velocity, &Transform, &Health), With<Agent>>,
 ) {
     let phys_scaling = PhysicalProperties {
@@ -366,12 +377,12 @@ fn observation(
         .iter()
         .for_each(|(agent, my_team, _action, velocity, transform, health)| {
             let mut my_state = TdmObs {
-                phys: PhysicalProperties::new(transform, velocity).scaled_by(&phys_scaling),
+                phys: PhysicalProperties::new(transform, velocity), //.scaled_by(&phys_scaling),
                 combat: CombatProperties {
-                    health: health.0 / params.ffa_params.agent_max_health,
+                    health: health.0, // / params.ffa_params.agent_max_health,
                 },
-                map_interaction: MapInteractionProperties::new(transform, &cx)
-                    .scaled_by(&map_scaling),
+                map_interaction: MapInteractionProperties::new(transform, &cx),
+                // .scaled_by(&map_scaling),
                 teammates: vec![],
                 enemies: vec![],
             };
@@ -389,14 +400,14 @@ fn observation(
                             position: transform.translation.xy() - other_transform.translation.xy(),
                             direction: other_transform.local_y().xy(),
                             linvel: other_vel.linvel,
-                        }
-                        .scaled_by(&phys_scaling),
-                        combat: CombatProperties {
-                            health: other_health.0 / params.ffa_params.agent_max_health,
                         },
-                        map_interaction: MapInteractionProperties::new(other_transform, &cx)
-                            .scaled_by(&map_scaling),
-                        firing: other_action.combat.shoot,
+                        // .scaled_by(&phys_scaling),
+                        combat: CombatProperties {
+                            health: other_health.0, // / params.ffa_params.agent_max_health,
+                        },
+                        map_interaction: MapInteractionProperties::new(other_transform, &cx),
+                        // .scaled_by(&map_scaling),
+                        firing: other_action.combat.shoot > 0.0,
                     });
                 } else {
                     my_state.enemies.push(EnemyObs {
@@ -404,47 +415,31 @@ fn observation(
                             position: transform.translation.xy() - other_transform.translation.xy(),
                             direction: other_transform.local_y().xy(),
                             linvel: other_vel.linvel,
-                        }
-                        .scaled_by(&phys_scaling),
-                        combat: CombatProperties {
-                            health: other_health.0 / params.ffa_params.agent_max_health,
                         },
-                        map_interaction: MapInteractionProperties::new(other_transform, &cx)
-                            .scaled_by(&map_scaling),
-                        firing: other_action.combat.shoot,
+                        // .scaled_by(&phys_scaling),
+                        combat: CombatProperties {
+                            health: other_health.0, // / params.ffa_params.agent_max_health,
+                        },
+                        map_interaction: MapInteractionProperties::new(other_transform, &cx),
+                        // .scaled_by(&map_scaling),
+                        firing: other_action.combat.shoot > 0.0,
                     });
                 }
             }
 
+            let obs = fs
+                .get_mut(agent)
+                .unwrap()
+                .1
+                .forward(Tensor::from_floats(&*my_state.as_slice()).unsqueeze())
+                .into_data()
+                .value
+                .into_boxed_slice();
             fs.get_mut(agent)
                 .unwrap()
-                .push(my_state, Some(params.ffa_params.agent_frame_stack_len));
+                .0
+                .push(obs, Some(params.agent_frame_stack_len()));
         });
-}
-
-fn action(
-    params: Res<TdmParams>,
-    mut obs_brains_actions: Query<
-        (
-            &FrameStack<TdmObs>,
-            &mut Brain<Tdm, SharedThinker<Tdm, PpoThinker>>,
-            &mut TdmAction,
-            &mut EntropyComponent<ChaCha8Rng>,
-        ),
-        With<Agent>,
-    >,
-    frame_count: Res<FrameCount>,
-) {
-    if frame_count.0 as usize % params.ffa_params.agent_frame_stack_len == 0 {
-        obs_brains_actions
-            .par_iter_mut()
-            .for_each_mut(|(obs, mut brain, mut actions, mut rng)| {
-                let action = brain.act(obs, &*params, &mut rng);
-                if let Some(action) = action {
-                    *actions = action;
-                }
-            });
-    }
 }
 
 fn get_reward(
@@ -471,7 +466,7 @@ fn get_reward(
         let my_health = health.get(agent_ent).unwrap();
         let my_t = agent_transform.get(agent_ent).unwrap();
         if let Ok(action) = actions.get(agent_ent).cloned() {
-            if action.combat.shoot && my_health.0 > 0.0 {
+            if action.combat.shoot > 0.0 && my_health.0 > 0.0 {
                 let my_team = team_id.get(agent_ent).unwrap();
                 let (ray_dir, ray_pos) = {
                     let ray_dir = my_t.local_y().xy();
@@ -502,18 +497,23 @@ fn get_reward(
                         }
                     }
 
-                    if let Ok(mut health) = health.get_component_mut::<Health>(hit_entity) {
+                    if let Ok(mut health) = health.get_mut(hit_entity) {
                         if let Ok(other_team) = team_id.get(hit_entity) {
                             if my_team.0 == other_team.0 {
                                 // friendly fire!
-                                rewards.get_mut(agent_ent).unwrap().0 -= 10.0;
+                                rewards.get_mut(agent_ent).unwrap().0 +=
+                                    params.reward_for_friendly_fire;
                             } else if health.0 > 0.0 {
                                 health.0 -= 5.0;
-                                rewards.get_mut(agent_ent).unwrap().0 += 1.0;
-                                rewards.get_mut(hit_entity).unwrap().0 -= 1.0;
+                                rewards.get_mut(agent_ent).unwrap().0 +=
+                                    params.ffa_params.reward_for_hit;
+                                rewards.get_mut(hit_entity).unwrap().0 +=
+                                    params.ffa_params.reward_for_getting_hit;
                                 if health.0 <= 0.0 {
-                                    rewards.get_mut(agent_ent).unwrap().0 += 100.0;
-                                    rewards.get_mut(hit_entity).unwrap().0 -= 100.0;
+                                    rewards.get_mut(agent_ent).unwrap().0 +=
+                                        params.ffa_params.reward_for_kill;
+                                    rewards.get_mut(hit_entity).unwrap().0 +=
+                                        params.ffa_params.reward_for_death;
                                     kills.get_mut(agent_ent).unwrap().0 += 1;
                                     let msg = format!(
                                         "{} killed {}! Nice!",

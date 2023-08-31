@@ -33,11 +33,11 @@ pub trait Thinker<E: Env>: Send + Sync + 'static {
     type ActionMetadata: Clone + Default + Send + Sync;
     fn act(
         &mut self,
-        obs: &FrameStack<E::Observation>,
+        obs: &FrameStack<Box<[f32]>>,
         metadata: &mut Self::Metadata,
         params: &E::Params,
         rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> Option<E::Action>;
+    ) -> E::Action;
     fn learn(
         &mut self,
         b: &mut PpoBuffer<E>,
@@ -92,11 +92,11 @@ impl<E: Env, T: Thinker<E>> Thinker<E> for SharedThinker<E, T> {
     type Status = T::Status;
     fn act(
         &mut self,
-        obs: &FrameStack<E::Observation>,
+        obs: &FrameStack<Box<[f32]>>,
         metadata: &mut Self::Metadata,
         params: &E::Params,
         rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> Option<E::Action> {
+    ) -> E::Action {
         self.lock().act(obs, metadata, params, rng)
     }
     fn learn(
@@ -129,22 +129,18 @@ impl<E: Env> Thinker<E> for RandomThinker {
 
     fn act(
         &mut self,
-        _obs: &FrameStack<<E as Env>::Observation>,
+        _obs: &FrameStack<Box<[f32]>>,
         _metadata: &mut Self::Metadata,
         params: &<E as Env>::Params,
         rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> Option<<E as Env>::Action> {
+    ) -> <E as Env>::Action {
         let len = E::Action::default().as_slice(params).len();
         let dist = rand_distr::Uniform::new(-1.0, 1.0);
         let mut out = vec![];
         for _ in 0..len {
             out.push(dist.sample(rng));
         }
-        Some(E::Action::from_slice(
-            &out,
-            <E::Action as Action<E>>::Metadata::default(),
-            params,
-        ))
+        E::Action::from_slice(&out, <E::Action as Action<E>>::Metadata::default(), params)
     }
 
     fn learn(

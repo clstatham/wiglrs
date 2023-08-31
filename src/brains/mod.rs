@@ -58,14 +58,14 @@ impl<E: Env, T: Thinker<E>> Drop for Brain<E, T> {
 impl<E: Env, T: Thinker<E>> Brain<E, T> {
     pub fn act(
         &mut self,
-        obs: &FrameStack<E::Observation>,
+        obs: &FrameStack<Box<[f32]>>,
         params: &E::Params,
         rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> Option<E::Action> {
+    ) -> E::Action {
         let action = self.thinker.act(obs, &mut self.metadata, params, rng);
-        if let Some(ref action) = action {
-            self.last_action = action.clone();
-        }
+        // if let Some(ref action) = action {
+        self.last_action = action.clone();
+        // }
         // self.writer
         //     .add_scalar("Entropy", self.thinker.recent_entropy, frame_count);
         action

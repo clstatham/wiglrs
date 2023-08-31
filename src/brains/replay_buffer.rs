@@ -1,15 +1,16 @@
 use std::collections::VecDeque;
 
-use bevy::prelude::*;
+use bevy::{core::FrameCount, prelude::*};
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use burn_tch::TchBackend;
+use itertools::Itertools;
 use rand::seq::IteratorRandom;
 
 use crate::{
     envs::{
         ffa::{Agent, Reward, Terminal},
-        Action, Env,
+        Action, Env, Params,
     },
     FrameStack,
 };
@@ -18,47 +19,15 @@ use super::thinkers::ppo::HiddenStates;
 
 #[derive(Clone)]
 pub struct Sart<E: Env> {
-    pub obs: FrameStack<E::Observation>,
+    pub obs: FrameStack<Box<[f32]>>,
     pub action: E::Action,
     pub reward: f32,
     pub terminal: bool,
 }
 
 impl<E: Env> Sart<E> {
-    pub fn unzip(self) -> (FrameStack<E::Observation>, E::Action, f32, bool) {
+    pub fn unzip(self) -> (FrameStack<Box<[f32]>>, E::Action, f32, bool) {
         (self.obs, self.action, self.reward, self.terminal)
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct SartAdv<E: Env> {
-    pub obs: E::Observation,
-    pub action: E::Action,
-    pub reward: f32,
-    pub advantage: Option<f32>,
-    pub returns: Option<f32>,
-    pub terminal: bool,
-}
-
-impl<E: Env> SartAdv<E> {
-    pub fn unzip(
-        self,
-    ) -> (
-        E::Observation,
-        E::Action,
-        f32,
-        Option<f32>,
-        Option<f32>,
-        bool,
-    ) {
-        (
-            self.obs,
-            self.action,
-            self.reward,
-            self.advantage,
-            self.returns,
-            self.terminal,
-        )
     }
 }
 
@@ -72,28 +41,14 @@ pub struct PpoMetadata {
 #[derive(Component)]
 pub struct PpoBuffer<E: Env> {
     pub max_len: Option<usize>,
-    pub obs: VecDeque<FrameStack<E::Observation>>,
+    pub obs: VecDeque<FrameStack<Box<[f32]>>>,
     pub action: VecDeque<E::Action>,
     pub reward: VecDeque<f32>,
     pub advantage: VecDeque<Option<f32>>,
-    pub returns: VecDeque<Option<f32>>,
+    // pub returns: VecDeque<Option<f32>>,
     pub terminal: VecDeque<bool>,
     current_trajectory_start: usize,
-}
-
-impl<E: Env> Default for PpoBuffer<E> {
-    fn default() -> Self {
-        Self {
-            obs: VecDeque::default(),
-            action: VecDeque::default(),
-            reward: VecDeque::default(),
-            advantage: VecDeque::default(),
-            returns: VecDeque::default(),
-            terminal: VecDeque::default(),
-            current_trajectory_start: 0,
-            max_len: None,
-        }
-    }
+    // returns_norm: RmsNormalize<TchBackend<f32>, 2>,
 }
 
 impl<E: Env> Clone for PpoBuffer<E> {
@@ -102,7 +57,7 @@ impl<E: Env> Clone for PpoBuffer<E> {
             max_len: self.max_len,
             obs: self.obs.clone(),
             action: self.action.clone(),
-            returns: self.returns.clone(),
+            // returns: self.returns.clone(),
             reward: self.reward.clone(),
             advantage: self.advantage.clone(),
             terminal: self.terminal.clone(),
@@ -118,7 +73,14 @@ where
     pub fn new(max_len: Option<usize>) -> Self {
         Self {
             max_len,
-            ..Default::default()
+            obs: VecDeque::default(),
+            action: VecDeque::default(),
+            reward: VecDeque::default(),
+            advantage: VecDeque::default(),
+            // returns: VecDeque::default(),
+            terminal: VecDeque::default(),
+            current_trajectory_start: 0,
+            // returns_norm: RmsNormalize::new([1, 1].into()),
         }
     }
 
@@ -136,9 +98,9 @@ where
             while self.advantage.len() >= max_len {
                 self.advantage.pop_front();
             }
-            while self.returns.len() >= max_len {
-                self.returns.pop_front();
-            }
+            // while self.returns.len() >= max_len {
+            //     self.returns.pop_front();
+            // }
             while self.terminal.len() >= max_len {
                 self.terminal.pop_front();
             }
@@ -153,41 +115,36 @@ where
 
         if action.metadata().hiddens.is_some() {
             self.obs.push_back(obs);
-            self.action.push_back(action);
+            self.action.push_back(action.clone());
             self.reward.push_back(reward);
             self.terminal.push_back(terminal);
             self.advantage.push_back(None);
-            self.returns.push_back(None);
+            // self.returns.push_back(None);
 
             self.current_trajectory_start += 1;
             if let Some(max_len) = self.max_len {
                 if self.current_trajectory_start >= max_len {
                     self.current_trajectory_start = max_len;
-                    self.finish_trajectory(); // in case one of them is an ABSOLUTE GAMER and doesn't die for like 100_000 frames
+                    self.finish_trajectory(Some(action.metadata().val)); // in case one of them is an ABSOLUTE GAMER and doesn't die for like 100_000 frames
                 }
             }
         }
     }
 
-    pub fn finish_trajectory(&mut self) {
+    pub fn finish_trajectory(&mut self, final_val: Option<f32>) {
         let endpoint = self.obs.len();
         let startpoint = endpoint - self.current_trajectory_start;
-        // push a temporary value of 0
-        self.action.push_back(E::Action::default());
+        let mut vals = self.action.iter().map(|a| a.metadata().val).collect_vec();
+        vals.push(final_val.unwrap_or(0.0));
         let mut gae = 0.0;
-        let mut ret = 0.0;
-
         for i in (startpoint..endpoint).rev() {
             let mask = if self.terminal[i] { 0.0 } else { 1.0 };
-            let delta = self.reward[i] + 0.99 * self.action[i + 1].metadata().val * mask
-                - self.action[i].metadata().val;
+            let delta = self.reward[i] + 0.99 * vals[i + 1] * mask - vals[i];
             gae = delta + 0.99 * 0.95 * mask * gae;
             self.advantage[i] = Some(gae);
-            ret = self.reward[i] + 0.99 * mask * ret;
-            self.returns[i] = Some(ret);
+            // ret = self.reward[i] + 0.99 * mask * ret;
+            // self.returns[i] = Some(ret);
         }
-        // remove the temporary value so we don't sample from it
-        self.action.pop_back();
         self.current_trajectory_start = 0;
     }
 
@@ -197,43 +154,50 @@ where
         rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Option<PpoBuffer<E>> {
         let end_of_last_traj = self.obs.len() - self.current_trajectory_start;
-        let mut idxs = vec![0; batch_size];
-        (0..end_of_last_traj).choose_multiple_fill(rng, &mut idxs);
-        let mut batch = PpoBuffer::default();
+        // dbg!(end_of_last_traj);
+        let idxs = (0..end_of_last_traj).choose_multiple(rng, batch_size);
+        let mut batch = PpoBuffer::new(None);
         for i in idxs {
             batch.obs.push_back(self.obs[i].to_owned());
             batch.action.push_back(self.action[i].clone());
             batch.reward.push_back(self.reward[i]);
             batch.terminal.push_back(self.terminal[i]);
             batch.advantage.push_back(self.advantage[i]);
-            batch.returns.push_back(self.returns[i]);
+            // batch.returns.push_back(self.returns[i]);
         }
         Some(batch)
     }
 }
 
 pub fn store_sarts<E: Env>(
-    observations: Query<&FrameStack<E::Observation>, With<Agent>>,
+    params: Res<E::Params>,
+    observations: Query<&FrameStack<Box<[f32]>>, With<Agent>>,
     actions: Query<&E::Action, With<Agent>>,
-    rewards: Query<&Reward, With<Agent>>,
+    mut rewards: Query<&mut Reward, With<Agent>>,
     mut rbs: Query<&mut PpoBuffer<E>, With<Agent>>,
     terminals: Query<&Terminal, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
+    frame_count: Res<FrameCount>,
 ) where
     E::Action: Action<E, Metadata = PpoMetadata>,
 {
-    for agent_ent in agents.iter() {
-        let (action, reward, terminal) = (
-            actions.get(agent_ent).unwrap().clone(),
-            rewards.get(agent_ent).unwrap().0,
-            terminals.get(agent_ent).unwrap().0,
-        );
-        let obs = observations.get(agent_ent).unwrap().clone();
-        rbs.get_mut(agent_ent).unwrap().remember_sart(Sart {
-            obs,
-            action: action.to_owned(),
-            reward,
-            terminal,
-        });
+    if frame_count.0 as usize % params.agent_frame_stack_len() == 0 {
+        for agent_ent in agents.iter() {
+            let (action, reward, terminal) = (
+                actions.get(agent_ent).unwrap().clone(),
+                rewards.get(agent_ent).unwrap().0,
+                terminals.get(agent_ent).unwrap().0,
+            );
+            let obs = observations.get(agent_ent).unwrap().clone();
+            rbs.get_mut(agent_ent).unwrap().remember_sart(Sart {
+                obs,
+                action: action.to_owned(),
+                reward,
+                terminal,
+            });
+        }
+        for mut reward in rewards.iter_mut() {
+            reward.0 = 0.0;
+        }
     }
 }

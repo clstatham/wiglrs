@@ -126,7 +126,7 @@ impl Behavior for PhysicalBehaviors {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CombatBehaviors {
-    pub shoot: bool,
+    pub shoot: f32,
 }
 
 impl Behavior for CombatBehaviors {
@@ -135,11 +135,11 @@ impl Behavior for CombatBehaviors {
     }
 
     fn as_slice(&self) -> Box<[f32]> {
-        Box::new([if self.shoot { 1.0 } else { 0.0 }])
+        Box::new([self.shoot])
     }
 
     fn from_slice(s: &[f32]) -> Self {
-        Self { shoot: s[0] > 0.0 }
+        Self { shoot: s[0] }
     }
 
     fn scaled_by(&self, _scaling: &Self) -> Self {

@@ -1,11 +1,15 @@
 #![allow(clippy::single_range_in_vec_init)]
 
+use bevy::prelude::{Component, Resource};
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use burn::{
     config::Config,
     module::{ADModule, Module, ModuleVisitor, Param, ParamId},
-    nn::{Initializer, Linear, LinearConfig},
+    nn::{
+        transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
+        Initializer, Linear, LinearConfig,
+    },
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -14,10 +18,13 @@ use burn::{
 use burn_tch::{TchBackend, TchDevice};
 
 use itertools::Itertools;
-use std::f32::consts::PI;
+use std::{f32::consts::PI, marker::PhantomData};
 
 use crate::{
-    brains::replay_buffer::{PpoBuffer, PpoMetadata},
+    brains::{
+        replay_buffer::{PpoBuffer, PpoMetadata},
+        thinkers::stats::{diag, diag2d},
+    },
     envs::{Observation, Params},
 };
 use crate::{
@@ -25,21 +32,18 @@ use crate::{
     FrameStack,
 };
 
-use super::{
-    ncp::{Cfc, CfcCellMode, CfcConfig, CfcMode, FullyConnected, WiringConfig},
-    Status, Thinker,
-};
+use super::{Status, Thinker};
 
 pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
 
 pub struct MvNormal<B: Backend<FloatElem = f32>> {
     pub mu: Tensor<B, 2>,
-    pub cov_diag: Tensor<B, 2>,
+    pub std: Tensor<B, 2>,
 }
 
 impl<B: Backend<FloatElem = f32>> MvNormal<B> {
     pub fn sample(&self, rng: &mut EntropyComponent<ChaCha8Rng>) -> Tensor<B, 2> {
-        let std = self.cov_diag.clone().sqrt();
+        let std = self.std.clone();
         let [_, nfeat] = self.mu.shape().dims;
         let cov = std.to_data().value;
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
@@ -54,35 +58,33 @@ impl<B: Backend<FloatElem = f32>> MvNormal<B> {
         self.mu.clone() + z * std
     }
 
-    pub fn log_prob(self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let [_, nfeat] = self.mu.shape().dims;
+    // https://online.stat.psu.edu/stat505/book/export/html/636
+    pub fn log_prob(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let [nbatch, nfeat] = self.mu.shape().dims;
         let x = x.to_device(&self.mu.device());
-        let a = x.clone() - self.mu.clone();
-        let cov = self.cov_diag.to_data().value;
-        assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
-        let cov_diag = self.cov_diag.clone();
-        let nbatch = self.mu.shape().dims[0];
-        let mut det = Tensor::<B, 2>::ones([nbatch, 1]).to_device(&self.cov_diag.device());
+        let first = self.std.ones_like() / (self.std.clone() * 2.0 * PI).sqrt();
+        let second = {
+            let a = self.std.ones_like().neg() / (self.std.clone() * 2.0);
+            let b = x.clone() - self.mu.clone();
+            (a * b.clone() * b).exp()
+        };
+        let factors = first * second;
+
+        let mut prod = Tensor::<B, 2>::ones([nbatch, 1]).to_device(&self.mu.device());
         for i in 0..nfeat {
-            det = det * cov_diag.clone().slice([0..nbatch, i..i + 1]);
+            prod = prod * factors.clone().slice([0..nbatch, i..i + 1]);
         }
-        let d = a.clone() / cov_diag;
-        let e = (d * a).sum_dim(1);
-        let numer = (e * -0.5).exp().reshape([nbatch, 1]);
-        let f = (2.0 * PI).powf(nfeat as f32);
-        let denom = (det * f).sqrt();
-        let pdf = numer / denom;
-        pdf.log()
+        prod.log()
     }
 
     pub fn entropy(&self) -> Tensor<B, 2> {
-        let cov = self.cov_diag.to_data().value;
+        let cov = self.std.to_data().value;
         let [_, nfeat] = self.mu.shape().dims;
         assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
         let nbatch = self.mu.shape().dims[0];
-        let mut g = Tensor::ones([nbatch, 1]).to_device(&self.cov_diag.device());
+        let mut g = Tensor::ones([nbatch, 1]).to_device(&self.std.device());
         for i in 0..nfeat {
-            g = g * self.cov_diag.clone().slice([0..nbatch, i..i + 1]);
+            g = g * self.std.clone().slice([0..nbatch, i..i + 1]);
         }
         let second_term = (nfeat as f32 * 0.5) * (1.0 + (2.0 * PI).ln());
         g.log() * 0.5 + second_term
@@ -216,11 +218,12 @@ impl<B: Backend<FloatElem = f32>> ModuleVisitor<B> for CheckNanWeights {
 
 #[derive(Module, Debug)]
 pub struct PpoActor<B: Backend> {
-    common: Cfc<B>,
+    common1: Linear<B>,
+    common2: Linear<B>,
     mu_head: Linear<B>,
+    // std_head: Param<Tensor<B, 1>>,
     std_head: Linear<B>,
     obs_len: usize,
-    com_units: usize,
 }
 
 #[derive(Config, Debug)]
@@ -233,20 +236,20 @@ pub struct PpoActorConfig {
 impl PpoActorConfig {
     pub fn init<B: Backend<FloatElem = f32>>(
         &self,
-        rng: &mut EntropyComponent<ChaCha8Rng>,
+        _rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> PpoActor<B> {
-        let wiring_com = FullyConnected::new(self.obs_len, self.hidden_len, true, rng);
-
         PpoActor {
             obs_len: self.obs_len,
-            com_units: wiring_com.units(),
-            common: CfcConfig::new(self.obs_len, self.hidden_len).init(
-                wiring_com,
-                CfcMode::MixedMemory,
-                CfcCellMode::Default,
-            ),
-            mu_head: LinearConfig::new(self.hidden_len, self.action_len).init(),
-            std_head: LinearConfig::new(self.hidden_len, self.action_len).init(),
+            // common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 1, 3).init(),
+            common1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
+            common2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            mu_head: LinearConfig::new(self.hidden_len, self.action_len)
+                .with_initializer(Initializer::XavierUniform { gain: 1.0 })
+                .init(),
+            std_head: LinearConfig::new(self.hidden_len, self.action_len)
+                .with_initializer(Initializer::XavierUniform { gain: 1.0 })
+                .init(),
+            // std_head: Param::new(ParamId::new(), Initializer::Zeros.init([self.action_len])),
         }
     }
 }
@@ -254,37 +257,39 @@ impl<B: Backend<FloatElem = f32>> PpoActor<B> {
     pub fn forward(
         &mut self,
         x: Tensor<B, 3>,
-        common_h: &mut Tensor<B, 2>,
+        // common_h: &mut Tensor<B, 2>,
     ) -> (Tensor<B, 2>, Tensor<B, 2>) {
         let x = x.to_device(&self.devices()[0]);
-
-        let (x, ch) = self.common.forward(x, Some(common_h.clone()));
-        *common_h = ch;
-        // let x = x.tanh();
-        let mu = self.mu_head.forward(x.clone());
-        let [nbatch, nstack, nfeat] = mu.shape().dims;
-        let mu = mu
+        let [nbatch, nstack, nfeat] = x.shape().dims;
+        let x = x
             .clone()
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1);
-        let mu = mu.tanh();
+        let x = self.common1.forward(x).tanh();
+        let x = self.common2.forward(x).tanh();
+        // let x = x.tanh();
+        let mu = self.mu_head.forward(x.clone());
 
-        let std = self.std_head.forward(x);
-        let [nbatch, nstack, nfeat] = std.shape().dims;
-        let std = std
-            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
-            .squeeze(1);
+        // let mu = mu.tanh();
+
+        let std = self.std_head.forward(x).exp();
+        // let std = std + 1e-7;
+        // let [nbatch, nstack, nfeat] = std.shape().dims;
+        // let std = std
+        //     .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
+        //     .squeeze(1);
         // softplus
-        let std: Tensor<B, 2> = (std.exp() + 1.0).log() + 1e-7;
+        // let std: Tensor<B, 2> = (std.exp() + 1.0).log() + 1e-7;
         (mu, std)
     }
 }
 
 #[derive(Module, Debug)]
 pub struct PpoCritic<B: Backend> {
-    rnn: Cfc<B>,
+    common1: Linear<B>,
+    common2: Linear<B>,
+    head: Linear<B>,
     obs_len: usize,
-    rnn_units: usize,
 }
 
 #[derive(Debug, Config)]
@@ -296,36 +301,38 @@ pub struct PpoCriticConfig {
 impl PpoCriticConfig {
     pub fn init<B: Backend<FloatElem = f32>>(
         &self,
-        rng: &mut EntropyComponent<ChaCha8Rng>,
+        _rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> PpoCritic<B> {
-        let wiring = FullyConnected::new(self.obs_len, self.hidden_len, true, rng);
         PpoCritic {
             obs_len: self.obs_len,
-            rnn_units: wiring.units(),
-            rnn: CfcConfig::new(self.obs_len, self.hidden_len)
-                .with_projected_len(1)
-                .init(wiring, CfcMode::MixedMemory, CfcCellMode::Default),
+            // common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 1, 3).init(),
+            common1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
+            common2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
+            head: LinearConfig::new(self.hidden_len, 1).init(),
         }
     }
 }
 
 impl<B: Backend> PpoCritic<B> {
-    pub fn forward(&mut self, x: Tensor<B, 3>, h: &mut Tensor<B, 2>) -> Tensor<B, 1> {
+    pub fn forward(&mut self, x: Tensor<B, 3>) -> Tensor<B, 1> {
         let x = x.to_device(&self.devices()[0]);
-        let (x, h_new) = self.rnn.forward(x, Some(h.clone()));
-        *h = h_new;
         let [nbatch, nstack, nfeat] = x.shape().dims;
         let x: Tensor<B, 2> = x
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1);
+        let x = self.common1.forward(x).tanh();
+        let x = self.common2.forward(x).tanh();
+
+        let x = self.head.forward(x);
         x.squeeze(1)
     }
 }
 
-#[derive(Debug, Module)]
+#[derive(Debug, Clone)]
 pub struct HiddenStates<B: Backend> {
-    pub actor_com_h: Tensor<B, 2>,
-    pub critic_h: Tensor<B, 2>,
+    phantom: PhantomData<B>,
+    // pub actor_com_h: Tensor<B, 2>,
+    // pub critic_h: Tensor<B, 2>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -359,6 +366,43 @@ pub trait PpoParams: Params {
     fn agent_update_interval(&self) -> usize;
 }
 
+#[derive(Debug, Component)]
+pub struct RmsNormalize<B: Backend, const D: usize> {
+    mean: Tensor<B, D>,
+    var: Tensor<B, D>,
+    count: f32,
+}
+
+impl<B: Backend, const D: usize> RmsNormalize<B, D> {
+    pub fn new(shape: burn_tensor::Shape<D>) -> Self {
+        Self {
+            mean: Tensor::zeros(shape.clone()),
+            var: Tensor::ones(shape),
+            count: 1e-4,
+        }
+    }
+
+    // https://github.com/openai/baselines/blob/ea25b9e8b234e6ee1bca43083f8f3cf974143998/baselines/common/running_mean_std.py#L12
+    fn update(&mut self, x: Tensor<B, D>) {
+        let batch_count = x.shape().dims[0] as f32;
+        let batch_mean = x.mean_dim(0);
+
+        let delta = batch_mean.clone() - self.mean.clone();
+        let tot_count = batch_count + self.count;
+        self.mean = self.mean.clone() + delta.clone() * batch_count / tot_count;
+        let m_a = self.var.clone() * self.count;
+        // let m_b = batch_var * batch_count;
+        let m2 = m_a + (delta.clone() * delta) * self.count * batch_count / tot_count;
+        self.var = m2 / tot_count;
+        self.count = tot_count;
+    }
+
+    pub fn forward(&mut self, x: Tensor<B, D>) -> Tensor<B, D> {
+        self.update(x.clone());
+        (x - self.mean.clone()) / (self.var.clone() + 1e-4).sqrt()
+    }
+}
+
 pub struct PpoThinker {
     actor: PpoActor<Be>,
     critic: PpoCritic<Be>,
@@ -389,15 +433,15 @@ impl PpoThinker {
             hidden_len,
             action_len,
         }
-        .init(rng)
-        .fork(&TchDevice::Cuda(0));
+        .init(rng);
+        // .fork(&TchDevice::Cuda(0));
         dbg!(actor.num_params());
         let critic = PpoCriticConfig {
             obs_len,
             hidden_len,
         }
-        .init(rng)
-        .fork(&TchDevice::Cuda(0));
+        .init(rng);
+        // .fork(&TchDevice::Cuda(0));
         dbg!(critic.num_params());
         let actor_optim = RMSPropConfig::new().with_momentum(0.0).init();
         let critic_optim = RMSPropConfig::new().with_momentum(0.0).init();
@@ -428,52 +472,50 @@ where
         self.status.clone()
     }
 
-    fn init_metadata(&self, batch_size: usize) -> Self::Metadata {
-        let dev = self.actor.devices()[0];
+    fn init_metadata(&self, _batch_size: usize) -> Self::Metadata {
+        // let dev = self.actor.devices()[0];
         HiddenStates {
-            actor_com_h: Tensor::zeros_device([batch_size, self.actor.com_units], &dev),
-            critic_h: Tensor::zeros_device([batch_size, self.critic.rnn_units], &dev),
+            phantom: PhantomData,
         }
     }
 
     fn act(
         &mut self,
-        obs: &FrameStack<E::Observation>,
+        obs: &FrameStack<Box<[f32]>>,
         metadata: &mut Self::Metadata,
         params: &E::Params,
         rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> Option<E::Action> {
-        let hiddens = metadata.clone().to_device(&TchDevice::Cpu);
+    ) -> E::Action {
+        let hiddens = metadata.clone(); //.to_device(&TchDevice::Cpu);
         let obs = obs
             .as_vec()
             .into_iter()
-            .map(|o| Tensor::from_floats(&*o.as_slice(params)).unsqueeze::<2>())
+            .map(|o| Tensor::from_floats(&*o).unsqueeze::<2>())
             .collect::<Vec<_>>();
         let obs = Tensor::cat(obs, 0).unsqueeze();
-        let (mu, std) = self
-            .actor
-            .valid()
-            .forward(obs.clone(), &mut metadata.actor_com_h);
+        let (mu, std) = self.actor.valid().forward(obs.clone());
         self.status.recent_mu = mu.to_data().value.into_boxed_slice();
         self.status.recent_std = std.to_data().value.into_boxed_slice();
-        let dist = MvNormal {
-            mu,
-            cov_diag: std.clone() * std,
-        };
+        let dist = MvNormal { mu, std };
         self.status.recent_entropy = dist.entropy().into_scalar();
-        let action = dist.sample(rng).clamp(-1.0, 1.0);
-        let val = self.critic.valid().forward(obs, &mut metadata.critic_h);
+        let action = dist.sample(rng).tanh();
+        let val = self.critic.valid().forward(obs);
 
         let action_vec = action.to_data().value;
-        Some(E::Action::from_slice(
+
+        let logp = dist.log_prob(action.clone()).into_scalar();
+        let logp2 = dist.log_prob(action).into_scalar();
+        assert_eq!(logp, logp2);
+
+        E::Action::from_slice(
             action_vec.as_slice(),
             PpoMetadata {
                 val: val.into_scalar(),
-                logp: dist.log_prob(action).into_scalar(),
+                logp,
                 hiddens: Some(hiddens),
             },
             params,
-        ))
+        )
     }
 
     fn learn(
@@ -492,18 +534,6 @@ where
             nstep += 1;
 
             let step = rb.sample_batch(self.training_batch_size, rng).unwrap();
-            let returns = Tensor::from_floats(
-                step.returns
-                    .iter()
-                    .copied()
-                    .map(|r| r.unwrap())
-                    .collect_vec()
-                    .as_slice(),
-            )
-            .to_device(&self.actor.devices()[0]);
-            // let returns = (returns.clone() - returns.clone().mean().unsqueeze())
-            //     / (returns.var(0).sqrt() + 1e-7);
-
             let s = step
                 .obs
                 .iter()
@@ -512,7 +542,7 @@ where
                         stack
                             .as_vec()
                             .into_iter()
-                            .map(|x| Tensor::from_floats(&*x.as_slice(params)).unsqueeze())
+                            .map(|x| Tensor::from_floats(&*x).unsqueeze())
                             .collect::<Vec<_>>(),
                         1,
                     )
@@ -532,7 +562,15 @@ where
                 .collect::<Vec<_>>();
             let old_lp = Tensor::from_floats(old_lp.as_slice())
                 .to_device(&self.actor.devices()[0])
-                .reshape([self.training_batch_size, 1]);
+                .reshape([0, 1]);
+            let old_val = step
+                .action
+                .iter()
+                .map(|action| action.metadata().val)
+                .collect::<Vec<_>>();
+            let old_val: Tensor<Be, 2> = Tensor::from_floats(old_val.as_slice())
+                .to_device(&self.actor.devices()[0])
+                .reshape([0, 1]);
 
             let advantage = Tensor::from_floats(
                 step.advantage
@@ -543,30 +581,15 @@ where
                     .as_slice(),
             )
             .to_device(&self.actor.devices()[0])
-            .reshape([self.training_batch_size, 1]);
-            // let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
-            //     / (advantage.var(0).sqrt() + 1e-7);
+            .reshape([0, 1]);
+            let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
+                / (advantage.var(0).sqrt() + 1e-7);
+            let returns = advantage.clone() + old_val;
 
-            let (actor_com_h, critic_h): (Vec<_>, Vec<_>) = step
-                .action
-                .into_iter()
-                .map(|hs| {
-                    let hiddens = hs.metadata().hiddens.as_ref().unwrap().to_owned();
-                    (hiddens.actor_com_h, hiddens.critic_h)
-                })
-                .multiunzip();
-
-            let dev = &self.actor.devices()[0];
-            let mut actor_com_h = Tensor::from_inner(Tensor::cat(actor_com_h, 0)).to_device(dev);
-            let mut critic_h = Tensor::from_inner(Tensor::cat(critic_h, 0)).to_device(dev);
-            let (mu, std) = self.actor.forward(s.clone(), &mut actor_com_h);
-            let dist = MvNormal {
-                mu,
-                cov_diag: std.clone() * std,
-            };
+            let (mu, std) = self.actor.forward(s.clone());
+            let dist = MvNormal { mu, std };
             let entropy = dist.entropy();
             let lp = dist.log_prob(a);
-
             let ratio = (lp - old_lp).exp();
             let surr1 = ratio.clone() * advantage.clone();
             let nclamp = ratio
@@ -600,8 +623,8 @@ where
                 GradientsParams::from_grads(actor_grads, &self.actor),
             );
             self.actor.visit(&mut visitor);
-            let val = self.critic.forward(s, &mut critic_h);
-            let val_err = val - returns;
+            let val = self.critic.forward(s);
+            let val_err = val - returns.squeeze(1);
             let value_loss = (val_err.clone() * val_err).mean();
             total_val_loss += value_loss.clone().into_scalar();
             let critic_grads = value_loss.backward();

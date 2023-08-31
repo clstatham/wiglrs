@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::{prelude::EntropyComponent, resource::GlobalEntropy};
+use burn_tch::TchBackend;
+use burn_tensor::Tensor;
 use itertools::Itertools;
 
 use bevy::{
@@ -16,7 +18,7 @@ use crate::{
     brains::{
         replay_buffer::{store_sarts, PpoBuffer, PpoMetadata},
         thinkers::{
-            ppo::{PpoParams, PpoStatus, PpoThinker},
+            ppo::{PpoParams, PpoStatus, PpoThinker, RmsNormalize},
             Thinker,
         },
         Brain,
@@ -51,6 +53,11 @@ pub struct FfaParams {
     pub agent_max_health: f32,
     pub agent_shoot_distance: f32,
     pub distance_scaling: f32,
+    pub reward_for_kill: f32,
+    pub reward_for_death: f32,
+    pub reward_for_hit: f32,
+    pub reward_for_getting_hit: f32,
+    pub reward_for_miss: f32,
 }
 
 impl Default for FfaParams {
@@ -72,6 +79,11 @@ impl Default for FfaParams {
             agent_max_health: 100.0,
             agent_shoot_distance: 1000.0,
             distance_scaling: 1.0 / 2000.0,
+            reward_for_kill: 100.0,
+            reward_for_death: -50.0,
+            reward_for_hit: 1.0,
+            reward_for_getting_hit: -0.5,
+            reward_for_miss: -2.0,
         }
     }
 }
@@ -133,7 +145,7 @@ pub struct OtherState {
 }
 
 impl Observation for OtherState {
-    fn as_slice<P: Params>(&self, _params: &P) -> Box<[f32]> {
+    fn as_slice(&self) -> Box<[f32]> {
         let mut out = self.phys.as_slice().to_vec();
         out.extend_from_slice(&self.combat.as_slice());
         out.extend_from_slice(&self.map_inter.as_slice());
@@ -155,12 +167,12 @@ pub struct FfaObs {
 pub const BASE_STATE_LEN: usize = 6 + 1 + 4;
 
 impl Observation for FfaObs {
-    fn as_slice<P: Params>(&self, params: &P) -> Box<[f32]> {
+    fn as_slice(&self) -> Box<[f32]> {
         let mut out = self.phys.as_slice().to_vec();
         out.extend_from_slice(&self.combat.as_slice());
         out.extend_from_slice(&self.map_inter.as_slice());
         for other in &self.other_states {
-            out.extend_from_slice(&other.as_slice(params));
+            out.extend_from_slice(&other.as_slice());
         }
         out.into_boxed_slice()
     }
@@ -201,9 +213,7 @@ impl Action<Ffa> for FfaAction {
                 force: Vec2::new(action[0], action[1]),
                 torque: action[2],
             },
-            combat: CombatBehaviors {
-                shoot: action[3] > 0.0,
-            },
+            combat: CombatBehaviors { shoot: action[3] },
             metadata,
         }
     }
@@ -406,7 +416,8 @@ where
     pub deaths: Deaths,
     pub name: Name,
     pub brain: Brain<E, T>,
-    pub obs: FrameStack<E::Observation>,
+    pub obs: FrameStack<Box<[f32]>>,
+    pub obs_norm: RmsNormalize<TchBackend<f32>, 2>,
     pub action: E::Action,
     pub replay_buffer: PpoBuffer<E>,
     pub reward: Reward,
@@ -428,11 +439,15 @@ where
         mut meshes: Mut<Assets<Mesh>>,
         mut materials: Mut<Assets<ColorMaterial>>,
         params: &E::Params,
+        obs_len: usize,
         rng: &mut ResMut<GlobalEntropy<ChaCha8Rng>>,
     ) -> Self {
         Self {
             rng: EntropyComponent::from(rng),
-            obs: E::Observation::default_frame_stack(params),
+            obs: FrameStack(
+                vec![vec![0.0; obs_len].into_boxed_slice(); params.agent_frame_stack_len()].into(),
+            ),
+            obs_norm: RmsNormalize::new([1, obs_len].into()),
             action: E::Action::default(),
             replay_buffer: PpoBuffer::new(Some(params.agent_rb_max_len())),
             reward: Reward(0.0),
@@ -498,7 +513,7 @@ impl Env for Ffa {
     }
 
     fn action_system() -> SystemConfigs {
-        get_action.chain()
+        get_action::<Ffa, PpoThinker>.chain()
     }
 
     fn reward_system() -> SystemConfigs {
@@ -571,6 +586,7 @@ fn setup(
             meshes.reborrow(),
             materials.reborrow(),
             &params,
+            obs_len,
             &mut rng,
         );
         agent.health = Health(params.agent_max_health);
@@ -601,7 +617,13 @@ fn setup(
 
 fn get_observation(
     params: Res<FfaParams>,
-    mut observations: Query<&mut FrameStack<FfaObs>, With<Agent>>,
+    mut observations: Query<
+        (
+            &mut FrameStack<Box<[f32]>>,
+            &mut RmsNormalize<TchBackend<f32>, 2>,
+        ),
+        With<Agent>,
+    >,
     actions: Query<&FfaAction, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
     agent_velocity: Query<&Velocity, With<Agent>>,
@@ -629,13 +651,13 @@ fn get_observation(
                 position: my_t.translation.xy(),
                 direction: my_t.local_y().xy(),
                 linvel: my_v.linvel,
-            }
-            .scaled_by(&phys_scaling),
-            combat: CombatProperties { health: my_h.0 }.scaled_by(&CombatProperties {
-                health: 1.0 / params.agent_max_health,
-            }),
+            },
+            // .scaled_by(&phys_scaling),
+            combat: CombatProperties { health: my_h.0 }, //.scaled_by(&CombatProperties {
+            // health: 1.0 / params.agent_max_health,
+            // }),
             other_states: vec![],
-            map_inter: MapInteractionProperties::new(my_t, &cx).scaled_by(&map_scaling),
+            map_inter: MapInteractionProperties::new(my_t, &cx), //.scaled_by(&map_scaling),
         };
 
         for other_ent in agents
@@ -655,50 +677,60 @@ fn get_observation(
                     position: my_t.translation.xy() - other_t.translation.xy(),
                     direction: other_t.local_y().xy(),
                     linvel: other_v.linvel,
-                }
-                .scaled_by(&phys_scaling),
-                combat: CombatProperties { health: other_h.0 }.scaled_by(&CombatProperties {
-                    health: 1.0 / params.agent_max_health,
-                }),
-                map_inter: MapInteractionProperties::new(other_t, &cx).scaled_by(&map_scaling),
+                },
+                //.scaled_by(&phys_scaling),
+                combat: CombatProperties { health: other_h.0 }, //.scaled_by(&CombatProperties {
+                // health: 1.0 / params.agent_max_health,
+                // }),
+                map_inter: MapInteractionProperties::new(other_t, &cx), //.scaled_by(&map_scaling),
 
-                firing: actions.get(other_ent).unwrap().combat.shoot,
+                firing: actions.get(other_ent).unwrap().combat.shoot > 0.0,
             };
 
             my_state.other_states.push(other_state);
         }
 
         let max_len = params.agent_frame_stack_len;
+
+        let obs = observations
+            .get_mut(agent_ent)
+            .unwrap()
+            .1
+            .forward(Tensor::from_floats(&*my_state.as_slice()).unsqueeze())
+            .into_data()
+            .value
+            .into_boxed_slice();
         observations
             .get_mut(agent_ent)
             .unwrap()
-            .push(my_state, Some(max_len));
+            .0
+            .push(obs, Some(max_len));
     }
 }
 
-fn get_action(
-    params: Res<FfaParams>,
+pub fn get_action<E: Env, T: Thinker<E>>(
+    params: Res<E::Params>,
     mut obs_brains_actions: Query<
         (
-            &FrameStack<FfaObs>,
-            &mut Brain<Ffa, PpoThinker>,
-            &mut FfaAction,
+            &FrameStack<Box<[f32]>>,
+            &mut Brain<E, T>,
+            &mut E::Action,
             &mut EntropyComponent<ChaCha8Rng>,
         ),
         With<Agent>,
     >,
     frame_count: Res<FrameCount>,
 ) {
-    if frame_count.0 as usize % params.agent_frame_stack_len == 0 {
+    if frame_count.0 as usize % params.agent_frame_stack_len() == 0 {
         obs_brains_actions
             .par_iter_mut()
             .for_each_mut(|(obs, mut brain, mut actions, mut rng)| {
-                let action = brain.act(obs, &*params, &mut rng);
-                if let Some(action) = action {
-                    // if let Some(action) = status.last_action {
-                    *actions = action;
-                    // }
-                }
+                let action = brain.act(&obs, &*params, &mut rng);
+                // if let Some(action) = action {
+                // if let Some(action) = status.last_action {
+                *actions = action;
+                // }
+                // }
             });
     }
 }
@@ -719,14 +751,11 @@ fn get_reward(
     names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
 ) {
-    for mut reward in rewards.iter_mut() {
-        reward.0 = 0.0;
-    }
     for agent_ent in agents.iter() {
         let my_health = health.get(agent_ent).unwrap();
         let my_t = agent_transform.get(agent_ent).unwrap();
         if let Ok(action) = actions.get(agent_ent).cloned() {
-            if action.combat.shoot && my_health.0 > 0.0 {
+            if action.combat.shoot > 0.0 && my_health.0 > 0.0 {
                 let (ray_dir, ray_pos) = {
                     let ray_dir = my_t.local_y().xy();
                     let ray_pos = my_t.translation.xy() + ray_dir * (params.agent_radius + 2.0);
@@ -799,25 +828,29 @@ fn get_reward(
 }
 
 pub fn send_reward<E: Env, T: Thinker<E>>(
+    params: Res<E::Params>,
     agents: Query<Entity, With<Agent>>,
     frame_count: Res<FrameCount>,
     rewards: Query<&Reward, With<Agent>>,
     mut running_rewards: Query<&mut RunningReward, With<Agent>>,
     mut brains: Query<&mut Brain<E, T>, With<Agent>>,
 ) {
-    for agent_ent in agents.iter() {
-        let reward = rewards.get(agent_ent).unwrap().0;
-        brains.get_mut(agent_ent).unwrap().writer.add_scalar(
-            "Reward/Frame",
-            reward,
-            frame_count.0 as usize,
-        );
-        if let Some(running_reward) = running_rewards.get_mut(agent_ent).unwrap().update(reward) {
+    if frame_count.0 as usize % params.agent_frame_stack_len() == 0 {
+        for agent_ent in agents.iter() {
+            let reward = rewards.get(agent_ent).unwrap().0;
             brains.get_mut(agent_ent).unwrap().writer.add_scalar(
-                "Reward/Running",
-                running_reward,
+                "Reward/Frame",
+                reward,
                 frame_count.0 as usize,
             );
+            if let Some(running_reward) = running_rewards.get_mut(agent_ent).unwrap().update(reward)
+            {
+                brains.get_mut(agent_ent).unwrap().writer.add_scalar(
+                    "Reward/Running",
+                    running_reward,
+                    frame_count.0 as usize,
+                );
+            }
         }
     }
 }
@@ -879,6 +912,7 @@ pub fn check_dead<E: Env>(
     mut health: Query<&mut Health, With<Agent>>,
     mut deaths: Query<&mut Deaths, With<Agent>>,
     mut rbs: Query<&mut PpoBuffer<E>, With<Agent>>,
+    actions: Query<&E::Action, With<Agent>>,
     mut agent_transform: Query<&mut Transform, With<Agent>>,
     mut rng: ResMut<GlobalEntropy<ChaCha8Rng>>,
 ) where
@@ -888,7 +922,8 @@ pub fn check_dead<E: Env>(
         let mut my_health = health.get_mut(agent_ent).unwrap();
         if my_health.0 <= 0.0 {
             if let Ok(mut rb) = rbs.get_mut(agent_ent) {
-                rb.finish_trajectory();
+                let final_val = actions.get(agent_ent).unwrap().metadata().val;
+                rb.finish_trajectory(Some(final_val));
             }
 
             deaths.get_mut(agent_ent).unwrap().0 += 1;
