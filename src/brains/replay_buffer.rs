@@ -5,7 +5,7 @@ use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use burn_tch::TchBackend;
 use itertools::Itertools;
-use rand::seq::IteratorRandom;
+use rand::seq::{IteratorRandom, SliceRandom};
 
 use crate::{
     envs::{
@@ -133,7 +133,8 @@ where
 
     pub fn finish_trajectory(&mut self, final_val: Option<f32>) {
         let endpoint = self.obs.len();
-        let startpoint = endpoint - self.current_trajectory_start;
+        // let startpoint = endpoint - self.current_trajectory_start;
+        let startpoint = 0;
         let mut vals = self.action.iter().map(|a| a.metadata().val).collect_vec();
         vals.push(final_val.unwrap_or(0.0));
         let mut gae = 0.0;
@@ -145,27 +146,53 @@ where
             // ret = self.reward[i] + 0.99 * mask * ret;
             // self.returns[i] = Some(ret);
         }
-        self.current_trajectory_start = 0;
+        // self.current_trajectory_start = 0;
     }
 
-    pub fn sample_batch(
-        &mut self,
+    // pub fn sample_batch(
+    //     &self,
+    //     batch_size: usize,
+    //     rng: &mut EntropyComponent<ChaCha8Rng>,
+    // ) -> PpoBuffer<E> {
+    //     let end_of_last_traj = self.obs.len() - self.current_trajectory_start;
+    //     // dbg!(end_of_last_traj);
+    //     let idxs = (0..end_of_last_traj).choose_multiple(rng, batch_size);
+    //     let mut batch = PpoBuffer::new(None);
+    //     for i in idxs {
+    //         batch.obs.push_back(self.obs[i].to_owned());
+    //         batch.action.push_back(self.action[i].clone());
+    //         batch.reward.push_back(self.reward[i]);
+    //         batch.terminal.push_back(self.terminal[i]);
+    //         batch.advantage.push_back(self.advantage[i]);
+    //         // batch.returns.push_back(self.returns[i]);
+    //     }
+    //     batch
+    // }
+
+    pub fn shuffled_and_batched(
+        &self,
         batch_size: usize,
         rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> Option<PpoBuffer<E>> {
-        let end_of_last_traj = self.obs.len() - self.current_trajectory_start;
-        // dbg!(end_of_last_traj);
-        let idxs = (0..end_of_last_traj).choose_multiple(rng, batch_size);
-        let mut batch = PpoBuffer::new(None);
-        for i in idxs {
-            batch.obs.push_back(self.obs[i].to_owned());
-            batch.action.push_back(self.action[i].clone());
-            batch.reward.push_back(self.reward[i]);
-            batch.terminal.push_back(self.terminal[i]);
-            batch.advantage.push_back(self.advantage[i]);
-            // batch.returns.push_back(self.returns[i]);
+    ) -> Vec<PpoBuffer<E>> {
+        let mut idxs = (0..self.obs.len()).collect_vec();
+        idxs.shuffle(rng);
+        let mut counter = 0;
+        let mut batches = vec![];
+        while counter < idxs.len() {
+            let mut batch = PpoBuffer::new(None);
+            let end = (counter + batch_size).min(idxs.len());
+            let batch_idxs = &idxs[counter..end];
+            for i in batch_idxs {
+                batch.obs.push_back(self.obs[*i].to_owned());
+                batch.action.push_back(self.action[*i].clone());
+                batch.reward.push_back(self.reward[*i]);
+                batch.terminal.push_back(self.terminal[*i]);
+                batch.advantage.push_back(self.advantage[*i]);
+            }
+            counter = end;
+            batches.push(batch);
         }
-        Some(batch)
+        batches
     }
 }
 

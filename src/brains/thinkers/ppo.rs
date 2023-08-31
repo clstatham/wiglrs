@@ -5,6 +5,7 @@ use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use burn::{
     config::Config,
+    grad_clipping::GradientClippingConfig,
     module::{ADModule, Module, ModuleVisitor, Param, ParamId},
     nn::{
         transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
@@ -352,6 +353,7 @@ impl Status for PpoStatus {
         writer.add_scalar("Policy/Loss", self.recent_policy_loss, step);
         writer.add_scalar("Policy/Entropy", self.recent_entropy_loss, step);
         writer.add_scalar("Policy/ClampRatio", self.recent_nclamp, step);
+        writer.add_scalar("Policy/KL", self.recent_kl, step);
         writer.add_scalar("Value/Loss", self.recent_value_loss, step);
     }
 }
@@ -443,8 +445,14 @@ impl PpoThinker {
         .init(rng);
         // .fork(&TchDevice::Cuda(0));
         dbg!(critic.num_params());
-        let actor_optim = RMSPropConfig::new().with_momentum(0.0).init();
-        let critic_optim = RMSPropConfig::new().with_momentum(0.0).init();
+        let actor_optim = RMSPropConfig::new()
+            .with_momentum(0.0)
+            .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
+            .init();
+        let critic_optim = RMSPropConfig::new()
+            .with_momentum(0.0)
+            .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
+            .init();
         Self {
             actor,
             critic,
@@ -524,122 +532,143 @@ where
         params: &E::Params,
         rng: &mut EntropyComponent<ChaCha8Rng>,
     ) {
+        use kdam::{tqdm, BarExt};
         let mut nstep = 0;
 
         let mut total_pi_loss = 0.0;
         let mut total_val_loss = 0.0;
         let mut total_entropy_loss = 0.0;
         let mut total_nclamp = 0.0;
-        for _epoch in kdam::tqdm!(0..self.training_epochs, desc = "Training") {
-            nstep += 1;
+        let mut total_kl = 0.0;
+        let mut it = tqdm!(total = self.training_epochs, desc = "Training");
+        for _epoch in 0..self.training_epochs {
+            let steps = rb.shuffled_and_batched(self.training_batch_size, rng);
+            let mut epoch_kl = 0.0;
+            for step in steps.iter() {
+                nstep += 1;
 
-            let step = rb.sample_batch(self.training_batch_size, rng).unwrap();
-            let s = step
-                .obs
-                .iter()
-                .map(|stack| {
-                    Tensor::cat(
-                        stack
-                            .as_vec()
-                            .into_iter()
-                            .map(|x| Tensor::from_floats(&*x).unsqueeze())
-                            .collect::<Vec<_>>(),
-                        1,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let s: Tensor<Be, 3> = Tensor::cat(s, 0);
-            let a = step
-                .action
-                .iter()
-                .map(|action| Tensor::from_floats(&*action.as_slice(params)).unsqueeze())
-                .collect::<Vec<_>>();
-            let a: Tensor<Be, 2> = Tensor::cat(a, 0);
-            let old_lp = step
-                .action
-                .iter()
-                .map(|action| action.metadata().logp)
-                .collect::<Vec<_>>();
-            let old_lp = Tensor::from_floats(old_lp.as_slice())
-                .to_device(&self.actor.devices()[0])
-                .reshape([0, 1]);
-            let old_val = step
-                .action
-                .iter()
-                .map(|action| action.metadata().val)
-                .collect::<Vec<_>>();
-            let old_val: Tensor<Be, 2> = Tensor::from_floats(old_val.as_slice())
-                .to_device(&self.actor.devices()[0])
-                .reshape([0, 1]);
-
-            let advantage = Tensor::from_floats(
-                step.advantage
+                let s = step
+                    .obs
                     .iter()
-                    .copied()
-                    .map(|a| a.unwrap())
-                    .collect_vec()
-                    .as_slice(),
-            )
-            .to_device(&self.actor.devices()[0])
-            .reshape([0, 1]);
-            let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
-                / (advantage.var(0).sqrt() + 1e-7);
-            let returns = advantage.clone() + old_val;
+                    .map(|stack| {
+                        Tensor::cat(
+                            stack
+                                .as_vec()
+                                .into_iter()
+                                .map(|x| Tensor::from_floats(&*x).unsqueeze())
+                                .collect::<Vec<_>>(),
+                            1,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let s: Tensor<Be, 3> = Tensor::cat(s, 0);
+                let a = step
+                    .action
+                    .iter()
+                    .map(|action| Tensor::from_floats(&*action.as_slice(params)).unsqueeze())
+                    .collect::<Vec<_>>();
+                let a: Tensor<Be, 2> = Tensor::cat(a, 0);
+                let old_lp = step
+                    .action
+                    .iter()
+                    .map(|action| action.metadata().logp)
+                    .collect::<Vec<_>>();
+                let old_lp = Tensor::from_floats(old_lp.as_slice())
+                    .to_device(&self.actor.devices()[0])
+                    .reshape([0, 1]);
+                let old_val = step
+                    .action
+                    .iter()
+                    .map(|action| action.metadata().val)
+                    .collect::<Vec<_>>();
+                let old_val: Tensor<Be, 2> = Tensor::from_floats(old_val.as_slice())
+                    .to_device(&self.actor.devices()[0])
+                    .reshape([0, 1]);
 
-            let (mu, std) = self.actor.forward(s.clone());
-            let dist = MvNormal { mu, std };
-            let entropy = dist.entropy();
-            let lp = dist.log_prob(a);
-            let ratio = (lp - old_lp).exp();
-            let surr1 = ratio.clone() * advantage.clone();
-            let nclamp = ratio
-                .clone()
-                .zeros_like()
-                .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
-            let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
-            total_nclamp += nclamp.mean().into_scalar();
+                let advantage = Tensor::from_floats(
+                    step.advantage
+                        .iter()
+                        .copied()
+                        .map(|a| a.unwrap())
+                        .collect_vec()
+                        .as_slice(),
+                )
+                .to_device(&self.actor.devices()[0])
+                .reshape([0, 1]);
+                let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
+                    / (advantage.var(0).sqrt() + 1e-7);
+                let returns = advantage.clone() + old_val;
 
-            let surr2 = ratio.clamp(0.8, 1.2) * advantage;
-            let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
-            let policy_loss = -masked.mean();
+                let (mu, std) = self.actor.forward(s.clone());
+                let dist = MvNormal { mu, std };
+                let entropy = dist.entropy();
+                let lp = dist.log_prob(a);
+                let log_ratio = lp.clone() - old_lp;
 
-            total_pi_loss += policy_loss.clone().into_scalar();
-            let entropy_loss = entropy.mean();
-            total_entropy_loss += entropy_loss.clone().into_scalar();
-            let policy_loss = policy_loss - entropy_loss * self.entropy_beta;
+                let ratio = log_ratio.clone().exp();
+                // let ratio = ratio.clone().mask_where(
+                //     log_ratio.clone().abs().lower_elem(0.1),
+                //     log_ratio.clone() + 1.0,
+                // ); // approximation
+                let surr1 = ratio.clone() * advantage.clone();
+                let nclamp = ratio
+                    .clone()
+                    .zeros_like()
+                    .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
+                let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
+                total_nclamp += nclamp.mean().into_scalar();
 
-            let actor_grads = policy_loss.backward();
+                let surr2 = ratio.clone().clamp(0.8, 1.2) * advantage;
+                let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
+                let policy_loss = -masked.mean();
 
-            // TchTensor::new(todo!())
-            //     .tensor
-            //     .isnan()
-            //     .any()
-            //     .iter()
-            //     .map(|t| t.map(|t| println!("{}", t)));
-            let mut visitor = CheckNanWeights;
-            self.actor = self.actor_optim.step(
-                self.actor_lr,
-                self.actor.clone(),
-                GradientsParams::from_grads(actor_grads, &self.actor),
-            );
-            self.actor.visit(&mut visitor);
-            let val = self.critic.forward(s);
-            let val_err = val - returns.squeeze(1);
-            let value_loss = (val_err.clone() * val_err).mean();
-            total_val_loss += value_loss.clone().into_scalar();
-            let critic_grads = value_loss.backward();
-            self.critic = self.critic_optim.step(
-                self.critic_lr,
-                self.critic.clone(),
-                GradientsParams::from_grads(critic_grads, &self.critic),
-            );
-            self.critic.visit(&mut visitor);
+                total_pi_loss += policy_loss.clone().into_scalar();
+                let entropy_loss = entropy.mean();
+                total_entropy_loss += entropy_loss.clone().into_scalar();
+                let policy_loss = policy_loss - entropy_loss * self.entropy_beta;
+                let kl = ((ratio - 1.0) - log_ratio.clone()).mean().into_scalar();
+                total_kl += kl;
+                epoch_kl += kl;
+                it.set_postfix(format!(
+                    "pl={} kl={} p={}",
+                    policy_loss.clone().into_scalar(),
+                    kl,
+                    lp.clone().exp().mean().into_scalar(),
+                ));
+                it.update(1).ok();
+                let actor_grads = policy_loss.backward();
+
+                let mut visitor = CheckNanWeights;
+                self.actor = self.actor_optim.step(
+                    self.actor_lr,
+                    self.actor.clone(),
+                    GradientsParams::from_grads(actor_grads, &self.actor),
+                );
+                self.actor.visit(&mut visitor);
+                let val = self.critic.forward(s);
+                let val_err = val - returns.squeeze(1);
+                let value_loss = (val_err.clone() * val_err * 0.5).mean();
+                total_val_loss += value_loss.clone().into_scalar();
+                let critic_grads = value_loss.backward();
+                self.critic = self.critic_optim.step(
+                    self.critic_lr,
+                    self.critic.clone(),
+                    GradientsParams::from_grads(critic_grads, &self.critic),
+                );
+                self.critic.visit(&mut visitor);
+            }
+
+            if epoch_kl / steps.len() as f32 > 0.02 {
+                println!("Maximum KL reached");
+                break;
+            }
         }
 
         self.status.recent_policy_loss = total_pi_loss / nstep as f32;
         self.status.recent_value_loss = total_val_loss / nstep as f32;
         self.status.recent_entropy_loss = total_entropy_loss / nstep as f32;
         self.status.recent_nclamp = total_nclamp / nstep as f32;
+        self.status.recent_kl = total_kl / nstep as f32;
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {

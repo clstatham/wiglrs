@@ -911,8 +911,6 @@ pub fn check_dead<E: Env>(
     agents: Query<Entity, With<Agent>>,
     mut health: Query<&mut Health, With<Agent>>,
     mut deaths: Query<&mut Deaths, With<Agent>>,
-    mut rbs: Query<&mut PpoBuffer<E>, With<Agent>>,
-    actions: Query<&E::Action, With<Agent>>,
     mut agent_transform: Query<&mut Transform, With<Agent>>,
     mut rng: ResMut<GlobalEntropy<ChaCha8Rng>>,
 ) where
@@ -921,10 +919,10 @@ pub fn check_dead<E: Env>(
     for agent_ent in agents.iter() {
         let mut my_health = health.get_mut(agent_ent).unwrap();
         if my_health.0 <= 0.0 {
-            if let Ok(mut rb) = rbs.get_mut(agent_ent) {
-                let final_val = actions.get(agent_ent).unwrap().metadata().val;
-                rb.finish_trajectory(Some(final_val));
-            }
+            // if let Ok(mut rb) = rbs.get_mut(agent_ent) {
+            //     let final_val = actions.get(agent_ent).unwrap().metadata().val;
+            //     rb.finish_trajectory(Some(final_val));
+            // }
 
             deaths.get_mut(agent_ent).unwrap().0 += 1;
             my_health.0 = params.agent_max_health();
@@ -942,7 +940,7 @@ pub fn learn<E: Env, T>(
         (
             &mut EntropyComponent<ChaCha8Rng>,
             &mut PpoBuffer<E>,
-            &Deaths,
+            &E::Action,
             &Name,
             &mut Brain<E, T>,
         ),
@@ -960,10 +958,11 @@ pub fn learn<E: Env, T>(
     {
         query
             .par_iter_mut()
-            .for_each_mut(|(mut rng, mut rb, deaths, _name, mut brain)| {
-                if deaths.0 > 0 {
-                    brain.learn(frame_count.0 as usize, &mut *rb, &*params, &mut rng);
-                }
+            .for_each_mut(|(mut rng, mut rb, action, _name, mut brain)| {
+                // if deaths.0 > 0 {
+                rb.finish_trajectory(Some(action.metadata().val));
+                brain.learn(frame_count.0 as usize, &mut *rb, &*params, &mut rng);
+                // }
             });
         for (_, _, _, name, brain) in query.iter() {
             let status = Thinker::<E>::status(&brain.thinker);
