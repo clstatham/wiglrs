@@ -1,5 +1,6 @@
 use burn::tensor::Tensor;
 use burn_tensor::backend::Backend;
+use nalgebra::DMatrix;
 
 use super::ppo::Be;
 
@@ -169,11 +170,36 @@ pub fn print_matrix(x: &Tensor<Be, 2>) {
     println!();
 }
 
+pub fn orthogonal<B: Backend<FloatElem = f32>>(
+    shape: burn_tensor::Shape<2>,
+    gain: f32,
+) -> Tensor<B, 2> {
+    let [nrows, ncols] = shape.dims;
+    let z = Tensor::<B, 2>::random(shape.clone(), burn_tensor::Distribution::Normal(0.0, 1.0));
+    let z = DMatrix::from_row_slice(nrows, ncols, z.into_data().value.as_slice());
+    let qr = z.qr();
+    let d = &qr.r().diagonal();
+    let mut q = qr.q();
+    for (i, elem) in d.into_iter().enumerate() {
+        q[(i, i)] *= elem.signum();
+    }
+    let t = Tensor::from_floats(q.transpose().data.as_slice()).reshape(shape);
+    // let e = eye(ncols);
+    // let prod = t.clone().transpose().matmul(t.clone());
+    // dbg!((e - prod).to_data());
+    t * gain
+}
+
 #[cfg(test)]
 mod tests {
     use burn_tensor::Tensor;
 
-    use super::{cholesky, print_matrix, Be};
+    use super::{cholesky, orthogonal, print_matrix, Be};
+
+    #[test]
+    fn test_orthogonal() {
+        let t = orthogonal::<Be>([6, 4].into(), 0.01);
+    }
 
     // #[test]
     // fn test_qr() {

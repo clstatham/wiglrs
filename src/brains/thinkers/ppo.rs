@@ -30,7 +30,7 @@ use crate::{
     FrameStack,
 };
 
-use super::{Status, Thinker};
+use super::{linalg::orthogonal, Status, Thinker};
 
 pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
 
@@ -239,14 +239,22 @@ impl PpoActorConfig {
         PpoActor {
             obs_len: self.obs_len,
             // common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 1, 3).init(),
-            common1: LinearConfig::new(self.obs_len, self.hidden_len).init(),
-            common2: LinearConfig::new(self.hidden_len, self.hidden_len).init(),
-            mu_head: LinearConfig::new(self.hidden_len, self.action_len)
-                .with_initializer(Initializer::XavierNormal { gain: 0.01 })
-                .init(),
-            std_head: LinearConfig::new(self.hidden_len, self.action_len)
-                .with_initializer(Initializer::XavierNormal { gain: 0.01 })
-                .init(),
+            common1: Linear {
+                weight: Param::from(orthogonal([self.obs_len, self.hidden_len].into(), 1.0)),
+                bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
+            },
+            common2: Linear {
+                weight: Param::from(orthogonal([self.hidden_len, self.hidden_len].into(), 1.0)),
+                bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
+            },
+            mu_head: Linear {
+                weight: Param::from(orthogonal([self.hidden_len, self.action_len].into(), 0.01)),
+                bias: Some(Param::from(Tensor::zeros([self.action_len]))),
+            },
+            std_head: Linear {
+                weight: Param::from(orthogonal([self.hidden_len, self.action_len].into(), 0.01)),
+                bias: Some(Param::from(Tensor::zeros([self.action_len]))),
+            },
             // std_head: Param::new(
             //     ParamId::new(),
             //     Tensor::zeros([self.action_len]).require_grad(),
@@ -430,14 +438,14 @@ impl PpoThinker {
             action_len,
         }
         .init(rng)
-        .fork(&TchDevice::Cuda(0));
+        .fork(&TchDevice::Cpu);
         dbg!(actor.num_params());
         let critic = PpoCriticConfig {
             obs_len,
             hidden_len,
         }
         .init(rng)
-        .fork(&TchDevice::Cuda(0));
+        .fork(&TchDevice::Cpu);
         dbg!(critic.num_params());
         let actor_optim = RMSPropConfig::new()
             .with_momentum(0.0)
