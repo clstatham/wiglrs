@@ -149,8 +149,8 @@ where
     let mut p = Path::new("./training").to_path_buf();
     p.push(ts.to_string());
     std::fs::create_dir_all(&p).ok();
-    p.push("env.json");
-    params.to_json_file(p).ok();
+    p.push("env.yaml");
+    params.to_yaml_file(p).ok();
     App::new()
         .insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
@@ -203,7 +203,7 @@ fn main() {
     let bevy_seed: [u8; 32] = [42; 32];
     burn_tch::TchBackend::<f32>::seed(tch_seed);
 
-    let params = match TdmParams::from_json_file("tdm.json").ok() {
+    let params = match TdmParams::from_yaml_file("tdm.yaml").ok() {
         Some(params) => {
             println!("Loaded environment parameters:\n{:?}", params);
             params

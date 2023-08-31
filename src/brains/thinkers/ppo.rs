@@ -501,8 +501,8 @@ where
                     .as_slice(),
             )
             .to_device(&self.actor.devices()[0]);
-            let returns = (returns.clone() - returns.clone().mean().unsqueeze())
-                / (returns.var(0).sqrt() + 1e-7);
+            // let returns = (returns.clone() - returns.clone().mean().unsqueeze())
+            //     / (returns.var(0).sqrt() + 1e-7);
 
             let s = step
                 .obs
@@ -544,8 +544,8 @@ where
             )
             .to_device(&self.actor.devices()[0])
             .reshape([self.training_batch_size, 1]);
-            let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
-                / (advantage.var(0).sqrt() + 1e-7);
+            // let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
+            //     / (advantage.var(0).sqrt() + 1e-7);
 
             let (actor_com_h, critic_h): (Vec<_>, Vec<_>) = step
                 .action

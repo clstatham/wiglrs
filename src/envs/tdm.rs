@@ -98,11 +98,18 @@ impl Default for TdmParams {
     fn default() -> Self {
         Self {
             ffa_params: FfaParams {
-                num_agents: 4,
+                num_agents: 6,
                 ..Default::default()
             },
-            num_teams: 2,
-            team_colors: vec![Color::RED, Color::BLUE],
+            num_teams: 3,
+            team_colors: vec![
+                Color::RED,
+                Color::BLUE,
+                Color::GREEN,
+                Color::YELLOW,
+                Color::FUCHSIA,
+                Color::CYAN,
+            ],
         }
     }
 }

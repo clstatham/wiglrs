@@ -36,37 +36,37 @@ pub trait Params {
     fn agent_max_health(&self) -> f32;
     fn num_agents(&self) -> usize;
     fn agent_frame_stack_len(&self) -> usize;
-    fn to_json(&self) -> Result<String, Box<dyn std::error::Error>>
+    fn to_yaml(&self) -> Result<String, Box<dyn std::error::Error>>
     where
         Self: Serialize,
     {
-        let s = serde_json::to_string(self)?;
+        let s = serde_yaml::to_string(self)?;
         Ok(s)
     }
-    fn to_json_file(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>
+    fn to_yaml_file(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>>
     where
         Self: Serialize,
     {
         let mut f = File::create(path)?;
-        let s = self.to_json()?;
+        let s = self.to_yaml()?;
         write!(f, "{}", s)?;
         Ok(())
     }
-    fn from_json<'a>(json: &'a str) -> Result<Self, Box<dyn std::error::Error>>
+    fn from_yaml<'a>(json: &'a str) -> Result<Self, Box<dyn std::error::Error>>
     where
         Self: Deserialize<'a>,
     {
-        let this = serde_json::from_str(json)?;
+        let this = serde_yaml::from_str(json)?;
         Ok(this)
     }
-    fn from_json_file(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>>
+    fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>>
     where
         Self: DeserializeOwned,
     {
         let mut f = File::open(path)?;
         let mut s = String::new();
         f.read_to_string(&mut s)?;
-        let this = Self::from_json(s.as_str())?;
+        let this = Self::from_yaml(s.as_str())?;
         Ok(this)
     }
 }

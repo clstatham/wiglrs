@@ -56,21 +56,21 @@ pub struct FfaParams {
 impl Default for FfaParams {
     fn default() -> Self {
         Self {
-            num_agents: 4,
-            agent_hidden_dim: 64,
-            agent_actor_lr: 1e-4,
-            agent_critic_lr: 1e-3,
-            agent_training_epochs: 5,
-            agent_training_batch_size: 4096,
-            agent_entropy_beta: 0.001,
+            num_agents: 6,
+            agent_hidden_dim: 128,
+            agent_actor_lr: 0.001,
+            agent_critic_lr: 0.01,
+            agent_training_epochs: 10,
+            agent_training_batch_size: 512,
+            agent_entropy_beta: 0.00001,
             agent_update_interval: 1_000,
             agent_rb_max_len: 100_000,
-            agent_frame_stack_len: 2,
+            agent_frame_stack_len: 5,
             agent_radius: 20.0,
             agent_lin_move_force: 600.0,
             agent_ang_move_force: 1.0,
             agent_max_health: 100.0,
-            agent_shoot_distance: 500.0,
+            agent_shoot_distance: 1000.0,
             distance_scaling: 1.0 / 2000.0,
         }
     }
