@@ -427,7 +427,7 @@ impl<B: Backend> LtcCell<B> {
                 + gleak.clone().unsqueeze() * self.vleak.val().unsqueeze()
                 + w_numerator;
             let denominator = cm_t.clone().unsqueeze() + gleak.clone().unsqueeze() + w_denominator;
-            v_pre = numerator / (denominator + 1e-7);
+            v_pre = numerator / (denominator + 1e-8);
         }
 
         v_pre

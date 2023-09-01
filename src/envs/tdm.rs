@@ -551,7 +551,8 @@ fn get_reward(
                         }
                     } else {
                         // hit a wall
-                        rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 -= 4.0;
+                        rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
+                            params.ffa_params.reward_for_miss;
                     }
                 } else {
                     // hit nothing
@@ -563,7 +564,8 @@ fn get_reward(
                                 Vec3::new(0.0, params.ffa_params.agent_shoot_distance / 2.0, 0.0);
                         }
                     }
-                    rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 -= 4.0;
+                    rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
+                        params.ffa_params.reward_for_miss;
                 }
             } else {
                 for child in childs.get(agent_ent).unwrap().iter() {

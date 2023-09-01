@@ -1,8 +1,8 @@
 ffa_params:
   num_agents: 6
   agent_hidden_dim: 64
-  agent_actor_lr: 0.00003
-  agent_critic_lr: 0.00003
+  agent_actor_lr: 0.0003
+  agent_critic_lr: 0.0003
   agent_training_epochs: 10
   agent_training_batch_size: 64
   agent_entropy_beta: 0.0
@@ -15,12 +15,12 @@ ffa_params:
   agent_max_health: 200.0
   agent_shoot_distance: 1000.0
   distance_scaling: 0.0005
-  reward_for_kill: 100.0
-  reward_for_death: -50.0
-  reward_for_hit: 1.0
-  reward_for_getting_hit: -0.5
+  reward_for_kill: 1.0
+  reward_for_death: -0.5
+  reward_for_hit: 0.2
+  reward_for_getting_hit: -0.1
   reward_for_miss: 0.0
-reward_for_friendly_fire: -1.0
+reward_for_friendly_fire: -0.1
 num_teams: 3
 team_colors:
 - !Rgba

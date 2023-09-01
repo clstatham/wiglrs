@@ -1,16 +1,13 @@
 #![allow(clippy::single_range_in_vec_init)]
 
-use bevy::prelude::{Component, Resource};
+use bevy::prelude::Component;
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use burn::{
     config::Config,
     grad_clipping::GradientClippingConfig,
     module::{ADModule, Module, ModuleVisitor, Param, ParamId},
-    nn::{
-        transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput},
-        Initializer, Linear, LinearConfig,
-    },
+    nn::{Initializer, Linear},
     optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
@@ -213,14 +210,19 @@ impl<B: Backend> GruCell<B> {
     }
 }
 
-pub struct CheckNanWeights;
+#[derive(Default, Debug)]
+pub struct CheckNanWeights {
+    pub nan_params: Vec<ParamId>,
+}
 impl<B: Backend<FloatElem = f32>> ModuleVisitor<B> for CheckNanWeights {
     fn visit<const D: usize>(&mut self, id: &ParamId, tensor: &Tensor<B, D>) {
         if tensor.to_data().value.into_iter().any(|s| s.is_nan()) {
-            panic!("NaN weight detected in param id {}", id);
+            println!("NaN weight detected in param id {}", id);
+            self.nan_params.push(id.to_owned());
         }
         if tensor.to_data().value.into_iter().any(|s| !s.is_finite()) {
-            panic!("Inf weight detected in param id {}", id);
+            println!("Inf weight detected in param id {}", id);
+            self.nan_params.push(id.to_owned());
         }
     }
 }
@@ -418,8 +420,8 @@ impl<B: Backend, const D: usize> RmsNormalize<B, D> {
             var: Tensor::ones(shape),
             ret_mean: Tensor::zeros([1]),
             ret_var: Tensor::ones([1]),
-            count: 1e-4,
-            ret_count: 1e-4,
+            count: 1e-8,
+            ret_count: 1e-8,
             returns: Tensor::zeros([1]),
         }
     }
@@ -442,7 +444,7 @@ impl<B: Backend, const D: usize> RmsNormalize<B, D> {
 
     pub fn forward_obs(&mut self, x: Tensor<B, D>) -> Tensor<B, D> {
         self.update_obs(x.clone());
-        (x - self.mean.clone()) / (self.var.clone() + 1e-4).sqrt()
+        (x - self.mean.clone()) / (self.var.clone() + 1e-8).sqrt()
     }
 
     fn update_ret(&mut self, ret: Tensor<B, 1>) {
@@ -461,7 +463,7 @@ impl<B: Backend, const D: usize> RmsNormalize<B, D> {
     pub fn forward_ret(&mut self, rew: Tensor<B, 1>) -> Tensor<B, 1> {
         self.returns = self.returns.clone() * 0.99 + rew.clone();
         self.update_ret(self.returns.clone());
-        rew / (self.ret_var.clone() + 1e-4).sqrt()
+        rew / (self.ret_var.clone() + 1e-8).sqrt()
     }
 }
 
@@ -506,11 +508,11 @@ impl PpoThinker {
         .fork(&TchDevice::Cpu);
         dbg!(critic.num_params());
         let actor_optim = RMSPropConfig::new()
-            // .with_momentum(0.9)
+            .with_momentum(0.0)
             .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
             .init();
         let critic_optim = RMSPropConfig::new()
-            // .with_momentum(0.9)
+            .with_momentum(0.0)
             .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
             .init();
         Self {
@@ -603,10 +605,10 @@ where
         let mut total_explained_var = 0.0;
         let mut it = tqdm!(total = self.training_epochs, desc = "Training");
         for _epoch in 0..self.training_epochs {
-            let steps = rb.shuffled_and_batched(self.training_batch_size, rng);
+            let batches = rb.shuffled_and_batched(self.training_batch_size, rng);
             let mut epoch_kl = 0.0;
-            for step in steps.iter() {
-                let s = step
+            for (batch_i, batch) in batches.iter().enumerate() {
+                let s = batch
                     .obs
                     .iter()
                     .map(|stack| {
@@ -621,13 +623,13 @@ where
                     })
                     .collect::<Vec<_>>();
                 let s: Tensor<Be, 3> = Tensor::cat(s, 0);
-                let a = step
+                let a = batch
                     .action
                     .iter()
                     .map(|action| Tensor::from_floats(&*action.as_slice(params)).unsqueeze())
                     .collect::<Vec<_>>();
                 let a: Tensor<Be, 2> = Tensor::cat(a, 0);
-                let old_lp = step
+                let old_lp = batch
                     .action
                     .iter()
                     .map(|action| action.metadata().logp)
@@ -635,7 +637,7 @@ where
                 let old_lp = Tensor::from_floats(old_lp.as_slice())
                     .to_device(&self.actor.devices()[0])
                     .reshape([0, 1]);
-                let old_val = step
+                let old_val = batch
                     .action
                     .iter()
                     .map(|action| action.metadata().val)
@@ -645,7 +647,8 @@ where
                     .reshape([0, 1]);
 
                 let advantage = Tensor::from_floats(
-                    step.advantage
+                    batch
+                        .advantage
                         .iter()
                         .copied()
                         .map(|a| a.unwrap())
@@ -655,7 +658,7 @@ where
                 .to_device(&self.actor.devices()[0])
                 .reshape([0, 1]);
                 let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
-                    / (advantage.var(0) + 1e-4).sqrt();
+                    / (advantage.var(0) + 1e-8).sqrt();
                 let returns = advantage.clone() + old_val;
 
                 let (mu, cov) = self.actor.forward(s.clone());
@@ -676,24 +679,38 @@ where
                 let nclamp = ratio
                     .clone()
                     .zeros_like()
-                    .mask_fill(ratio.clone().lower_elem(0.1), 1.0);
-                let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.1), 1.0);
+                    .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
+                let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
                 total_nclamp += nclamp.mean().into_scalar();
 
-                let surr2 = ratio.clone().clamp(0.9, 1.1) * advantage.clone();
+                let surr2 = ratio.clone().clamp(0.8, 1.2) * advantage.clone();
                 let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
                 let policy_loss = -masked.mean();
 
                 let entropy_loss = entropy.mean();
                 total_entropy_loss += entropy_loss.clone().into_scalar();
                 let policy_loss = policy_loss - entropy_loss * self.entropy_beta;
-                let kl = ((ratio.clone() - 1.0) - log_ratio.clone())
-                    .mean()
-                    .into_scalar();
+                let kl = (-log_ratio.clone()).mean().into_scalar();
+                if kl > 0.2 {
+                    println!("Maximum KL reached after {batch_i} batches");
+                    break;
+                }
                 total_kl += kl;
                 epoch_kl += kl;
                 let pl = policy_loss.clone().into_scalar();
-                if pl.is_nan() {
+
+                total_pi_loss += pl;
+
+                let actor_grads = policy_loss.backward();
+
+                let mut visitor = CheckNanWeights::default();
+                self.actor = self.actor_optim.step(
+                    self.actor_lr,
+                    self.actor.clone(),
+                    GradientsParams::from_grads(actor_grads, &self.actor),
+                );
+                self.actor.visit(&mut visitor);
+                if pl.is_nan() || !visitor.nan_params.is_empty() {
                     dbg!(
                         mu.to_data(),
                         cov.to_data(),
@@ -701,35 +718,14 @@ where
                         ratio.to_data(),
                         log_ratio.to_data()
                     );
-                    panic!("NaN Actor Loss");
+                    panic!("NaN Actor Loss/Params");
                 }
-                total_pi_loss += pl;
-
-                let actor_grads = policy_loss.backward();
-
-                let mut visitor = CheckNanWeights;
-                self.actor = self.actor_optim.step(
-                    self.actor_lr,
-                    self.actor.clone(),
-                    GradientsParams::from_grads(actor_grads, &self.actor),
-                );
-                self.actor.visit(&mut visitor);
 
                 let val = self.critic.forward(s);
                 let val_err = val.clone() - returns.clone().squeeze(1);
                 let value_loss = (val_err.clone() * val_err * 0.5).mean();
                 let vl = value_loss.clone().into_scalar();
-                if vl.is_nan() {
-                    dbg!(
-                        mu.to_data(),
-                        cov.to_data(),
-                        advantage.to_data(),
-                        ratio.to_data(),
-                        log_ratio.to_data(),
-                        val.to_data(),
-                    );
-                    panic!("NaN Critic Loss");
-                }
+
                 total_val_loss += vl;
                 let y_true = returns.clone().squeeze(1);
                 let explained_var = if y_true.clone().var(0).into_scalar() == 0.0 {
@@ -746,6 +742,16 @@ where
                     GradientsParams::from_grads(critic_grads, &self.critic),
                 );
                 self.critic.visit(&mut visitor);
+                if vl.is_nan() || !visitor.nan_params.is_empty() {
+                    dbg!(
+                        mu.to_data(),
+                        cov.to_data(),
+                        advantage.to_data(),
+                        ratio.to_data(),
+                        log_ratio.to_data()
+                    );
+                    panic!("NaN Actor Loss/Params");
+                }
                 nstep += 1;
             }
             // it.set_postfix(format!("pl={} kl={} ev={}", pl, kl, explained_var));
