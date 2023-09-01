@@ -506,11 +506,11 @@ impl PpoThinker {
         .fork(&TchDevice::Cpu);
         dbg!(critic.num_params());
         let actor_optim = RMSPropConfig::new()
-            .with_momentum(0.0)
+            // .with_momentum(0.9)
             .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
             .init();
         let critic_optim = RMSPropConfig::new()
-            .with_momentum(0.0)
+            // .with_momentum(0.9)
             .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
             .init();
         Self {
@@ -601,16 +601,11 @@ where
         let mut total_nclamp = 0.0;
         let mut total_kl = 0.0;
         let mut total_explained_var = 0.0;
-        let mut it = tqdm!(
-            total = self.training_epochs * self.training_batch_size,
-            desc = "Training"
-        );
+        let mut it = tqdm!(total = self.training_epochs, desc = "Training");
         for _epoch in 0..self.training_epochs {
             let steps = rb.shuffled_and_batched(self.training_batch_size, rng);
             let mut epoch_kl = 0.0;
             for step in steps.iter() {
-                nstep += 1;
-
                 let s = step
                     .obs
                     .iter()
@@ -659,8 +654,8 @@ where
                 )
                 .to_device(&self.actor.devices()[0])
                 .reshape([0, 1]);
-                // let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
-                //     / (advantage.var(0).sqrt() + 1e-7);
+                let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
+                    / (advantage.var(0) + 1e-4).sqrt();
                 let returns = advantage.clone() + old_val;
 
                 let (mu, cov) = self.actor.forward(s.clone());
@@ -706,7 +701,7 @@ where
                         ratio.to_data(),
                         log_ratio.to_data()
                     );
-                    panic!("NaN Loss");
+                    panic!("NaN Actor Loss");
                 }
                 total_pi_loss += pl;
 
@@ -723,7 +718,19 @@ where
                 let val = self.critic.forward(s);
                 let val_err = val.clone() - returns.clone().squeeze(1);
                 let value_loss = (val_err.clone() * val_err * 0.5).mean();
-                total_val_loss += value_loss.clone().into_scalar();
+                let vl = value_loss.clone().into_scalar();
+                if vl.is_nan() {
+                    dbg!(
+                        mu.to_data(),
+                        cov.to_data(),
+                        advantage.to_data(),
+                        ratio.to_data(),
+                        log_ratio.to_data(),
+                        val.to_data(),
+                    );
+                    panic!("NaN Critic Loss");
+                }
+                total_val_loss += vl;
                 let y_true = returns.clone().squeeze(1);
                 let explained_var = if y_true.clone().var(0).into_scalar() == 0.0 {
                     f32::NAN
@@ -739,15 +746,15 @@ where
                     GradientsParams::from_grads(critic_grads, &self.critic),
                 );
                 self.critic.visit(&mut visitor);
-
-                it.set_postfix(format!("pl={} kl={} ev={}", pl, kl, explained_var));
-                it.update(1).ok();
+                nstep += 1;
             }
+            // it.set_postfix(format!("pl={} kl={} ev={}", pl, kl, explained_var));
+            it.update(1).ok();
 
-            if epoch_kl / steps.len() as f32 > 0.02 {
-                println!("Maximum KL reached");
-                break;
-            }
+            // if epoch_kl / steps.len() as f32 > 0.02 * 1.5 {
+            //     println!("Maximum KL reached");
+            //     break;
+            // }
         }
 
         self.status.recent_policy_loss = total_pi_loss / nstep as f32;

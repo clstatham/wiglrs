@@ -291,6 +291,7 @@ fn setup(
     let obs_len = *BASE_OBS_LEN
         + *TEAMMATE_OBS_LEN * (params.agents_per_team() - 1)
         + *ENEMY_OBS_LEN * params.agents_per_team() * (params.num_teams - 1);
+
     for team_id in 0..params.num_teams {
         for _ in 0..params.agents_per_team() {
             let mut rng_comp = EntropyComponent::from(&mut rng);
