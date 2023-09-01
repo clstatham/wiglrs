@@ -232,8 +232,8 @@ pub struct PpoActor<B: Backend> {
     common1: Linear<B>,
     common2: Linear<B>,
     mu_head: Linear<B>,
-    // cov_head: Param<Tensor<B, 1>>,
-    cov_head: Linear<B>,
+    cov_head: Param<Tensor<B, 1>>,
+    // cov_head: Linear<B>,
     obs_len: usize,
 }
 
@@ -249,31 +249,46 @@ impl PpoActorConfig {
         &self,
         _rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> PpoActor<B> {
+        let init = Initializer::XavierNormal {
+            gain: 2.0f64.sqrt(),
+        };
+        let init2 = Initializer::XavierNormal { gain: 0.01 };
         PpoActor {
             obs_len: self.obs_len,
             // common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 1, 3).init(),
             common1: Linear {
-                weight: Param::from(orthogonal(
-                    [self.obs_len, self.hidden_len].into(),
-                    2.0f32.sqrt(),
+                weight: Param::from(init.init_with(
+                    [self.obs_len, self.hidden_len],
+                    Some(self.obs_len),
+                    Some(self.hidden_len),
                 )),
                 bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
             },
             common2: Linear {
-                weight: Param::from(orthogonal(
-                    [self.hidden_len, self.hidden_len].into(),
-                    2.0f32.sqrt(),
+                weight: Param::from(init.init_with(
+                    [self.hidden_len, self.hidden_len],
+                    Some(self.hidden_len),
+                    Some(self.hidden_len),
                 )),
                 bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
             },
             mu_head: Linear {
-                weight: Param::from(orthogonal([self.hidden_len, self.action_len].into(), 0.01)),
+                weight: Param::from(init2.init_with(
+                    [self.hidden_len, self.action_len],
+                    Some(self.hidden_len),
+                    Some(self.action_len),
+                )),
                 bias: Some(Param::from(Tensor::zeros([self.action_len]))),
             },
-            cov_head: Linear {
-                weight: Param::from(orthogonal([self.hidden_len, self.action_len].into(), 0.01)),
-                bias: Some(Param::from(Tensor::zeros([self.action_len]))),
-            },
+            // cov_head: Linear {
+            //     weight: Param::from(init2.init_with(
+            //         [self.hidden_len, self.action_len],
+            //         Some(self.hidden_len),
+            //         Some(self.action_len),
+            //     )),
+            //     bias: Some(Param::from(Tensor::zeros([self.action_len]))),
+            // },
+            cov_head: Param::from(Tensor::ones([self.action_len]).require_grad()),
         }
     }
 }
@@ -290,14 +305,16 @@ impl<B: Backend<FloatElem = f32>> PpoActor<B> {
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1);
         let x = self.common1.forward(x).tanh();
-        let x = self.common2.forward(x).tanh();
+        let x = x.clone() + self.common2.forward(x).tanh();
         // let x = x.tanh();
         let mu = self.mu_head.forward(x.clone());
 
         // let mu = mu.tanh();
 
-        let cov = self.cov_head.forward(x);
-        let cov: Tensor<B, 2> = (cov.exp() + 1.0).log();
+        // let cov = self.cov_head.forward(x);
+        let cov = self.cov_head.val().unsqueeze().repeat(0, nbatch).exp();
+        // let cov = (cov.exp() + 1.0).log();
+
         (mu, cov)
     }
 }
@@ -321,25 +338,35 @@ impl PpoCriticConfig {
         &self,
         _rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> PpoCritic<B> {
+        let init = Initializer::XavierNormal {
+            gain: 2.0f64.sqrt(),
+        };
+        let init2 = Initializer::XavierNormal { gain: 1.0 };
         PpoCritic {
             obs_len: self.obs_len,
             // common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 1, 3).init(),
             common1: Linear {
-                weight: Param::from(orthogonal(
-                    [self.obs_len, self.hidden_len].into(),
-                    2.0f32.sqrt(),
+                weight: Param::from(init.init_with(
+                    [self.obs_len, self.hidden_len],
+                    Some(self.obs_len),
+                    Some(self.hidden_len),
                 )),
                 bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
             },
             common2: Linear {
-                weight: Param::from(orthogonal(
-                    [self.hidden_len, self.hidden_len].into(),
-                    2.0f32.sqrt(),
+                weight: Param::from(init.init_with(
+                    [self.hidden_len, self.hidden_len],
+                    Some(self.hidden_len),
+                    Some(self.hidden_len),
                 )),
                 bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
             },
             head: Linear {
-                weight: Param::from(orthogonal([self.hidden_len, 1].into(), 1.0)),
+                weight: Param::from(init2.init_with(
+                    [self.hidden_len, 1],
+                    Some(self.hidden_len),
+                    Some(1),
+                )),
                 bias: Some(Param::from(Tensor::zeros([1]))),
             },
         }
@@ -354,7 +381,7 @@ impl<B: Backend> PpoCritic<B> {
             .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
             .squeeze(1);
         let x = self.common1.forward(x).tanh();
-        let x = self.common2.forward(x).tanh();
+        let x = x.clone() + self.common2.forward(x).tanh();
 
         let x = self.head.forward(x);
         x.squeeze(1)
@@ -595,18 +622,16 @@ where
         rng: &mut EntropyComponent<ChaCha8Rng>,
     ) {
         use kdam::{tqdm, BarExt};
-        let mut nstep = 0;
-
-        let mut total_pi_loss = 0.0;
-        let mut total_val_loss = 0.0;
-        let mut total_entropy_loss = 0.0;
-        let mut total_nclamp = 0.0;
-        let mut total_kl = 0.0;
-        let mut total_explained_var = 0.0;
+        let mean = |l: &[f32]| l.iter().sum::<f32>() / l.len() as f32;
+        let mut total_pi_loss: Vec<f32> = vec![];
+        let mut total_val_loss: Vec<f32> = vec![];
+        let mut total_entropy_loss = vec![];
+        let mut total_nclamp = vec![];
+        let mut total_kl = vec![];
+        let mut total_explained_var = vec![];
         let mut it = tqdm!(total = self.training_epochs, desc = "Training");
         for _epoch in 0..self.training_epochs {
             let batches = rb.shuffled_and_batched(self.training_batch_size, rng);
-            let mut epoch_kl = 0.0;
             for (batch_i, batch) in batches.iter().enumerate() {
                 let s = batch
                     .obs
@@ -681,44 +706,44 @@ where
                     .zeros_like()
                     .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
                 let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
-                total_nclamp += nclamp.mean().into_scalar();
+                total_nclamp.push(nclamp.mean().into_scalar());
 
                 let surr2 = ratio.clone().clamp(0.8, 1.2) * advantage.clone();
                 let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
                 let policy_loss = -masked.mean();
 
                 let entropy_loss = entropy.mean();
-                total_entropy_loss += entropy_loss.clone().into_scalar();
+                total_entropy_loss.push(entropy_loss.clone().into_scalar());
                 let policy_loss = policy_loss - entropy_loss * self.entropy_beta;
                 let kl = (-log_ratio.clone()).mean().into_scalar();
-                if kl > 0.2 {
-                    println!("Maximum KL reached after {batch_i} batches");
-                    break;
-                }
-                total_kl += kl;
-                epoch_kl += kl;
+
+                total_kl.push(kl);
                 let pl = policy_loss.clone().into_scalar();
 
-                total_pi_loss += pl;
+                total_pi_loss.push(pl);
 
-                let actor_grads = policy_loss.backward();
+                if kl <= 0.2 {
+                    let actor_grads = policy_loss.backward();
 
-                let mut visitor = CheckNanWeights::default();
-                self.actor = self.actor_optim.step(
-                    self.actor_lr,
-                    self.actor.clone(),
-                    GradientsParams::from_grads(actor_grads, &self.actor),
-                );
-                self.actor.visit(&mut visitor);
-                if pl.is_nan() || !visitor.nan_params.is_empty() {
-                    dbg!(
-                        mu.to_data(),
-                        cov.to_data(),
-                        advantage.to_data(),
-                        ratio.to_data(),
-                        log_ratio.to_data()
+                    let mut visitor = CheckNanWeights::default();
+                    self.actor = self.actor_optim.step(
+                        self.actor_lr,
+                        self.actor.clone(),
+                        GradientsParams::from_grads(actor_grads, &self.actor),
                     );
-                    panic!("NaN Actor Loss/Params");
+                    self.actor.visit(&mut visitor);
+                    if pl.is_nan() || !visitor.nan_params.is_empty() {
+                        dbg!(
+                            mu.to_data(),
+                            cov.to_data(),
+                            advantage.to_data(),
+                            ratio.to_data(),
+                            log_ratio.to_data()
+                        );
+                        panic!("NaN Actor Loss/Params");
+                    }
+                } else {
+                    // println!("Maximum KL reached after {batch_i} batches");
                 }
 
                 let val = self.critic.forward(s);
@@ -726,7 +751,7 @@ where
                 let value_loss = (val_err.clone() * val_err * 0.5).mean();
                 let vl = value_loss.clone().into_scalar();
 
-                total_val_loss += vl;
+                total_val_loss.push(vl);
                 let y_true = returns.clone().squeeze(1);
                 let explained_var = if y_true.clone().var(0).into_scalar() == 0.0 {
                     f32::NAN
@@ -734,13 +759,14 @@ where
                     1.0 - ((y_true.clone() - val.clone().detach()).var(0) / y_true.var(0))
                         .into_scalar()
                 };
-                total_explained_var += explained_var;
+                total_explained_var.push(explained_var);
                 let critic_grads = value_loss.backward();
                 self.critic = self.critic_optim.step(
                     self.critic_lr,
                     self.critic.clone(),
                     GradientsParams::from_grads(critic_grads, &self.critic),
                 );
+                let mut visitor = CheckNanWeights::default();
                 self.critic.visit(&mut visitor);
                 if vl.is_nan() || !visitor.nan_params.is_empty() {
                     dbg!(
@@ -750,25 +776,24 @@ where
                         ratio.to_data(),
                         log_ratio.to_data()
                     );
-                    panic!("NaN Actor Loss/Params");
+                    panic!("NaN Critic Loss/Params");
                 }
-                nstep += 1;
             }
-            // it.set_postfix(format!("pl={} kl={} ev={}", pl, kl, explained_var));
+            it.set_postfix(format!(
+                "pl={} vl={} kl={}",
+                mean(&total_pi_loss),
+                mean(&total_val_loss),
+                mean(&total_kl)
+            ));
             it.update(1).ok();
-
-            // if epoch_kl / steps.len() as f32 > 0.02 * 1.5 {
-            //     println!("Maximum KL reached");
-            //     break;
-            // }
         }
 
-        self.status.recent_policy_loss = total_pi_loss / nstep as f32;
-        self.status.recent_value_loss = total_val_loss / nstep as f32;
-        self.status.recent_entropy_loss = total_entropy_loss / nstep as f32;
-        self.status.recent_nclamp = total_nclamp / nstep as f32;
-        self.status.recent_kl = total_kl / nstep as f32;
-        self.status.recent_explained_var = total_explained_var / nstep as f32;
+        self.status.recent_policy_loss = mean(&total_pi_loss);
+        self.status.recent_value_loss = mean(&total_val_loss);
+        self.status.recent_entropy_loss = mean(&total_entropy_loss);
+        self.status.recent_nclamp = mean(&total_nclamp);
+        self.status.recent_kl = mean(&total_kl);
+        self.status.recent_explained_var = mean(&total_explained_var);
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {

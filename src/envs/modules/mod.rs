@@ -20,6 +20,39 @@ pub trait Behavior: std::fmt::Debug + Clone + Default {
     fn len() -> usize;
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct IdentityEmbedding {
+    pub embed: Box<[f32]>,
+}
+
+impl IdentityEmbedding {
+    pub fn new(id: usize, max_id: usize) -> Self {
+        let mut embed = vec![0.0; max_id];
+        embed[id] = 1.0;
+        Self {
+            embed: embed.into_boxed_slice(),
+        }
+    }
+}
+
+impl Property for IdentityEmbedding {
+    fn as_slice(&self) -> Box<[f32]> {
+        self.embed.clone()
+    }
+
+    fn from_slice(s: &[f32]) -> Self {
+        Self { embed: s.into() }
+    }
+
+    fn len() -> usize {
+        unimplemented!()
+    }
+
+    fn scaled_by(&self, _scaling: &Self) -> Self {
+        unimplemented!()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PhysicalProperties {
     pub position: Vec2,

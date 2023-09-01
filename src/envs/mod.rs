@@ -9,6 +9,7 @@ use bevy::{ecs::schedule::SystemConfigs, prelude::*};
 use burn_tensor::{backend::Backend, Tensor};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+pub mod basic;
 pub mod ffa;
 pub mod maps;
 pub mod modules;

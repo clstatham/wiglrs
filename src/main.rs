@@ -15,6 +15,7 @@ use bevy_rapier2d::prelude::*;
 use bevy_rand::prelude::*;
 use burn_tensor::backend::Backend;
 use envs::{
+    basic::{Basic, BasicParams},
     ffa::Ffa,
     maps::{tdm::TdmMap, Map},
     tdm::{Tdm, TdmParams},
@@ -203,7 +204,7 @@ fn main() {
     let bevy_seed: [u8; 32] = [42; 32];
     burn_tch::TchBackend::<f32>::seed(tch_seed);
 
-    let params = match TdmParams::from_yaml_file("tdm.yaml").ok() {
+    let params = match BasicParams::from_yaml_file("basic.yaml").ok() {
         Some(params) => {
             println!("Loaded environment parameters:\n{:?}", params);
             params
@@ -214,5 +215,5 @@ fn main() {
         }
     };
 
-    run_env::<Tdm, TdmMap>(bevy_seed, params);
+    run_env::<Basic, TdmMap>(bevy_seed, params);
 }
