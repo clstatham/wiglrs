@@ -524,15 +524,15 @@ impl PpoThinker {
             hidden_len,
             action_len,
         }
-        .init(rng)
-        .fork(&TchDevice::Cpu);
+        .init(rng);
+        // .fork(&TchDevice::Cuda(0));
         dbg!(actor.num_params());
         let critic = PpoCriticConfig {
             obs_len,
             hidden_len,
         }
-        .init(rng)
-        .fork(&TchDevice::Cpu);
+        .init(rng);
+        // .fork(&TchDevice::Cuda(0));
         dbg!(critic.num_params());
         let actor_optim = RMSPropConfig::new()
             .with_momentum(0.0)

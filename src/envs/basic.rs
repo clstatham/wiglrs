@@ -338,7 +338,7 @@ fn observation(
             for (other, other_id, other_v, other_t) in queries
                 .iter()
                 .filter(|a| a.0 != agent)
-                .sorted_by_key(|o| transform.translation.distance(o.3.translation) as i64)
+                .sorted_by_key(|o| o.1 .0)
             {
                 my_state.others.push(OtherObs {
                     identity: IdentityEmbedding::new(other_id.0, params.num_agents()),

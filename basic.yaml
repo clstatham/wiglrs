@@ -1,8 +1,8 @@
 ffa_params:
-  num_agents: 2
+  num_agents: 4
   agent_hidden_dim: 64
-  agent_actor_lr: 0.0003
-  agent_critic_lr: 0.0003
+  agent_actor_lr: 0.001
+  agent_critic_lr: 0.001
   agent_training_epochs: 10
   agent_training_batch_size: 64
   agent_entropy_beta: 0.0
