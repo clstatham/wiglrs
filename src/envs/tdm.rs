@@ -22,11 +22,11 @@ use itertools::Itertools;
 use rand_distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 
-use super::ffa::{get_action, learn, send_reward, Kills, Name, Reward, ShootyLine, Terminal};
+use super::basic::AgentId;
 use super::{
     ffa::{
-        Agent, AgentBundle, Eyeballs, FfaParams, Health, HealthBarBundle, NameTextBundle,
-        ShootyLineBundle,
+        get_action, learn, send_reward, Agent, AgentBundle, Eyeballs, FfaParams, Health,
+        HealthBarBundle, Kills, Name, NameTextBundle, Reward, Terminal,
     },
     modules::{
         map_interaction::MapInteractionProperties, Behavior, CombatBehaviors, CombatProperties,
@@ -291,7 +291,7 @@ fn setup(
     let obs_len = *BASE_OBS_LEN
         + *TEAMMATE_OBS_LEN * (params.agents_per_team() - 1)
         + *ENEMY_OBS_LEN * params.agents_per_team() * (params.num_teams - 1);
-
+    let mut agent_id = 0;
     for team_id in 0..params.num_teams {
         for _ in 0..params.agents_per_team() {
             let mut rng_comp = EntropyComponent::from(&mut rng);
@@ -327,12 +327,9 @@ fn setup(
             agent.health = Health(params.ffa_params.agent_max_health);
             let id = commands
                 .spawn(agent)
+                .insert(AgentId(agent_id))
                 .insert(TeamId(team_id as i32))
                 .with_children(|parent| {
-                    parent.spawn(ShootyLineBundle::new(
-                        materials.reborrow(),
-                        meshes.reborrow(),
-                    ));
                     Eyeballs::spawn(
                         parent,
                         meshes.reborrow(),
@@ -347,6 +344,8 @@ fn setup(
                 materials.reborrow(),
                 id,
             ));
+
+            agent_id += 1;
         }
     }
 }
@@ -361,11 +360,22 @@ fn observation(
         ),
         With<Agent>,
     >,
-    queries: Query<(Entity, &TeamId, &TdmAction, &Velocity, &Transform, &Health), With<Agent>>,
+    queries: Query<
+        (
+            Entity,
+            &AgentId,
+            &TeamId,
+            &TdmAction,
+            &Velocity,
+            &Transform,
+            &Health,
+        ),
+        With<Agent>,
+    >,
+    mut gizmos: Gizmos,
 ) {
-    queries
-        .iter()
-        .for_each(|(agent, my_team, _action, velocity, transform, health)| {
+    queries.iter().for_each(
+        |(agent, _agent_id, my_team, _action, velocity, transform, health)| {
             let mut my_state = TdmObs {
                 phys: PhysicalProperties::new(transform, velocity), //.scaled_by(&phys_scaling),
                 combat: CombatProperties {
@@ -376,13 +386,18 @@ fn observation(
                 teammates: vec![],
                 enemies: vec![],
             };
-            for (_other, other_team, other_action, other_vel, other_transform, other_health) in
-                queries
-                    .iter()
-                    .filter(|q| q.0 != agent)
-                    .sorted_by_key(|(_, _, _, _, t, _)| {
-                        t.translation.distance(transform.translation) as i64
-                    })
+            for (
+                other,
+                _other_id,
+                other_team,
+                other_action,
+                other_vel,
+                other_transform,
+                other_health,
+            ) in queries
+                .iter()
+                .filter(|q| q.0 != agent)
+                .sorted_by_key(|(_, id, _, _, _, t, _)| id.0)
             {
                 if my_team.0 == other_team.0 {
                     my_state.teammates.push(TeammateObs {
@@ -400,49 +415,20 @@ fn observation(
                         firing: other_action.combat.shoot > 0.0,
                     });
                 } else {
-                    // check line of sight
-                    let mut filter = QueryFilter::new();
-                    for (ent, tm, _, _, _, _) in queries.iter() {
-                        if tm.0 == my_team.0 {
-                            filter = filter.exclude_collider(ent);
-                        }
-                    }
-                    if let Some((hit_ent, _)) = cx.cast_ray(
-                        transform.translation.xy(),
-                        (other_transform.translation.xy() - transform.translation.xy()).normalize(),
-                        Real::MAX,
-                        true,
-                        filter,
-                    ) {
-                        // is it an agent or a wall?
-                        if queries.get(hit_ent).is_ok() {
-                            // we can see the enemy
-                            my_state.enemies.push(EnemyObs {
-                                phys: PhysicalProperties {
-                                    position: other_transform.translation.xy()
-                                        - transform.translation.xy(),
-                                    direction: other_transform.local_y().xy(),
-                                    linvel: other_vel.linvel,
-                                },
-                                // .scaled_by(&phys_scaling),
-                                combat: CombatProperties {
-                                    health: other_health.0, // / params.ffa_params.agent_max_health,
-                                },
-                                map_interaction: MapInteractionProperties::new(
-                                    other_transform,
-                                    &cx,
-                                ),
-                                // .scaled_by(&map_scaling),
-                                firing: other_action.combat.shoot > 0.0,
-                            });
-                        } else {
-                            // obscured by a wall
-                            my_state.enemies.push(EnemyObs::default());
-                        }
-                    } else {
-                        // ray hit nothing???
-                        my_state.enemies.push(EnemyObs::default());
-                    }
+                    my_state.enemies.push(EnemyObs {
+                        phys: PhysicalProperties {
+                            position: other_transform.translation.xy() - transform.translation.xy(),
+                            direction: other_transform.local_y().xy(),
+                            linvel: other_vel.linvel,
+                        },
+                        // .scaled_by(&phys_scaling),
+                        combat: CombatProperties {
+                            health: other_health.0, // / params.ffa_params.agent_max_health,
+                        },
+                        map_interaction: MapInteractionProperties::new(other_transform, &cx),
+                        // .scaled_by(&map_scaling),
+                        firing: other_action.combat.shoot > 0.0,
+                    });
                 }
             }
 
@@ -458,7 +444,8 @@ fn observation(
                 .unwrap()
                 .0
                 .push(obs, Some(params.agent_frame_stack_len()));
-        });
+        },
+    );
 }
 
 fn get_reward(
@@ -468,15 +455,13 @@ fn get_reward(
     cx: Res<RapierContext>,
     agents: Query<Entity, With<Agent>>,
     agent_transform: Query<&Transform, With<Agent>>,
-    childs: Query<&Children, With<Agent>>,
     team_id: Query<&TeamId, With<Agent>>,
     mut health: Query<&mut Health, With<Agent>>,
     mut kills: Query<&mut Kills, With<Agent>>,
     mut force: Query<&mut ExternalForce, With<Agent>>,
-    mut line_vis: Query<&mut Visibility, With<ShootyLine>>,
-    mut line_transform: Query<&mut Transform, (With<ShootyLine>, Without<Agent>)>,
     names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
+    mut gizmos: Gizmos,
 ) {
     macro_rules! reward_team {
         ($team:expr, $reward:expr) => {
@@ -495,14 +480,7 @@ fn get_reward(
                 let my_team = team_id.get(agent_ent).unwrap();
                 let (ray_dir, ray_pos) = {
                     let ray_dir = my_t.local_y().xy();
-                    let ray_pos =
-                        my_t.translation.xy() + ray_dir * (params.ffa_params.agent_radius + 2.0);
-
-                    for child in childs.get(agent_ent).unwrap().iter() {
-                        if let Ok(mut vis) = line_vis.get_mut(*child) {
-                            *vis = Visibility::Visible;
-                        }
-                    }
+                    let ray_pos = my_t.translation.xy();
                     (ray_dir, ray_pos)
                 };
 
@@ -512,15 +490,10 @@ fn get_reward(
                     ray_pos,
                     ray_dir,
                     params.ffa_params.agent_shoot_distance,
-                    false,
+                    true,
                     filter,
                 ) {
-                    for child in childs.get(agent_ent).unwrap().iter() {
-                        if let Ok(mut line) = line_transform.get_mut(*child) {
-                            line.scale = Vec3::new(1.0, toi, 1.0);
-                            line.translation = Vec3::new(0.0, toi / 2.0, 0.0);
-                        }
-                    }
+                    gizmos.line_2d(ray_pos, ray_pos + ray_dir * toi, Color::WHITE);
 
                     if let Ok(mut health) = health.get_mut(hit_entity) {
                         if let Ok(other_team) = team_id.get(hit_entity) {
@@ -535,10 +508,13 @@ fn get_reward(
                                 rewards.get_component_mut::<Reward>(hit_entity).unwrap().0 +=
                                     params.ffa_params.reward_for_getting_hit;
                                 if health.0 <= 0.0 {
-                                    // rewards.get_mut(agent_ent).unwrap().0 +=
-                                    //     params.ffa_params.reward_for_kill;
-                                    reward_team!(my_team.0, params.ffa_params.reward_for_kill);
-                                    reward_team!(other_team.0, params.ffa_params.reward_for_death);
+                                    rewards.get_mut(agent_ent).unwrap().0 .0 +=
+                                        params.ffa_params.reward_for_kill;
+                                    rewards.get_mut(hit_entity).unwrap().0 .0 +=
+                                        params.ffa_params.reward_for_death;
+
+                                    // reward_team!(my_team.0, params.ffa_params.reward_for_kill);
+                                    // reward_team!(other_team.0, params.ffa_params.reward_for_death);
                                     kills.get_mut(agent_ent).unwrap().0 += 1;
                                     let msg = format!(
                                         "{} killed {}! Nice!",
@@ -556,22 +532,8 @@ fn get_reward(
                     }
                 } else {
                     // hit nothing
-                    for child in childs.get(agent_ent).unwrap().iter() {
-                        if let Ok(mut line) = line_transform.get_mut(*child) {
-                            line.scale =
-                                Vec3::new(1.0, params.ffa_params.agent_shoot_distance, 1.0);
-                            line.translation =
-                                Vec3::new(0.0, params.ffa_params.agent_shoot_distance / 2.0, 0.0);
-                        }
-                    }
                     rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
                         params.ffa_params.reward_for_miss;
-                }
-            } else {
-                for child in childs.get(agent_ent).unwrap().iter() {
-                    if let Ok(mut vis) = line_vis.get_mut(*child) {
-                        *vis = Visibility::Hidden;
-                    }
                 }
             }
 

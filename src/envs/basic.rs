@@ -22,16 +22,14 @@ use itertools::Itertools;
 use rand_distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 
-use super::ffa::{get_action, learn, send_reward, Kills, Name, Reward, ShootyLine, Terminal};
-use super::modules::IdentityEmbedding;
 use super::{
     ffa::{
-        Agent, AgentBundle, Eyeballs, FfaParams, Health, HealthBarBundle, NameTextBundle,
-        ShootyLineBundle,
+        get_action, learn, send_reward, Agent, AgentBundle, Eyeballs, FfaParams, Health,
+        HealthBarBundle, Kills, Name, NameTextBundle, Reward, Terminal,
     },
     modules::{
         map_interaction::MapInteractionProperties, Behavior, CombatBehaviors, CombatProperties,
-        PhysicalBehaviors, PhysicalProperties, Property,
+        IdentityEmbedding, PhysicalBehaviors, PhysicalProperties, Property,
     },
     Action, DefaultFrameStack, Env, Observation, Params,
 };
@@ -325,10 +323,30 @@ fn observation(
         With<Agent>,
     >,
     queries: Query<(Entity, &AgentId, &Velocity, &Transform), With<Agent>>,
+    mut gizmos: Gizmos,
 ) {
     queries
         .iter()
         .for_each(|(agent, agent_id, velocity, transform)| {
+            // draw their vision cones
+            let my_pos = transform.translation.xy();
+            // let required_angle = if agent_id.0 % 2 == 0 {
+            //     45.0f32.to_radians()
+            // } else {
+            //     80.0f32.to_radians()
+            // };
+            // let required_angle_positive =
+            //     transform.local_y().xy().angle_between(Vec2::Y) + required_angle;
+            // let required_angle_negative =
+            //     transform.local_y().xy().angle_between(Vec2::Y) - required_angle;
+
+            // let point1 = my_pos
+            //     + 100.0 * Vec2::new(required_angle_positive.sin(), required_angle_positive.cos());
+            // let point2 = my_pos
+            //     + 100.0 * Vec2::new(required_angle_negative.sin(), required_angle_negative.cos());
+            // gizmos.line_2d(my_pos, point1, Color::WHITE);
+            // gizmos.line_2d(my_pos, point2, Color::WHITE);
+
             let mut my_state = BasicObs {
                 identity: IdentityEmbedding::new(agent_id.0, params.num_agents()),
                 phys: PhysicalProperties::new(transform, velocity),
@@ -340,11 +358,66 @@ fn observation(
                 .filter(|a| a.0 != agent)
                 .sorted_by_key(|o| o.1 .0)
             {
-                my_state.others.push(OtherObs {
-                    identity: IdentityEmbedding::new(other_id.0, params.num_agents()),
-                    phys: PhysicalProperties::new(other_t, other_v),
-                    map_interaction: MapInteractionProperties::new(other_t, &cx),
-                });
+                let my_forward = transform.local_y().xy();
+                let other_loc_relative =
+                    (other_t.translation.xy() - transform.translation.xy()).normalize();
+                // gizmos.line_2d(my_pos, my_pos + other_loc_relative * 100.0, Color::GREEN);
+
+                // check line of sight
+                let filter = QueryFilter::new().exclude_collider(agent);
+                // for (ent, ent_id, _, _) in queries.iter() {
+                //     if agent_id.0 % 2 == ent_id.0 % 2 {
+                //         filter = filter.exclude_collider(ent);
+                //     }
+                // }
+                if let Some((hit_ent, _)) = cx.cast_ray(
+                    transform.translation.xy(),
+                    (other_t.translation.xy() - transform.translation.xy()).normalize(),
+                    Real::MAX,
+                    true,
+                    filter,
+                ) {
+                    // is it an agent or a wall?
+                    if queries.get(hit_ent).is_ok() {
+                        // check if they're in front of us
+                        // let angle = my_forward.dot(other_loc_relative).acos();
+                        // if angle <= required_angle {
+                        // we can see the enemy
+                        gizmos.line_2d(
+                            my_pos,
+                            my_pos + other_loc_relative * 100.0,
+                            if other_id.0 % 2 == 0 {
+                                Color::RED
+                            } else {
+                                Color::BLUE
+                            },
+                        );
+                        my_state.others.push(OtherObs {
+                            identity: IdentityEmbedding::new(other_id.0, params.num_agents()),
+                            phys: PhysicalProperties::new(other_t, other_v),
+                            map_interaction: MapInteractionProperties::new(other_t, &cx),
+                        });
+                        // } else {
+                        //     // behind us
+                        //     my_state.others.push(OtherObs {
+                        //         identity: IdentityEmbedding::new(other_id.0, params.num_agents()),
+                        //         ..Default::default()
+                        //     });
+                        // }
+                    } else {
+                        // obscured by a wall
+                        my_state.others.push(OtherObs {
+                            identity: IdentityEmbedding::new(other_id.0, params.num_agents()),
+                            ..Default::default()
+                        });
+                    }
+                } else {
+                    // ray hit nothing???
+                    my_state.others.push(OtherObs {
+                        identity: IdentityEmbedding::new(other_id.0, params.num_agents()),
+                        ..Default::default()
+                    });
+                }
             }
             let obs = fs
                 .get_mut(agent)

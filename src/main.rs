@@ -4,6 +4,7 @@
 use std::{collections::VecDeque, fmt, path::Path, sync::Arc};
 
 use bevy::{
+    gizmos::GizmoPlugin,
     prelude::*,
     window::{PresentMode, WindowMode},
     winit::WinitSettings,
@@ -204,7 +205,7 @@ fn main() {
     let bevy_seed: [u8; 32] = [42; 32];
     burn_tch::TchBackend::<f32>::seed(tch_seed);
 
-    let params = match BasicParams::from_yaml_file("basic.yaml").ok() {
+    let params = match TdmParams::from_yaml_file("tdm.yaml").ok() {
         Some(params) => {
             println!("Loaded environment parameters:\n{:?}", params);
             params
@@ -215,5 +216,5 @@ fn main() {
         }
     };
 
-    run_env::<Basic, TdmMap>(bevy_seed, params);
+    run_env::<Tdm, TdmMap>(bevy_seed, params);
 }

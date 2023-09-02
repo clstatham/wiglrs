@@ -96,12 +96,12 @@ pub fn action_space<E: Env, T: Thinker<E, Status = PpoStatus>>(
                                 // ui.group(|ui| {
                                 let status = T::status(&brains.get(brain).unwrap().thinker);
                                 let mut mu = "mu:".to_owned();
-                                for m in status.recent_mu.iter() {
+                                for m in status.mu.iter() {
                                     mu.push_str(&format!(" {:.4}", m));
                                 }
                                 ui.label(mu);
                                 let mut cov = "cov:".to_owned();
-                                for s in status.recent_cov.iter() {
+                                for s in status.cov.iter() {
                                     cov.push_str(&format!(" {:.4}", s));
                                 }
                                 ui.label(cov);
@@ -111,9 +111,9 @@ pub fn action_space<E: Env, T: Thinker<E, Status = PpoStatus>>(
                                 // ui.horizontal_top(|ui| {
 
                                 let ms = status
-                                    .recent_mu
+                                    .mu
                                     .iter()
-                                    .zip(status.recent_cov.iter())
+                                    .zip(status.cov.iter())
                                     .enumerate()
                                     .map(|(i, (mu, cov))| {
                                         // https://www.desmos.com/calculator/rkoehr8rve

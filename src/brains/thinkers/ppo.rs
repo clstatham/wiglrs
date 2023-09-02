@@ -8,7 +8,10 @@ use burn::{
     grad_clipping::GradientClippingConfig,
     module::{ADModule, Module, ModuleVisitor, Param, ParamId},
     nn::{Initializer, Linear},
-    optim::{adaptor::OptimizerAdaptor, GradientsParams, Optimizer, RMSProp, RMSPropConfig},
+    optim::{
+        adaptor::OptimizerAdaptor, Adam, AdamConfig, AdamState, GradientsParams, Optimizer,
+        RMSProp, RMSPropConfig, SimpleOptimizer,
+    },
     record::{BinGzFileRecorder, FullPrecisionSettings},
     tensor::{backend::Backend, Tensor},
 };
@@ -288,7 +291,7 @@ impl PpoActorConfig {
             //     )),
             //     bias: Some(Param::from(Tensor::zeros([self.action_len]))),
             // },
-            cov_head: Param::from(Tensor::ones([self.action_len]).require_grad()),
+            cov_head: Param::from(Tensor::zeros([self.action_len]).require_grad()),
         }
     }
 }
@@ -306,14 +309,13 @@ impl<B: Backend<FloatElem = f32>> PpoActor<B> {
             .squeeze(1);
         let x = self.common1.forward(x).tanh();
         let x = x.clone() + self.common2.forward(x).tanh();
-        // let x = x.tanh();
-        let mu = self.mu_head.forward(x.clone());
 
-        // let mu = mu.tanh();
+        let mu = self.mu_head.forward(x.clone());
+        let mu = mu.tanh();
 
         // let cov = self.cov_head.forward(x);
-        let cov = self.cov_head.val().unsqueeze().repeat(0, nbatch).exp();
-        // let cov = (cov.exp() + 1.0).log();
+        let cov = self.cov_head.val().unsqueeze().repeat(0, nbatch);
+        let cov = (cov.exp() + 1.0).log();
 
         (mu, cov)
     }
@@ -397,25 +399,31 @@ pub struct HiddenStates<B: Backend> {
 
 #[derive(Debug, Clone, Default)]
 pub struct PpoStatus {
-    pub recent_mu: Box<[f32]>,
-    pub recent_cov: Box<[f32]>,
+    pub mu: Box<[f32]>,
+    pub cov: Box<[f32]>,
     pub recent_entropy: f32,
-    pub recent_policy_loss: f32,
-    pub recent_value_loss: f32,
-    pub recent_entropy_loss: f32,
-    pub recent_nclamp: f32,
-    pub recent_kl: f32,
-    pub recent_explained_var: f32,
+    pub policy_loss: f32,
+    pub value_loss: f32,
+    pub entropy_loss: f32,
+    pub nclamp: f32,
+    pub kl: f32,
+    pub explained_var: f32,
+    pub policy_batches_completed: f32,
 }
 
 impl Status for PpoStatus {
     fn log(&self, writer: &mut crate::TbWriter, step: usize) {
-        writer.add_scalar("Policy/Loss", self.recent_policy_loss, step);
-        writer.add_scalar("Policy/Entropy", self.recent_entropy_loss, step);
-        writer.add_scalar("Policy/ClampRatio", self.recent_nclamp, step);
-        writer.add_scalar("Policy/KL", self.recent_kl, step);
-        writer.add_scalar("Value/Loss", self.recent_value_loss, step);
-        writer.add_scalar("Value/ExplainedVariance", self.recent_explained_var, step);
+        writer.add_scalar("Policy/Loss", self.policy_loss, step);
+        writer.add_scalar("Policy/Entropy", self.entropy_loss, step);
+        writer.add_scalar("Policy/ClampRatio", self.nclamp, step);
+        writer.add_scalar("Policy/KL", self.kl, step);
+        writer.add_scalar(
+            "Policy/BatchesCompleted",
+            self.policy_batches_completed,
+            step,
+        );
+        writer.add_scalar("Value/Loss", self.value_loss, step);
+        writer.add_scalar("Value/ExplainedVariance", self.explained_var, step);
     }
 }
 
@@ -534,6 +542,10 @@ impl PpoThinker {
         .init(rng);
         // .fork(&TchDevice::Cuda(0));
         dbg!(critic.num_params());
+        // let actor_optim = AdamConfig::new()
+        //     .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
+        //     .init()
+        //     .into();
         let actor_optim = RMSPropConfig::new()
             .with_momentum(0.0)
             .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
@@ -591,8 +603,8 @@ where
             .collect::<Vec<_>>();
         let obs = Tensor::cat(obs, 0).unsqueeze();
         let (mu, cov) = self.actor.valid().forward(obs.clone());
-        self.status.recent_mu = mu.to_data().value.into_boxed_slice();
-        self.status.recent_cov = cov.to_data().value.into_boxed_slice();
+        self.status.mu = mu.to_data().value.into_boxed_slice();
+        self.status.cov = cov.to_data().value.into_boxed_slice();
         let dist = MvNormal { mu, cov };
         self.status.recent_entropy = dist.entropy().into_scalar();
         let action = dist.sample(rng);
@@ -629,6 +641,8 @@ where
         let mut total_nclamp = vec![];
         let mut total_kl = vec![];
         let mut total_explained_var = vec![];
+        let mut total_policy_batches = 0;
+        let mut total_batches = 0;
         let mut it = tqdm!(total = self.training_epochs, desc = "Training");
         for _epoch in 0..self.training_epochs {
             let batches = rb.shuffled_and_batched(self.training_batch_size, rng);
@@ -723,6 +737,7 @@ where
                 total_pi_loss.push(pl);
 
                 if kl <= 0.2 {
+                    total_policy_batches += 1;
                     let actor_grads = policy_loss.backward();
 
                     let mut visitor = CheckNanWeights::default();
@@ -778,22 +793,24 @@ where
                     );
                     panic!("NaN Critic Loss/Params");
                 }
+
+                total_batches += 1;
             }
             it.set_postfix(format!(
                 "pl={} vl={} kl={}",
                 mean(&total_pi_loss),
                 mean(&total_val_loss),
-                mean(&total_kl)
+                mean(&total_kl),
             ));
             it.update(1).ok();
         }
-
-        self.status.recent_policy_loss = mean(&total_pi_loss);
-        self.status.recent_value_loss = mean(&total_val_loss);
-        self.status.recent_entropy_loss = mean(&total_entropy_loss);
-        self.status.recent_nclamp = mean(&total_nclamp);
-        self.status.recent_kl = mean(&total_kl);
-        self.status.recent_explained_var = mean(&total_explained_var);
+        self.status.policy_batches_completed = total_policy_batches as f32 / total_batches as f32;
+        self.status.policy_loss = mean(&total_pi_loss);
+        self.status.value_loss = mean(&total_val_loss);
+        self.status.entropy_loss = mean(&total_entropy_loss);
+        self.status.nclamp = mean(&total_nclamp);
+        self.status.kl = mean(&total_kl);
+        self.status.explained_var = mean(&total_explained_var);
     }
 
     fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {

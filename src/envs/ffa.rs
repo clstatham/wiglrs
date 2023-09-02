@@ -233,31 +233,6 @@ impl Action<Ffa> for FfaAction {
     }
 }
 
-#[derive(Component)]
-pub struct ShootyLine;
-
-#[derive(Bundle)]
-pub struct ShootyLineBundle {
-    pub mesh: MaterialMesh2dBundle<ColorMaterial>,
-    pub shooty_line: ShootyLine,
-}
-
-impl ShootyLineBundle {
-    pub fn new(mut materials: Mut<Assets<ColorMaterial>>, mut meshes: Mut<Assets<Mesh>>) -> Self {
-        Self {
-            mesh: MaterialMesh2dBundle {
-                material: materials.add(ColorMaterial::from(Color::WHITE)),
-                mesh: meshes
-                    .add(Mesh::from(shape::Box::new(3.0, 1.0, 0.0)))
-                    .into(),
-                transform: Transform::from_translation(Vec3::new(0.0, 0.0, 0.0)),
-                ..Default::default()
-            },
-            shooty_line: ShootyLine,
-        }
-    }
-}
-
 pub struct Eyeballs;
 
 impl Eyeballs {
@@ -352,18 +327,27 @@ pub struct Reward(pub f32);
 
 #[derive(Component)]
 pub struct RunningReward {
-    pub rewards: VecDeque<f32>,
+    pub total_reward: f32,
     pub history: VecDeque<f32>,
-    pub max_len: usize,
     pub history_max_len: usize,
+}
+
+impl Default for RunningReward {
+    fn default() -> Self {
+        Self {
+            total_reward: 0.0,
+            history: VecDeque::default(),
+            history_max_len: 1_000,
+        }
+    }
 }
 
 impl RunningReward {
     pub fn update(&mut self, reward: f32) -> Option<f32> {
-        if self.rewards.len() >= self.max_len {
-            self.rewards.pop_front();
-        }
-        self.rewards.push_back(reward);
+        // let delta = reward - self.total_reward;
+        self.total_reward += reward;
+        // self.count = tot_count;
+
         if let Some(r) = self.get() {
             if self.history.len() >= self.history_max_len {
                 self.history.pop_front();
@@ -376,11 +360,7 @@ impl RunningReward {
     }
 
     pub fn get(&self) -> Option<f32> {
-        if self.rewards.len() == self.max_len {
-            Some(self.rewards.iter().sum::<f32>() / self.max_len as f32)
-        } else {
-            None
-        }
+        Some(self.total_reward)
     }
 }
 
@@ -451,12 +431,7 @@ where
             action: E::Action::default(),
             replay_buffer: PpoBuffer::new(Some(params.agent_rb_max_len())),
             reward: Reward(0.0),
-            running_reward: RunningReward {
-                rewards: VecDeque::new(),
-                history: VecDeque::new(),
-                max_len: params.agent_frame_stack_len() * 100,
-                history_max_len: params.agent_frame_stack_len() * 100,
-            },
+            running_reward: RunningReward::default(),
             terminal: Terminal(false),
             marker: Agent,
             rb: RigidBody::Dynamic,
@@ -594,10 +569,6 @@ fn setup(
             .spawn(agent)
             .insert(ActiveEvents::all())
             .with_children(|parent| {
-                parent.spawn(ShootyLineBundle::new(
-                    materials.reborrow(),
-                    meshes.reborrow(),
-                ));
                 Eyeballs::spawn(
                     parent,
                     meshes.reborrow(),
@@ -746,10 +717,9 @@ fn get_reward(
     mut health: Query<&mut Health, With<Agent>>,
     mut kills: Query<&mut Kills, With<Agent>>,
     mut force: Query<&mut ExternalForce, With<Agent>>,
-    mut line_vis: Query<&mut Visibility, With<ShootyLine>>,
-    mut line_transform: Query<&mut Transform, (With<ShootyLine>, Without<Agent>)>,
     names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
+    mut gizmos: Gizmos,
 ) {
     for agent_ent in agents.iter() {
         let my_health = health.get(agent_ent).unwrap();
@@ -760,11 +730,6 @@ fn get_reward(
                     let ray_dir = my_t.local_y().xy();
                     let ray_pos = my_t.translation.xy() + ray_dir * (params.agent_radius + 2.0);
 
-                    for child in childs.get(agent_ent).unwrap().iter() {
-                        if let Ok(mut vis) = line_vis.get_mut(*child) {
-                            *vis = Visibility::Visible;
-                        }
-                    }
                     (ray_dir, ray_pos)
                 };
 
@@ -773,12 +738,7 @@ fn get_reward(
                 if let Some((hit_entity, toi)) =
                     cx.cast_ray(ray_pos, ray_dir, params.agent_shoot_distance, false, filter)
                 {
-                    for child in childs.get(agent_ent).unwrap().iter() {
-                        if let Ok(mut line) = line_transform.get_mut(*child) {
-                            line.scale = Vec3::new(1.0, toi, 1.0);
-                            line.translation = Vec3::new(0.0, toi / 2.0, 0.0);
-                        }
-                    }
+                    gizmos.line_2d(ray_pos, ray_dir * toi, Color::WHITE);
 
                     if let Ok(mut health) = health.get_component_mut::<Health>(hit_entity) {
                         if health.0 > 0.0 {
@@ -803,20 +763,7 @@ fn get_reward(
                     }
                 } else {
                     // hit nothing
-                    for child in childs.get(agent_ent).unwrap().iter() {
-                        if let Ok(mut line) = line_transform.get_mut(*child) {
-                            line.scale = Vec3::new(1.0, params.agent_shoot_distance, 1.0);
-                            line.translation =
-                                Vec3::new(0.0, params.agent_shoot_distance / 2.0, 0.0);
-                        }
-                    }
                     rewards.get_mut(agent_ent).unwrap().0 -= 4.0;
-                }
-            } else {
-                for child in childs.get(agent_ent).unwrap().iter() {
-                    if let Ok(mut vis) = line_vis.get_mut(*child) {
-                        *vis = Visibility::Hidden;
-                    }
                 }
             }
 
@@ -967,22 +914,13 @@ pub fn learn<E: Env, T>(
             });
         for (_, _, _, name, brain) in query.iter() {
             let status = Thinker::<E>::status(&brain.thinker);
-            log.push(format!(
-                "{} Policy Loss: {}",
-                name.0, status.recent_policy_loss
-            ));
+            log.push(format!("{} Policy Loss: {}", name.0, status.policy_loss));
             log.push(format!(
                 "{} Policy Entropy: {}",
-                name.0, status.recent_entropy_loss
+                name.0, status.entropy_loss
             ));
-            log.push(format!(
-                "{} Policy Clip Ratio: {}",
-                name.0, status.recent_nclamp
-            ));
-            log.push(format!(
-                "{} Value Loss: {}",
-                name.0, status.recent_value_loss
-            ));
+            log.push(format!("{} Policy Clip Ratio: {}", name.0, status.nclamp));
+            log.push(format!("{} Value Loss: {}", name.0, status.value_loss));
         }
     }
 }

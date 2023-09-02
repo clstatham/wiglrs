@@ -1,5 +1,5 @@
 ffa_params:
-  num_agents: 6
+  num_agents: 4
   agent_hidden_dim: 64
   agent_actor_lr: 0.0003
   agent_critic_lr: 0.0003
@@ -21,7 +21,7 @@ ffa_params:
   reward_for_getting_hit: -0.1
   reward_for_miss: 0.0
 reward_for_friendly_fire: -0.1
-num_teams: 3
+num_teams: 2
 team_colors:
 - !Rgba
   red: 1.0
