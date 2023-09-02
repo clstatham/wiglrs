@@ -325,41 +325,40 @@ pub struct Agent;
 pub struct Reward(pub f32);
 
 #[derive(Component)]
-pub struct RunningReward {
-    pub total_reward: f32,
+pub struct RunningReturn {
+    pub buf: VecDeque<f32>,
     pub history: VecDeque<f32>,
-    pub history_max_len: usize,
+    pub max_len: usize,
 }
 
-impl Default for RunningReward {
-    fn default() -> Self {
+impl RunningReturn {
+    pub fn new(max_len: usize) -> Self {
         Self {
-            total_reward: 0.0,
+            buf: VecDeque::default(),
             history: VecDeque::default(),
-            history_max_len: 1_000,
+            max_len,
         }
     }
 }
 
-impl RunningReward {
+impl RunningReturn {
     pub fn update(&mut self, reward: f32) -> Option<f32> {
-        // let delta = reward - self.total_reward;
-        self.total_reward += reward;
-        // self.count = tot_count;
-
-        if let Some(r) = self.get() {
-            if self.history.len() >= self.history_max_len {
-                self.history.pop_front();
-            }
-            self.history.push_back(r);
-            Some(r)
-        } else {
-            None
+        if self.buf.len() >= self.max_len {
+            self.buf.pop_front();
         }
+        self.buf.push_back(reward);
+
+        self.history.clear();
+        let mut val = reward;
+        for r in self.buf.iter().rev() {
+            val = *r + 0.9999 * val;
+            self.history.push_front(val);
+        }
+        self.get()
     }
 
     pub fn get(&self) -> Option<f32> {
-        Some(self.total_reward)
+        self.history.front().copied()
     }
 }
 
@@ -400,7 +399,7 @@ where
     pub action: E::Action,
     pub replay_buffer: PpoBuffer<E>,
     pub reward: Reward,
-    pub running_reward: RunningReward,
+    pub running_reward: RunningReturn,
     pub terminal: Terminal,
     pub rng: EntropyComponent<ChaCha8Rng>,
     marker: Agent,
@@ -430,7 +429,9 @@ where
             action: E::Action::default(),
             replay_buffer: PpoBuffer::new(Some(params.agent_rb_max_len())),
             reward: Reward(0.0),
-            running_reward: RunningReward::default(),
+            running_reward: RunningReturn::new(
+                params.agent_rb_max_len() / params.agent_frame_stack_len(),
+            ),
             terminal: Terminal(false),
             marker: Agent,
             rb: RigidBody::Dynamic,
@@ -770,7 +771,7 @@ pub fn send_reward<E: Env, T: Thinker<E>>(
     agents: Query<Entity, With<Agent>>,
     frame_count: Res<FrameCount>,
     rewards: Query<&Reward, With<Agent>>,
-    mut running_rewards: Query<&mut RunningReward, With<Agent>>,
+    mut running_rewards: Query<&mut RunningReturn, With<Agent>>,
     mut brains: Query<&mut Brain<E, T>, With<Agent>>,
 ) {
     if frame_count.0 as usize % params.agent_frame_stack_len() == 0 {
@@ -874,8 +875,10 @@ pub fn check_dead<E: Env>(
 
 pub fn learn<E: Env, T>(
     params: Res<E::Params>,
+    obs: Query<&FrameStack<Box<[f32]>>, With<Agent>>,
     mut query: Query<
         (
+            Entity,
             &mut EntropyComponent<ChaCha8Rng>,
             &mut PpoBuffer<E>,
             &E::Action,
@@ -894,15 +897,18 @@ pub fn learn<E: Env, T>(
     if frame_count.0 as usize >= params.training_batch_size()
         && frame_count.0 as usize % params.agent_update_interval() == 0
     {
-        query
-            .par_iter_mut()
-            .for_each_mut(|(mut rng, mut rb, action, _name, mut brain)| {
+        query.par_iter_mut().for_each_mut(
+            |(ent, mut rng, mut rb, _old_action, _name, mut brain)| {
                 // if deaths.0 > 0 {
+                let action = brain.act(obs.get(ent).unwrap(), &*params, &mut rng);
+                // assert_ne!(old_action.metadata().val, action.metadata().val);
+                // dbg!(old_action.metadata().val, action.metadata().val);
                 rb.finish_trajectory(Some(action.metadata().val));
                 brain.learn(frame_count.0 as usize, &mut *rb, &*params, &mut rng);
                 // }
-            });
-        for (_, _, _, name, brain) in query.iter() {
+            },
+        );
+        for (_, _, _, _, name, brain) in query.iter() {
             let status = Thinker::<E>::status(&brain.thinker);
             log.push(format!("{} Policy Loss: {}", name.0, status.policy_loss));
             log.push(format!(

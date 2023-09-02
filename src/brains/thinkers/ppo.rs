@@ -6,7 +6,10 @@ use bevy_rand::prelude::EntropyComponent;
 
 use itertools::Itertools;
 use rand_distr::Distribution;
-use std::f32::consts::PI;
+use std::{
+    f32::consts::PI,
+    ops::{Add, Mul},
+};
 
 use crate::{
     brains::replay_buffer::{PpoBuffer, PpoMetadata},
@@ -83,18 +86,30 @@ impl MvNormal {
     }
 
     pub fn entropy(&self) -> Result<Tensor> {
-        // let cov = self.cov.to_data().value;
-        // let [_, nfeat] = self.mu.shape().dims;
-        // assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
-        // let nbatch = self.mu.shape().dims[0];
-        // let mut g = Tensor::ones([nbatch, 1]).to_device(&self.cov.device());
-        // for i in 0..nfeat {
-        //     g = g * self.cov.clone().slice([0..nbatch, i..i + 1]);
-        // }
-        // let second_term = (nfeat as f32 * 0.5) * (1.0 + (2.0 * PI).ln());
-        // g.log() * 0.5 + second_term
-        todo!()
+        let (_, nfeat) = self.mu.shape().dims2().unwrap();
+        let second_term = (nfeat as f32 * 0.5) * (1.0 + (2.0 * PI).ln());
+        self.cov
+            .log()
+            .unwrap()
+            .sum(1)
+            .unwrap()
+            .mul(0.5)
+            .unwrap()
+            .broadcast_add(&Tensor::new(second_term, &DEVICE).unwrap())
     }
+}
+
+pub fn linear(in_len: usize, out_len: usize, gain: f64, vs: VarBuilder) -> Linear {
+    let w_init = candle_nn::init::Init::Randn {
+        mean: 0.0,
+        stdev: gain,
+    };
+    let b_init = candle_nn::init::Init::Const(0.0);
+    let weight = vs
+        .get_with_hints((out_len, in_len), "weight", w_init)
+        .unwrap();
+    let bias = vs.get_with_hints((out_len,), "bias", b_init).unwrap();
+    Linear::new(weight, Some(bias))
 }
 
 pub struct PpoActor {
@@ -105,11 +120,7 @@ pub struct PpoActor {
 }
 
 impl PpoActor {
-    pub fn forward(
-        &mut self,
-        x: &Tensor,
-        // common_h: &mut Tensor<B, 2>,
-    ) -> Result<(Tensor, Tensor)> {
+    pub fn forward(&mut self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, nseq, _) = x.shape().dims3().unwrap();
         let x = x
             .index_select(
@@ -138,10 +149,10 @@ impl PpoActor {
         vs: VarBuilder,
     ) -> Result<Self> {
         Ok(Self {
-            common1: candle_nn::linear(obs_len, hidden_len, vs.pp("common1"))?,
-            common2: candle_nn::linear(hidden_len, hidden_len, vs.pp("common2"))?,
-            mu_head: candle_nn::linear(hidden_len, action_len, vs.pp("mu_head"))?,
-            cov_head: candle_nn::linear(hidden_len, action_len, vs.pp("cov_head"))?,
+            common1: linear(obs_len, hidden_len, 2.0f64.sqrt(), vs.pp("common1")),
+            common2: linear(hidden_len, hidden_len, 2.0f64.sqrt(), vs.pp("common2")),
+            mu_head: linear(hidden_len, action_len, 0.01, vs.pp("mu_head")),
+            cov_head: linear(hidden_len, action_len, 0.01, vs.pp("cov_head")),
         })
     }
 }
@@ -155,9 +166,9 @@ pub struct PpoCritic {
 impl PpoCritic {
     pub fn new(obs_len: usize, hidden_len: usize, vs: VarBuilder) -> Result<Self> {
         Ok(Self {
-            common1: candle_nn::linear(obs_len, hidden_len, vs.pp("common1"))?,
-            common2: candle_nn::linear(hidden_len, hidden_len, vs.pp("common2"))?,
-            head: candle_nn::linear(hidden_len, 1, vs.push_prefix("head"))?,
+            common1: linear(obs_len, hidden_len, 2.0f64.sqrt(), vs.pp("common1")),
+            common2: linear(hidden_len, hidden_len, 2.0f64.sqrt(), vs.pp("common2")),
+            head: linear(hidden_len, 1, 1.0, vs.push_prefix("head")),
         })
     }
 }
@@ -285,7 +296,7 @@ impl RmsNormalize {
     }
 
     pub fn forward_ret(&mut self, rew: f32) -> f32 {
-        self.returns = self.returns * 0.99 + rew;
+        self.returns = self.returns * 0.9999 + rew;
         self.update_ret(self.returns);
         rew / (self.ret_var + 1e-8).sqrt()
     }
@@ -370,6 +381,7 @@ where
             .unwrap()
             .unsqueeze(0)
             .unwrap();
+
         let (mu, cov) = self.actor.forward(&obs).unwrap();
         self.status.mu = mu
             .reshape((self.action_len,))
@@ -384,8 +396,13 @@ where
             .unwrap()
             .into_boxed_slice();
         let dist = MvNormal { mu, cov };
-        // self.status.recent_entropy = dist.entropy().into_scalar();
-        self.status.recent_entropy = 0.0;
+        self.status.recent_entropy = dist
+            .entropy()
+            .unwrap()
+            .reshape(())
+            .unwrap()
+            .to_scalar()
+            .unwrap();
         let action = dist.sample(rng).unwrap();
         let val = self.critic.forward(&obs).unwrap();
 
@@ -419,6 +436,18 @@ where
         params: &E::Params,
         rng: &mut EntropyComponent<ChaCha8Rng>,
     ) {
+        fn variance(a: &Tensor) -> Tensor {
+            let a_mean = a.mean(0).unwrap();
+            let n = Tensor::new(a.shape().dims()[0] as f32, &DEVICE).unwrap();
+            a.broadcast_sub(&a_mean)
+                .unwrap()
+                .sqr()
+                .unwrap()
+                .sum_keepdim(0)
+                .unwrap()
+                .broadcast_div(&n)
+                .unwrap()
+        }
         use kdam::{tqdm, BarExt};
         let mean = |l: &[f32]| l.iter().sum::<f32>() / l.len() as f32;
         let mut total_pi_loss: Vec<f32> = vec![];
@@ -480,8 +509,14 @@ where
                     &self.device,
                 )
                 .unwrap();
-                // let advantage = (advantage - advantage.mean(0).unwrap()).unwrap()
-                //     / (advantage.variance + 1e-8).sqrt();
+
+                let adv_mean = advantage.mean_keepdim(0).unwrap();
+                let adv_std = variance(&advantage).sqrt().unwrap();
+                let advantage = (advantage
+                    .broadcast_sub(&adv_mean)
+                    .unwrap()
+                    .broadcast_div(&(adv_std + 1e-8).unwrap()))
+                .unwrap();
                 let returns = (&advantage + &old_val).unwrap();
 
                 let (mu, cov) = self.actor.forward(&s).unwrap();
@@ -489,34 +524,42 @@ where
                     mu: mu.clone(),
                     cov: cov.clone(),
                 };
-                // let entropy = dist.entropy();
+                let entropy = dist.entropy().unwrap();
+                total_entropy_loss.push(entropy.mean(0).unwrap().to_scalar().unwrap());
                 let lp = dist.log_prob(&a);
                 let log_ratio = (lp - old_lp).unwrap();
 
                 let ratio = log_ratio.exp().unwrap();
                 let surr1 = (&ratio * &advantage).unwrap();
-                // let nclamp = ratio
-                //     .zeros_like()
-                //     .unwrap()
-                //     .where_cond(, on_false)
-                //     .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
-                // let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
-                // total_nclamp.push(nclamp.mean().into_scalar());
-                total_nclamp.push(0.0);
-                let surr2 = (ratio
-                    .broadcast_minimum(&Tensor::new(1.2f32, &self.device).unwrap())
+
+                let lo = Tensor::new(0.9f32, &self.device).unwrap();
+                let hi = Tensor::new(1.1f32, &self.device).unwrap();
+
+                let nclamp: f32 = (ratio
+                    .lt(&lo.broadcast_left(ratio.shape()).unwrap())
                     .unwrap()
-                    .broadcast_maximum(&Tensor::new(0.8f32, &self.device).unwrap())
+                    + ratio
+                        .gt(&hi.broadcast_left(ratio.shape()).unwrap())
+                        .unwrap())
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .mean(0)
+                .unwrap()
+                .to_scalar()
+                .unwrap();
+                total_nclamp.push(nclamp);
+
+                let surr2 = (ratio
+                    .broadcast_minimum(&hi)
+                    .unwrap()
+                    .broadcast_maximum(&lo)
                     .unwrap()
                     * advantage.clone())
                 .unwrap();
                 let masked = surr2.minimum(&surr1).unwrap();
-                let policy_loss = masked.mean(0).unwrap().neg().unwrap();
+                let policy_loss = masked.neg().unwrap().mean(0).unwrap();
 
-                // let entropy_loss = entropy.mean();
-                // total_entropy_loss.push(entropy_loss.clone().into_scalar());
-                total_entropy_loss.push(0.0);
-                // let policy_loss = policy_loss - entropy_loss * self.entropy_beta;
                 let kl = log_ratio
                     .neg()
                     .unwrap()
@@ -531,30 +574,27 @@ where
                 total_pi_loss.push(pl);
 
                 let val = self.critic.forward(&s).unwrap();
-                let val_err = (val - returns).unwrap();
+                let val_err = (&val - &returns).unwrap();
                 let value_loss = (&val_err * &val_err).unwrap().mean(0).unwrap();
                 let vl = value_loss.to_scalar().unwrap();
                 total_val_loss.push(vl);
 
-                let loss = (policy_loss + value_loss).unwrap();
-                if kl <= 0.2 {
+                let loss = (policy_loss + (value_loss * 0.5).unwrap()).unwrap();
+                if kl <= 0.02 {
                     total_policy_batches += 1;
                     let grads = loss.backward().unwrap();
 
                     self.optim.step(&grads).unwrap();
-                } else {
-                    // println!("Maximum KL reached after {batch_i} batches");
-                    // break;
                 }
-
-                // let y_true = returns.clone().squeeze(1);
-                // let explained_var = if y_true.clone().var(0).into_scalar() == 0.0 {
-                //     f32::NAN
-                // } else {
-                //     1.0 - ((y_true.clone() - val.clone().detach()).var(0) / y_true.var(0))
-                //         .into_scalar()
-                // };
-                total_explained_var.push(0.0);
+                let y_true = returns.clone();
+                let explained_var: f32 = (Tensor::new(&[1.0f32], &DEVICE).unwrap()
+                    - (variance(&(&y_true - &val).unwrap()).div(&variance(&y_true))))
+                .unwrap()
+                .reshape(())
+                .unwrap()
+                .to_scalar()
+                .unwrap();
+                total_explained_var.push(explained_var);
 
                 total_batches += 1;
             }

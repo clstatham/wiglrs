@@ -7,7 +7,7 @@ use bevy_egui::EguiContexts;
 use itertools::Itertools;
 
 use crate::brains::thinkers::ppo::PpoStatus;
-use crate::envs::ffa::{Name, RunningReward};
+use crate::envs::ffa::{Name, RunningReturn};
 use crate::{
     brains::{thinkers::Thinker, Brain},
     envs::{
@@ -185,7 +185,7 @@ pub fn log(mut cxs: EguiContexts, log: Res<LogText>) {
         });
 }
 
-pub fn running_reward(mut cxs: EguiContexts, queries: Query<(&Name, &RunningReward), With<Agent>>) {
+pub fn running_reward(mut cxs: EguiContexts, queries: Query<(&Name, &RunningReturn), With<Agent>>) {
     egui::Window::new("Running Reward")
         .vscroll(true)
         .hscroll(true)
@@ -202,7 +202,7 @@ pub fn running_reward(mut cxs: EguiContexts, queries: Query<(&Name, &RunningRewa
                                 .width(220.0)
                                 .show(ui, |plot| {
                                     let line = Line::new(
-                                        (0..reward.history_max_len)
+                                        (0..reward.max_len)
                                             .zip(reward.history.iter())
                                             .map(|(x, y)| [x as f64, *y as f64])
                                             .collect_vec(),

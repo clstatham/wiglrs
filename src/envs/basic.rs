@@ -454,9 +454,9 @@ fn get_reward(
             let reward =
                 my_t.translation.distance(other_t.translation) * params.distance_reward_mult;
             if my_id.0 % 2 == 0 && other_id.0 % 2 == 1 {
-                rewards.get_mut(agent_ent).unwrap().0 .0 -= reward;
+                rewards.get_mut(agent_ent).unwrap().0 .0 -= reward * reward;
             } else if my_id.0 % 2 == 1 && other_id.0 % 2 == 0 {
-                rewards.get_mut(agent_ent).unwrap().0 .0 += reward;
+                rewards.get_mut(agent_ent).unwrap().0 .0 += reward * reward;
             }
         }
     }

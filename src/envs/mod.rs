@@ -6,6 +6,7 @@ use std::{
 
 use crate::FrameStack;
 use bevy::{ecs::schedule::SystemConfigs, prelude::*};
+use bevy_rapier2d::prelude::PhysicsSet;
 use candle_core::Tensor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -92,15 +93,20 @@ pub trait Env: Resource {
     fn learn_system() -> SystemConfigs;
     fn ui_system() -> SystemConfigs;
 
-    fn main_system() -> SystemConfigs {
-        (
-            Self::observation_system(),
-            Self::action_system(),
-            Self::reward_system(),
-            Self::terminal_system(),
-            Self::update_system(),
-            Self::learn_system(),
-        )
-            .chain()
+    fn add_main_systems(app: &mut App) {
+        app.add_systems(Startup, Self::observation_system());
+        app.add_systems(
+            Update,
+            (
+                Self::action_system(),
+                Self::reward_system(),
+                Self::terminal_system(),
+                Self::update_system(),
+                Self::observation_system(),
+                Self::learn_system(),
+            )
+                .chain()
+                .after(PhysicsSet::Writeback),
+        );
     }
 }

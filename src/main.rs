@@ -15,10 +15,11 @@ use bevy_rapier2d::prelude::*;
 use bevy_rand::prelude::*;
 use envs::{
     basic::{Basic, BasicParams},
-    maps::{tdm::TdmMap, Map},
+    ffa::{Ffa, FfaParams},
+    maps::tdm::TdmMap,
     tdm::{Tdm, TdmParams},
-    // tdm::Tdm,
     Env,
+    // tdm::Tdm,
     Params,
 };
 use serde::Serialize;
@@ -140,8 +141,13 @@ fn handle_input(
         }
     }
 }
-fn run_env<E: Env, M: Map>(seed: [u8; 32], params: E::Params)
-where
+
+fn run_env<E: crate::envs::Env, M: crate::envs::maps::Map>(
+    seed: [u8; 32],
+    env: E,
+    map: M,
+    params: E::Params,
+) where
     E::Params: Serialize,
 {
     let ts = Timestamp::default();
@@ -150,8 +156,8 @@ where
     std::fs::create_dir_all(&p).ok();
     p.push("env.yaml");
     params.to_yaml_file(p).ok();
-    App::new()
-        .insert_resource(Msaa::default())
+    let mut app = App::new();
+    app.insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
             focused_mode: bevy::winit::UpdateMode::Continuous,
             ..default()
@@ -184,33 +190,76 @@ where
             },
             ..Default::default()
         })
-        .add_plugins(RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0))
+        .add_plugins(
+            RapierPhysicsPlugin::<NoUserData>::pixels_per_meter(100.0), // .with_default_system_setup(false),
+        )
         // .add_plugins(RapierDebugRenderPlugin::default())
         .add_plugins(EguiPlugin)
-        .insert_resource(E::init())
+        .insert_resource(env)
         .insert_resource(params)
         .add_systems(Startup, setup)
         .add_systems(Startup, (M::setup_system(), E::setup_system()).chain())
         .add_systems(Update, E::ui_system())
-        .add_systems(Update, handle_input)
-        .add_systems(Update, E::main_system())
-        .run();
+        .add_systems(Update, handle_input);
+    E::add_main_systems(&mut app);
+    app.run();
+}
+
+pub enum EnvKind {
+    Basic,
+    Ffa,
+    Tdm,
+}
+
+pub enum MapKind {
+    Tdm,
 }
 
 fn main() {
     let _tch_seed: u64 = 0xcafebabe;
     let bevy_seed: [u8; 32] = [42; 32];
 
-    let params = match BasicParams::from_yaml_file("basic.yaml").ok() {
-        Some(params) => {
-            println!("Loaded environment parameters:\n{:?}", params);
-            params
-        }
-        None => {
-            println!("Using default environment parameters.");
-            Default::default()
-        }
-    };
+    let env = EnvKind::Basic;
 
-    run_env::<Basic, TdmMap>(bevy_seed, params);
+    match env {
+        EnvKind::Tdm => {
+            let params = match TdmParams::from_yaml_file("tdm.yaml").ok() {
+                Some(params) => {
+                    println!("Loaded environment parameters:\n{:?}", params);
+                    params
+                }
+                None => {
+                    println!("Using default environment parameters.");
+                    Default::default()
+                }
+            };
+            run_env(bevy_seed, Tdm::init(), TdmMap, params);
+        }
+        EnvKind::Basic => {
+            let params = match BasicParams::from_yaml_file("basic.yaml").ok() {
+                Some(params) => {
+                    println!("Loaded environment parameters:\n{:?}", params);
+                    params
+                }
+                None => {
+                    println!("Using default environment parameters.");
+                    Default::default()
+                }
+            };
+            run_env(bevy_seed, Basic::init(), TdmMap, params);
+        }
+        EnvKind::Ffa => {
+            let params = match FfaParams::from_yaml_file("ffa.yaml").ok() {
+                Some(params) => {
+                    println!("Loaded environment parameters:\n{:?}", params);
+                    params
+                }
+                None => {
+                    println!("Using default environment parameters.");
+                    Default::default()
+                }
+            };
+            run_env(bevy_seed, Ffa::init(), TdmMap, params);
+        }
+    }
 }

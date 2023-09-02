@@ -120,13 +120,13 @@ where
             self.advantage.push_back(None);
             // self.returns.push_back(None);
 
-            self.current_trajectory_start += 1;
-            if let Some(max_len) = self.max_len {
-                if self.current_trajectory_start >= max_len {
-                    self.current_trajectory_start = max_len;
-                    self.finish_trajectory(Some(action.metadata().val)); // in case one of them is an ABSOLUTE GAMER and doesn't die for like 100_000 frames
-                }
-            }
+            // self.current_trajectory_start += 1;
+            // if let Some(max_len) = self.max_len {
+            //     if self.current_trajectory_start >= max_len {
+            //         self.current_trajectory_start = max_len;
+            //         self.finish_trajectory(Some(action.metadata().val)); // in case one of them is an ABSOLUTE GAMER and doesn't die for like 100_000 frames
+            //     }
+            // }
         }
     }
 
@@ -139,8 +139,8 @@ where
         let mut gae = 0.0;
         for i in (startpoint..endpoint).rev() {
             let mask = if self.terminal[i] { 0.0 } else { 1.0 };
-            let delta = self.reward[i] + 0.99 * vals[i + 1] * mask - vals[i];
-            gae = delta + 0.99 * 0.95 * mask * gae;
+            let delta = self.reward[i] + 0.9999 * vals[i + 1] * mask - vals[i];
+            gae = delta + 0.9999 * 0.95 * mask * gae;
             self.advantage[i] = Some(gae);
             // ret = self.reward[i] + 0.99 * mask * ret;
             // self.returns[i] = Some(ret);
