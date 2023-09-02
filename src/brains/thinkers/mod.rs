@@ -15,8 +15,8 @@ use crate::{
 
 use super::replay_buffer::{PpoBuffer, PpoMetadata};
 
-pub mod linalg;
-pub mod ncp;
+// pub mod linalg;
+// pub mod ncp;
 pub mod ppo;
 
 pub trait Status {

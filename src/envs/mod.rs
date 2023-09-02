@@ -6,7 +6,7 @@ use std::{
 
 use crate::FrameStack;
 use bevy::{ecs::schedule::SystemConfigs, prelude::*};
-use burn_tensor::{backend::Backend, Tensor};
+use candle_core::Tensor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod basic;
@@ -27,8 +27,8 @@ where
     Self: Sized,
 {
     fn as_slice(&self) -> Box<[f32]>;
-    fn as_tensor<B: Backend>(&self) -> Tensor<B, 1> {
-        Tensor::from_floats(self.as_slice().to_vec().as_slice())
+    fn as_tensor(&self) -> Tensor {
+        Tensor::new(&*self.as_slice(), &candle_core::Device::Cpu).unwrap()
     }
 }
 

@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use bevy::{core::FrameCount, prelude::*};
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
-use burn_tch::TchBackend;
 use itertools::Itertools;
 use rand::seq::SliceRandom;
 
@@ -35,7 +34,7 @@ impl<E: Env> Sart<E> {
 pub struct PpoMetadata {
     pub val: f32,
     pub logp: f32,
-    pub hiddens: Option<HiddenStates<TchBackend<f32>>>,
+    pub hiddens: Option<HiddenStates>,
 }
 
 #[derive(Component)]

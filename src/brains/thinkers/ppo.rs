@@ -3,23 +3,10 @@
 use bevy::prelude::Component;
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
-use burn::{
-    config::Config,
-    grad_clipping::GradientClippingConfig,
-    module::{ADModule, Module, ModuleVisitor, Param, ParamId},
-    nn::{Initializer, Linear},
-    optim::{
-        adaptor::OptimizerAdaptor, Adam, AdamConfig, AdamState, GradientsParams, Optimizer,
-        RMSProp, RMSPropConfig, SimpleOptimizer,
-    },
-    record::{BinGzFileRecorder, FullPrecisionSettings},
-    tensor::{backend::Backend, Tensor},
-};
-
-use burn_tch::{TchBackend, TchDevice};
 
 use itertools::Itertools;
-use std::{f32::consts::PI, marker::PhantomData};
+use rand_distr::Distribution;
+use std::f32::consts::PI;
 
 use crate::{
     brains::replay_buffer::{PpoBuffer, PpoMetadata},
@@ -30,369 +17,171 @@ use crate::{
     FrameStack,
 };
 
-use super::{linalg::orthogonal, Status, Thinker};
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::{AdamW, Linear, Module, Optimizer, VarBuilder, VarMap};
 
-pub type Be = burn_autodiff::ADBackendDecorator<burn_tch::TchBackend<f32>>;
+use super::{Status, Thinker};
 
-#[cfg(test)]
-mod tests {
-    use burn_tch::TchBackend;
-    use burn_tensor::Tensor;
-
-    use super::MvNormal;
-
-    #[test]
-    fn test_logpdf() {
-        let mu = Tensor::<TchBackend<f32>, 1>::from_floats([0.0, 1.0, -1.0]).unsqueeze();
-        let cov = Tensor::<TchBackend<f32>, 1>::from_floats([0.1, 0.7, 1.5]).unsqueeze();
-        let xs = Tensor::<TchBackend<f32>, 1>::from_floats([0.2, -0.9, 1.5]).unsqueeze();
-        let dist = MvNormal { mu, cov };
-        let lp = dist.log_prob(xs).into_scalar();
-        assert!((lp - -6.4918).abs() < 1e-4);
-    }
+lazy_static::lazy_static! {
+    pub static ref DEVICE: Device = Device::Cpu;
 }
 
-pub struct MvNormal<B: Backend<FloatElem = f32>> {
-    pub mu: Tensor<B, 2>,
-    pub cov: Tensor<B, 2>,
+pub struct MvNormal {
+    pub mu: Tensor,
+    pub cov: Tensor,
 }
 
-impl<B: Backend<FloatElem = f32>> MvNormal<B> {
-    pub fn sample(&self, rng: &mut EntropyComponent<ChaCha8Rng>) -> Tensor<B, 2> {
-        let cov = self.cov.clone();
-        let [_, nfeat] = self.mu.shape().dims;
-        let nbatch = self.mu.shape().dims[0];
-        let mut sampler = burn_tensor::Distribution::<f32>::Normal(0.0, 1.0).sampler(rng);
-        let samples = (0..nbatch * nfeat).map(|_| sampler.sample()).collect_vec();
-        let z = Tensor::from_floats(samples.as_slice())
-            .reshape([nbatch, nfeat])
-            .to_device(&self.mu.device());
+impl MvNormal {
+    pub fn sample(&self, rng: &mut EntropyComponent<ChaCha8Rng>) -> Result<Tensor> {
+        let elems = self.mu.shape().elem_count();
+        let dist = rand_distr::StandardNormal;
+        let samples = (0..elems)
+            .map(|_| Distribution::<f32>::sample(&dist, rng))
+            .collect_vec();
+        let z = Tensor::from_vec(samples, self.mu.shape(), self.mu.device())?;
 
-        self.mu.clone() + z * cov
+        z.broadcast_mul(&self.cov)?.broadcast_add(&self.mu)
     }
 
     // https://online.stat.psu.edu/stat505/book/export/html/636
-    pub fn log_prob(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let [nbatch, _nfeat] = self.mu.shape().dims;
-        let x = x.to_device(&self.mu.device());
-        let first = self.cov.ones_like() / (self.cov.clone() * 2.0 * PI).sqrt();
+    pub fn log_prob(&self, x: &Tensor) -> Tensor {
+        let _nbatch = self.mu.shape().dims()[0];
+        let x = x.to_device(self.mu.device()).unwrap();
+        let first = self
+            .cov
+            .ones_like()
+            .unwrap()
+            .broadcast_div(
+                &self
+                    .cov
+                    .broadcast_mul(&Tensor::new(2.0 * PI, &DEVICE).unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+            .sqrt()
+            .unwrap();
         let second = {
-            let a = self.cov.ones_like().neg() / (self.cov.clone() * 2.0);
-            let b = x.clone() - self.mu.clone();
-            (a * b.clone() * b).exp()
+            let a = self
+                .cov
+                .ones_like()
+                .unwrap()
+                .neg()
+                .unwrap()
+                .div(
+                    &self
+                        .cov
+                        .broadcast_mul(&Tensor::new(2.0f32, &DEVICE).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+            let b = x.sub(&self.mu).unwrap();
+            (a.mul(&b).unwrap().mul(&b).unwrap()).exp().unwrap()
         };
-        let factors = first * second;
+        let factors = first.mul(&second).unwrap();
 
-        factors.log().sum_dim(1).reshape([nbatch, 1])
+        factors.log().unwrap().sum(1).unwrap()
     }
 
-    pub fn entropy(&self) -> Tensor<B, 2> {
-        let cov = self.cov.to_data().value;
-        let [_, nfeat] = self.mu.shape().dims;
-        assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
-        let nbatch = self.mu.shape().dims[0];
-        let mut g = Tensor::ones([nbatch, 1]).to_device(&self.cov.device());
-        for i in 0..nfeat {
-            g = g * self.cov.clone().slice([0..nbatch, i..i + 1]);
-        }
-        let second_term = (nfeat as f32 * 0.5) * (1.0 + (2.0 * PI).ln());
-        g.log() * 0.5 + second_term
-    }
-}
-
-pub fn sigmoid<B: Backend, const ND: usize>(x: Tensor<B, ND>) -> Tensor<B, ND> {
-    x.ones_like() / (x.ones_like() + x.clone().neg().exp())
-}
-
-#[derive(Module, Debug)]
-pub struct GruCell<B: Backend> {
-    w_xz: Param<Tensor<B, 2>>,
-    w_hz: Param<Tensor<B, 2>>,
-    b_z: Param<Tensor<B, 1>>,
-    w_xr: Param<Tensor<B, 2>>,
-    w_hr: Param<Tensor<B, 2>>,
-    b_r: Param<Tensor<B, 1>>,
-    w_xh: Param<Tensor<B, 2>>,
-    w_hh: Param<Tensor<B, 2>>,
-    b_h: Param<Tensor<B, 1>>,
-}
-
-#[derive(Config, Debug)]
-pub struct GruCellConfig {
-    input_len: usize,
-    hidden_len: usize,
-}
-
-impl GruCellConfig {
-    pub fn init<B: Backend>(&self) -> GruCell<B> {
-        let initializer = Initializer::XavierNormal { gain: 1.0 };
-        GruCell {
-            w_xz: Param::new(
-                ParamId::new(),
-                initializer.init_with(
-                    [self.input_len, self.hidden_len],
-                    Some(self.input_len),
-                    Some(self.hidden_len),
-                ),
-            ),
-            w_hz: Param::new(
-                ParamId::new(),
-                initializer.init_with(
-                    [self.hidden_len, self.hidden_len],
-                    Some(self.hidden_len),
-                    Some(self.hidden_len),
-                ),
-            ),
-            b_z: Param::new(ParamId::new(), Tensor::zeros([self.hidden_len])),
-            w_xr: Param::new(
-                ParamId::new(),
-                initializer.init_with(
-                    [self.input_len, self.hidden_len],
-                    Some(self.input_len),
-                    Some(self.hidden_len),
-                ),
-            ),
-            w_hr: Param::new(
-                ParamId::new(),
-                initializer.init_with(
-                    [self.hidden_len, self.hidden_len],
-                    Some(self.hidden_len),
-                    Some(self.hidden_len),
-                ),
-            ),
-            b_r: Param::new(ParamId::new(), Tensor::zeros([self.hidden_len])),
-            w_xh: Param::new(
-                ParamId::new(),
-                initializer.init_with(
-                    [self.input_len, self.hidden_len],
-                    Some(self.input_len),
-                    Some(self.hidden_len),
-                ),
-            ),
-            w_hh: Param::new(
-                ParamId::new(),
-                initializer.init_with(
-                    [self.hidden_len, self.hidden_len],
-                    Some(self.hidden_len),
-                    Some(self.hidden_len),
-                ),
-            ),
-            b_h: Param::new(ParamId::new(), Tensor::zeros([self.hidden_len])),
-        }
+    pub fn entropy(&self) -> Result<Tensor> {
+        // let cov = self.cov.to_data().value;
+        // let [_, nfeat] = self.mu.shape().dims;
+        // assert!(cov.iter().all(|f| *f > 0.0), "{:?}", cov);
+        // let nbatch = self.mu.shape().dims[0];
+        // let mut g = Tensor::ones([nbatch, 1]).to_device(&self.cov.device());
+        // for i in 0..nfeat {
+        //     g = g * self.cov.clone().slice([0..nbatch, i..i + 1]);
+        // }
+        // let second_term = (nfeat as f32 * 0.5) * (1.0 + (2.0 * PI).ln());
+        // g.log() * 0.5 + second_term
+        todo!()
     }
 }
 
-impl<B: Backend> GruCell<B> {
-    pub fn forward(
-        &self,
-        x: Tensor<B, 2>,
-        h: Option<Tensor<B, 2>>,
-    ) -> (Tensor<B, 2>, Tensor<B, 2>) {
-        let dev = &self.devices()[0];
-        let [nbatch, _] = x.shape().dims;
-        let [nhidden] = self.b_h.shape().dims;
-        let mut h = h.unwrap_or(Tensor::zeros_device([nbatch, nhidden], dev));
-
-        let z = sigmoid(
-            x.clone().matmul(self.w_xz.val())
-                + h.clone().matmul(self.w_hz.val())
-                + self.b_z.val().reshape([1, nhidden]),
-        );
-        let r = sigmoid(
-            x.clone().matmul(self.w_xr.val())
-                + h.clone().matmul(self.w_hr.val())
-                + self.b_r.val().reshape([1, nhidden]),
-        );
-        let h_tilde = (x.clone().matmul(self.w_xh.val())
-            + (r * h.clone()).matmul(self.w_hh.val())
-            + self.b_h.val().reshape([1, nhidden]))
-        .tanh();
-        h = z.clone() * h + (z.ones_like() - z) * h_tilde;
-
-        (h.clone(), h)
-    }
+pub struct PpoActor {
+    common1: Linear,
+    common2: Linear,
+    mu_head: Linear,
+    cov_head: Linear,
 }
 
-#[derive(Default, Debug)]
-pub struct CheckNanWeights {
-    pub nan_params: Vec<ParamId>,
-}
-impl<B: Backend<FloatElem = f32>> ModuleVisitor<B> for CheckNanWeights {
-    fn visit<const D: usize>(&mut self, id: &ParamId, tensor: &Tensor<B, D>) {
-        if tensor.to_data().value.into_iter().any(|s| s.is_nan()) {
-            println!("NaN weight detected in param id {}", id);
-            self.nan_params.push(id.to_owned());
-        }
-        if tensor.to_data().value.into_iter().any(|s| !s.is_finite()) {
-            println!("Inf weight detected in param id {}", id);
-            self.nan_params.push(id.to_owned());
-        }
-    }
-}
-
-#[derive(Module, Debug)]
-pub struct PpoActor<B: Backend> {
-    common1: Linear<B>,
-    common2: Linear<B>,
-    mu_head: Linear<B>,
-    cov_head: Param<Tensor<B, 1>>,
-    // cov_head: Linear<B>,
-    obs_len: usize,
-}
-
-#[derive(Config, Debug)]
-pub struct PpoActorConfig {
-    obs_len: usize,
-    hidden_len: usize,
-    action_len: usize,
-}
-
-impl PpoActorConfig {
-    pub fn init<B: Backend<FloatElem = f32>>(
-        &self,
-        _rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> PpoActor<B> {
-        let init = Initializer::XavierNormal {
-            gain: 2.0f64.sqrt(),
-        };
-        let init2 = Initializer::XavierNormal { gain: 0.01 };
-        PpoActor {
-            obs_len: self.obs_len,
-            // common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 1, 3).init(),
-            common1: Linear {
-                weight: Param::from(init.init_with(
-                    [self.obs_len, self.hidden_len],
-                    Some(self.obs_len),
-                    Some(self.hidden_len),
-                )),
-                bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
-            },
-            common2: Linear {
-                weight: Param::from(init.init_with(
-                    [self.hidden_len, self.hidden_len],
-                    Some(self.hidden_len),
-                    Some(self.hidden_len),
-                )),
-                bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
-            },
-            mu_head: Linear {
-                weight: Param::from(init2.init_with(
-                    [self.hidden_len, self.action_len],
-                    Some(self.hidden_len),
-                    Some(self.action_len),
-                )),
-                bias: Some(Param::from(Tensor::zeros([self.action_len]))),
-            },
-            // cov_head: Linear {
-            //     weight: Param::from(init2.init_with(
-            //         [self.hidden_len, self.action_len],
-            //         Some(self.hidden_len),
-            //         Some(self.action_len),
-            //     )),
-            //     bias: Some(Param::from(Tensor::zeros([self.action_len]))),
-            // },
-            cov_head: Param::from(Tensor::zeros([self.action_len]).require_grad()),
-        }
-    }
-}
-impl<B: Backend<FloatElem = f32>> PpoActor<B> {
+impl PpoActor {
     pub fn forward(
         &mut self,
-        x: Tensor<B, 3>,
+        x: &Tensor,
         // common_h: &mut Tensor<B, 2>,
-    ) -> (Tensor<B, 2>, Tensor<B, 2>) {
-        let x = x.to_device(&self.devices()[0]);
-        let [nbatch, nstack, nfeat] = x.shape().dims;
+    ) -> Result<(Tensor, Tensor)> {
+        let (_, nseq, _) = x.shape().dims3().unwrap();
         let x = x
-            .clone()
-            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
-            .squeeze(1);
-        let x = self.common1.forward(x).tanh();
-        let x = x.clone() + self.common2.forward(x).tanh();
+            .index_select(
+                &Tensor::from_slice::<_, i64>(&[nseq as i64 - 1], (1,), &DEVICE)?,
+                1,
+            )?
+            .squeeze(1)
+            .unwrap();
+        let x = self.common1.forward(&x)?.tanh()?;
+        let x = self.common2.forward(&x)?.tanh()?;
 
-        let mu = self.mu_head.forward(x.clone());
-        let mu = mu.tanh();
+        let mu = self.mu_head.forward(&x)?.tanh()?;
 
-        // let cov = self.cov_head.forward(x);
-        let cov = self.cov_head.val().unsqueeze().repeat(0, nbatch);
-        let cov = (cov.exp() + 1.0).log();
+        let cov = self.cov_head.forward(&x)?;
+        let cov = (cov.exp()? + 1.0)?.log()?;
 
-        (mu, cov)
+        Ok((mu, cov))
     }
 }
 
-#[derive(Module, Debug)]
-pub struct PpoCritic<B: Backend> {
-    common1: Linear<B>,
-    common2: Linear<B>,
-    head: Linear<B>,
-    obs_len: usize,
-}
-
-#[derive(Debug, Config)]
-pub struct PpoCriticConfig {
-    obs_len: usize,
-    hidden_len: usize,
-}
-
-impl PpoCriticConfig {
-    pub fn init<B: Backend<FloatElem = f32>>(
-        &self,
-        _rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> PpoCritic<B> {
-        let init = Initializer::XavierNormal {
-            gain: 2.0f64.sqrt(),
-        };
-        let init2 = Initializer::XavierNormal { gain: 1.0 };
-        PpoCritic {
-            obs_len: self.obs_len,
-            // common: TransformerEncoderConfig::new(self.obs_len, self.hidden_len, 1, 3).init(),
-            common1: Linear {
-                weight: Param::from(init.init_with(
-                    [self.obs_len, self.hidden_len],
-                    Some(self.obs_len),
-                    Some(self.hidden_len),
-                )),
-                bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
-            },
-            common2: Linear {
-                weight: Param::from(init.init_with(
-                    [self.hidden_len, self.hidden_len],
-                    Some(self.hidden_len),
-                    Some(self.hidden_len),
-                )),
-                bias: Some(Param::from(Tensor::zeros([self.hidden_len]))),
-            },
-            head: Linear {
-                weight: Param::from(init2.init_with(
-                    [self.hidden_len, 1],
-                    Some(self.hidden_len),
-                    Some(1),
-                )),
-                bias: Some(Param::from(Tensor::zeros([1]))),
-            },
-        }
+impl PpoActor {
+    pub fn new(
+        obs_len: usize,
+        hidden_len: usize,
+        action_len: usize,
+        vs: VarBuilder,
+    ) -> Result<Self> {
+        Ok(Self {
+            common1: candle_nn::linear(obs_len, hidden_len, vs.pp("common1"))?,
+            common2: candle_nn::linear(hidden_len, hidden_len, vs.pp("common2"))?,
+            mu_head: candle_nn::linear(hidden_len, action_len, vs.pp("mu_head"))?,
+            cov_head: candle_nn::linear(hidden_len, action_len, vs.pp("cov_head"))?,
+        })
     }
 }
 
-impl<B: Backend> PpoCritic<B> {
-    pub fn forward(&mut self, x: Tensor<B, 3>) -> Tensor<B, 1> {
-        let x = x.to_device(&self.devices()[0]);
-        let [nbatch, nstack, nfeat] = x.shape().dims;
-        let x: Tensor<B, 2> = x
-            .slice([0..nbatch, nstack - 1..nstack, 0..nfeat])
-            .squeeze(1);
-        let x = self.common1.forward(x).tanh();
-        let x = x.clone() + self.common2.forward(x).tanh();
+pub struct PpoCritic {
+    common1: Linear,
+    common2: Linear,
+    head: Linear,
+}
 
-        let x = self.head.forward(x);
-        x.squeeze(1)
+impl PpoCritic {
+    pub fn new(obs_len: usize, hidden_len: usize, vs: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            common1: candle_nn::linear(obs_len, hidden_len, vs.pp("common1"))?,
+            common2: candle_nn::linear(hidden_len, hidden_len, vs.pp("common2"))?,
+            head: candle_nn::linear(hidden_len, 1, vs.push_prefix("head"))?,
+        })
+    }
+}
+
+impl PpoCritic {
+    pub fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
+        let (_, nseq, _) = x.shape().dims3().unwrap();
+        let x = x
+            .index_select(
+                &Tensor::from_slice::<_, i64>(&[nseq as i64 - 1], (1,), &DEVICE)?,
+                1,
+            )?
+            .squeeze(1)
+            .unwrap();
+        let x = self.common1.forward(&x)?.tanh()?;
+        let x = (&x + self.common2.forward(&x)?.tanh()?)?;
+
+        let x = self.head.forward(&x)?.squeeze(1)?;
+        Ok(x)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct HiddenStates<B: Backend> {
-    phantom: PhantomData<B>,
+pub struct HiddenStates {
     // pub actor_com_h: Tensor<B, 2>,
     // pub critic_h: Tensor<B, 2>,
 }
@@ -438,81 +227,81 @@ pub trait PpoParams: Params {
 }
 
 #[derive(Debug, Component)]
-pub struct RmsNormalize<B: Backend, const D: usize> {
-    mean: Tensor<B, D>,
-    var: Tensor<B, D>,
-    ret_mean: Tensor<B, 1>,
-    ret_var: Tensor<B, 1>,
+pub struct RmsNormalize {
+    mean: Tensor,
+    var: Tensor,
+    ret_mean: f32,
+    ret_var: f32,
     count: f32,
     ret_count: f32,
-    returns: Tensor<B, 1>,
+    returns: f32,
 }
 
-impl<B: Backend, const D: usize> RmsNormalize<B, D> {
-    pub fn new(shape: burn_tensor::Shape<D>) -> Self {
-        Self {
-            mean: Tensor::zeros(shape.clone()),
-            var: Tensor::ones(shape),
-            ret_mean: Tensor::zeros([1]),
-            ret_var: Tensor::ones([1]),
+impl RmsNormalize {
+    pub fn new(shape: &[usize]) -> Result<Self> {
+        Ok(Self {
+            mean: Tensor::zeros(shape, DType::F32, &DEVICE)?,
+            var: Tensor::ones(shape, DType::F32, &DEVICE)?,
+            ret_mean: 0.0,
+            ret_var: 0.0,
             count: 1e-8,
             ret_count: 1e-8,
-            returns: Tensor::zeros([1]),
-        }
+            returns: 0.0,
+        })
     }
 
     // https://github.com/openai/baselines/blob/ea25b9e8b234e6ee1bca43083f8f3cf974143998/baselines/common/running_mean_std.py#L12
-    fn update_obs(&mut self, x: Tensor<B, D>) {
-        let batch_count = x.shape().dims[0] as f32;
-        assert_eq!(x.shape().dims[0], 1);
-        let batch_mean = x.mean_dim(0);
+    fn update_obs(&mut self, x: &Tensor) -> Result<()> {
+        // let batch_count = x.shape().dims()[0] as f32;
+        // assert_eq!(x.shape().dims()[0], 1);
+        let batch_mean = x;
 
-        let delta = batch_mean.clone() - self.mean.clone();
-        let tot_count = batch_count + self.count;
-        self.mean = self.mean.clone() + delta.clone() * batch_count / tot_count;
-        let m_a = self.var.clone() * self.count;
+        let delta = (batch_mean - &self.mean)?;
+        let count = Tensor::new(self.count, &DEVICE)?;
+        let tot_count = Tensor::new(1.0 + self.count, &DEVICE)?;
+        self.mean = (&self.mean + delta.broadcast_div(&tot_count)?)?;
+        let m_a = self.var.broadcast_mul(&count)?;
         // let m_b = batch_var * batch_count;
-        let m2 = m_a + (delta.clone() * delta) * self.count * batch_count / tot_count;
-        self.var = m2 / tot_count;
-        self.count = tot_count;
+        let m2 = (m_a + ((&delta * &delta)?.broadcast_mul(&(&count / &tot_count)?))?)?;
+        self.var = m2.broadcast_div(&tot_count)?;
+        self.count += 1.0;
+        Ok(())
     }
 
-    pub fn forward_obs(&mut self, x: Tensor<B, D>) -> Tensor<B, D> {
-        self.update_obs(x.clone());
-        (x - self.mean.clone()) / (self.var.clone() + 1e-8).sqrt()
+    pub fn forward_obs(&mut self, x: &Tensor) -> Result<Tensor> {
+        self.update_obs(x)?;
+        (x - self.mean.clone()) / (self.var.clone() + 1e-8)?.sqrt()?
     }
 
-    fn update_ret(&mut self, ret: Tensor<B, 1>) {
-        let batch_count = ret.shape().dims[0] as f32;
-        assert_eq!(ret.shape().dims[0], 1);
-        let batch_mean = ret.mean_dim(0);
-        let delta = batch_mean.clone() - self.ret_mean.clone();
-        let tot_count = batch_count + self.ret_count;
-        self.ret_mean = self.ret_mean.clone() + delta.clone() * batch_count / tot_count;
-        let m_a = self.ret_var.clone() * self.ret_count;
-        let m2 = m_a + (delta.clone() * delta) * self.ret_count * batch_count / tot_count;
+    fn update_ret(&mut self, ret: f32) {
+        let batch_mean = ret;
+        let delta = batch_mean - self.ret_mean;
+        let tot_count = 1.0 + self.ret_count;
+        self.ret_mean += delta / tot_count;
+        let m_a = self.ret_var * self.ret_count;
+        let m2 = m_a + (delta * delta) * self.ret_count / tot_count;
         self.ret_var = m2 / tot_count;
         self.ret_count = tot_count;
     }
 
-    pub fn forward_ret(&mut self, rew: Tensor<B, 1>) -> Tensor<B, 1> {
-        self.returns = self.returns.clone() * 0.99 + rew.clone();
-        self.update_ret(self.returns.clone());
-        rew / (self.ret_var.clone() + 1e-8).sqrt()
+    pub fn forward_ret(&mut self, rew: f32) -> f32 {
+        self.returns = self.returns * 0.99 + rew;
+        self.update_ret(self.returns);
+        rew / (self.ret_var + 1e-8).sqrt()
     }
 }
 
 pub struct PpoThinker {
-    actor: PpoActor<Be>,
-    critic: PpoCritic<Be>,
-    actor_optim: OptimizerAdaptor<RMSProp<TchBackend<f32>>, PpoActor<Be>, Be>,
-    critic_optim: OptimizerAdaptor<RMSProp<TchBackend<f32>>, PpoCritic<Be>, Be>,
+    device: Device,
+    actor: PpoActor,
+    critic: PpoCritic,
+    optim: AdamW,
     status: PpoStatus,
     training_epochs: usize,
     training_batch_size: usize,
     entropy_beta: f32,
-    actor_lr: f64,
-    critic_lr: f64,
+    varmap: VarMap,
+    action_len: usize,
 }
 
 impl PpoThinker {
@@ -523,49 +312,27 @@ impl PpoThinker {
         training_epochs: usize,
         training_batch_size: usize,
         entropy_beta: f32,
-        actor_lr: f64,
-        critic_lr: f64,
-        rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> Self {
-        let actor = PpoActorConfig {
-            obs_len,
-            hidden_len,
+        lr: f64,
+        _rng: &mut EntropyComponent<ChaCha8Rng>,
+    ) -> Result<Self> {
+        let device = DEVICE.to_owned();
+        let varmap = VarMap::new();
+        let vs = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let actor = PpoActor::new(obs_len, hidden_len, action_len, vs.pp("actor"))?;
+        let critic = PpoCritic::new(obs_len, hidden_len, vs.pp("critic"))?;
+        let optim = AdamW::new_lr(varmap.all_vars(), lr)?;
+        Ok(Self {
             action_len,
-        }
-        .init(rng);
-        // .fork(&TchDevice::Cuda(0));
-        dbg!(actor.num_params());
-        let critic = PpoCriticConfig {
-            obs_len,
-            hidden_len,
-        }
-        .init(rng);
-        // .fork(&TchDevice::Cuda(0));
-        dbg!(critic.num_params());
-        // let actor_optim = AdamConfig::new()
-        //     .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
-        //     .init()
-        //     .into();
-        let actor_optim = RMSPropConfig::new()
-            .with_momentum(0.0)
-            .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
-            .init();
-        let critic_optim = RMSPropConfig::new()
-            .with_momentum(0.0)
-            .with_grad_clipping(Some(GradientClippingConfig::Norm(0.5)))
-            .init();
-        Self {
+            device,
+            varmap,
             actor,
             critic,
-            actor_optim,
-            critic_optim,
+            optim,
             status: PpoStatus::default(),
             training_batch_size,
             training_epochs,
             entropy_beta,
-            actor_lr,
-            critic_lr,
-        }
+        })
     }
 }
 
@@ -573,7 +340,7 @@ impl<E: Env> Thinker<E> for PpoThinker
 where
     E::Action: Action<E, Metadata = PpoMetadata>,
 {
-    type Metadata = HiddenStates<TchBackend<f32>>;
+    type Metadata = HiddenStates;
     type Status = PpoStatus;
     type ActionMetadata = PpoMetadata;
 
@@ -583,9 +350,7 @@ where
 
     fn init_metadata(&self, _batch_size: usize) -> Self::Metadata {
         // let dev = self.actor.devices()[0];
-        HiddenStates {
-            phantom: PhantomData,
-        }
+        HiddenStates {}
     }
 
     fn act(
@@ -595,31 +360,52 @@ where
         params: &E::Params,
         rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> E::Action {
-        let hiddens = metadata.clone(); //.to_device(&TchDevice::Cpu);
+        let hiddens = metadata.clone(); //.to_device(&TchDEVICE);
         let obs = obs
             .as_vec()
             .into_iter()
-            .map(|o| Tensor::from_floats(&*o).unsqueeze::<2>())
+            .map(|o| Tensor::from_slice(&o, (o.len(),), &self.device).unwrap())
             .collect::<Vec<_>>();
-        let obs = Tensor::cat(obs, 0).unsqueeze();
-        let (mu, cov) = self.actor.valid().forward(obs.clone());
-        self.status.mu = mu.to_data().value.into_boxed_slice();
-        self.status.cov = cov.to_data().value.into_boxed_slice();
+        let obs = Tensor::stack(obs.as_slice(), 0)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let (mu, cov) = self.actor.forward(&obs).unwrap();
+        self.status.mu = mu
+            .reshape((self.action_len,))
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+            .into_boxed_slice();
+        self.status.cov = cov
+            .reshape((self.action_len,))
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+            .into_boxed_slice();
         let dist = MvNormal { mu, cov };
-        self.status.recent_entropy = dist.entropy().into_scalar();
-        let action = dist.sample(rng);
-        let val = self.critic.valid().forward(obs);
+        // self.status.recent_entropy = dist.entropy().into_scalar();
+        self.status.recent_entropy = 0.0;
+        let action = dist.sample(rng).unwrap();
+        let val = self.critic.forward(&obs).unwrap();
 
-        let action_vec = action.to_data().value;
+        let action_vec = action
+            .reshape((self.action_len,))
+            .unwrap()
+            .to_vec1()
+            .unwrap();
 
-        let logp = dist.log_prob(action.clone()).into_scalar();
-        let logp2 = dist.log_prob(action).into_scalar();
-        assert_eq!(logp, logp2);
+        let logp = dist
+            .log_prob(&action)
+            .reshape(())
+            .unwrap()
+            .to_scalar()
+            .unwrap();
 
         E::Action::from_slice(
             action_vec.as_slice(),
             PpoMetadata {
-                val: val.into_scalar(),
+                val: val.reshape(()).unwrap().to_scalar().unwrap(),
                 logp,
                 hiddens: Some(hiddens),
             },
@@ -646,46 +432,44 @@ where
         let mut it = tqdm!(total = self.training_epochs, desc = "Training");
         for _epoch in 0..self.training_epochs {
             let batches = rb.shuffled_and_batched(self.training_batch_size, rng);
-            for (batch_i, batch) in batches.iter().enumerate() {
+            for (_batch_i, batch) in batches.iter().enumerate() {
                 let s = batch
                     .obs
                     .iter()
                     .map(|stack| {
-                        Tensor::cat(
+                        Tensor::stack(
                             stack
                                 .as_vec()
                                 .into_iter()
-                                .map(|x| Tensor::from_floats(&*x).unsqueeze())
-                                .collect::<Vec<_>>(),
-                            1,
+                                .map(|x| Tensor::new(&*x, &self.device).unwrap())
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                            0,
                         )
+                        .unwrap()
                     })
                     .collect::<Vec<_>>();
-                let s: Tensor<Be, 3> = Tensor::cat(s, 0);
+                let s = Tensor::stack(s.as_slice(), 0).unwrap();
                 let a = batch
                     .action
                     .iter()
-                    .map(|action| Tensor::from_floats(&*action.as_slice(params)).unsqueeze())
+                    .map(|action| Tensor::new(&*action.as_slice(params), &self.device).unwrap())
                     .collect::<Vec<_>>();
-                let a: Tensor<Be, 2> = Tensor::cat(a, 0);
+                let a = Tensor::stack(a.as_slice(), 0).unwrap();
                 let old_lp = batch
                     .action
                     .iter()
                     .map(|action| action.metadata().logp)
                     .collect::<Vec<_>>();
-                let old_lp = Tensor::from_floats(old_lp.as_slice())
-                    .to_device(&self.actor.devices()[0])
-                    .reshape([0, 1]);
+                let old_lp = Tensor::new(old_lp.as_slice(), &self.device).unwrap();
                 let old_val = batch
                     .action
                     .iter()
                     .map(|action| action.metadata().val)
                     .collect::<Vec<_>>();
-                let old_val: Tensor<Be, 2> = Tensor::from_floats(old_val.as_slice())
-                    .to_device(&self.actor.devices()[0])
-                    .reshape([0, 1]);
+                let old_val = Tensor::new(old_val.as_slice(), &self.device).unwrap();
 
-                let advantage = Tensor::from_floats(
+                let advantage = Tensor::new(
                     batch
                         .advantage
                         .iter()
@@ -693,106 +477,84 @@ where
                         .map(|a| a.unwrap())
                         .collect_vec()
                         .as_slice(),
+                    &self.device,
                 )
-                .to_device(&self.actor.devices()[0])
-                .reshape([0, 1]);
-                let advantage = (advantage.clone() - advantage.clone().mean().unsqueeze())
-                    / (advantage.var(0) + 1e-8).sqrt();
-                let returns = advantage.clone() + old_val;
+                .unwrap();
+                // let advantage = (advantage - advantage.mean(0).unwrap()).unwrap()
+                //     / (advantage.variance + 1e-8).sqrt();
+                let returns = (&advantage + &old_val).unwrap();
 
-                let (mu, cov) = self.actor.forward(s.clone());
+                let (mu, cov) = self.actor.forward(&s).unwrap();
                 let dist = MvNormal {
                     mu: mu.clone(),
                     cov: cov.clone(),
                 };
-                let entropy = dist.entropy();
-                let lp = dist.log_prob(a);
-                let log_ratio = lp.clone() - old_lp;
+                // let entropy = dist.entropy();
+                let lp = dist.log_prob(&a);
+                let log_ratio = (lp - old_lp).unwrap();
 
-                let ratio = log_ratio.clone().exp();
-                // let ratio = ratio.clone().mask_where(
-                //     log_ratio.clone().abs().lower_elem(0.1),
-                //     log_ratio.clone() + 1.0,
-                // ); // approximation
-                let surr1 = ratio.clone() * advantage.clone();
-                let nclamp = ratio
-                    .clone()
-                    .zeros_like()
-                    .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
-                let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
-                total_nclamp.push(nclamp.mean().into_scalar());
+                let ratio = log_ratio.exp().unwrap();
+                let surr1 = (&ratio * &advantage).unwrap();
+                // let nclamp = ratio
+                //     .zeros_like()
+                //     .unwrap()
+                //     .where_cond(, on_false)
+                //     .mask_fill(ratio.clone().lower_elem(0.8), 1.0);
+                // let nclamp = nclamp.mask_fill(ratio.clone().greater_elem(1.2), 1.0);
+                // total_nclamp.push(nclamp.mean().into_scalar());
+                total_nclamp.push(0.0);
+                let surr2 = (ratio
+                    .broadcast_minimum(&Tensor::new(1.2f32, &self.device).unwrap())
+                    .unwrap()
+                    .broadcast_maximum(&Tensor::new(0.8f32, &self.device).unwrap())
+                    .unwrap()
+                    * advantage.clone())
+                .unwrap();
+                let masked = surr2.minimum(&surr1).unwrap();
+                let policy_loss = masked.mean(0).unwrap().neg().unwrap();
 
-                let surr2 = ratio.clone().clamp(0.8, 1.2) * advantage.clone();
-                let masked = surr2.clone().mask_where(surr1.clone().lower(surr2), surr1);
-                let policy_loss = -masked.mean();
-
-                let entropy_loss = entropy.mean();
-                total_entropy_loss.push(entropy_loss.clone().into_scalar());
-                let policy_loss = policy_loss - entropy_loss * self.entropy_beta;
-                let kl = (-log_ratio.clone()).mean().into_scalar();
+                // let entropy_loss = entropy.mean();
+                // total_entropy_loss.push(entropy_loss.clone().into_scalar());
+                total_entropy_loss.push(0.0);
+                // let policy_loss = policy_loss - entropy_loss * self.entropy_beta;
+                let kl = log_ratio
+                    .neg()
+                    .unwrap()
+                    .mean(0)
+                    .unwrap()
+                    .to_scalar()
+                    .unwrap();
 
                 total_kl.push(kl);
-                let pl = policy_loss.clone().into_scalar();
+                let pl = policy_loss.to_scalar().unwrap();
 
                 total_pi_loss.push(pl);
 
+                let val = self.critic.forward(&s).unwrap();
+                let val_err = (val - returns).unwrap();
+                let value_loss = (&val_err * &val_err).unwrap().mean(0).unwrap();
+                let vl = value_loss.to_scalar().unwrap();
+                total_val_loss.push(vl);
+
+                let loss = (policy_loss + value_loss).unwrap();
                 if kl <= 0.2 {
                     total_policy_batches += 1;
-                    let actor_grads = policy_loss.backward();
+                    let grads = loss.backward().unwrap();
 
-                    let mut visitor = CheckNanWeights::default();
-                    self.actor = self.actor_optim.step(
-                        self.actor_lr,
-                        self.actor.clone(),
-                        GradientsParams::from_grads(actor_grads, &self.actor),
-                    );
-                    self.actor.visit(&mut visitor);
-                    if pl.is_nan() || !visitor.nan_params.is_empty() {
-                        dbg!(
-                            mu.to_data(),
-                            cov.to_data(),
-                            advantage.to_data(),
-                            ratio.to_data(),
-                            log_ratio.to_data()
-                        );
-                        panic!("NaN Actor Loss/Params");
-                    }
+                    self.optim.step(&grads).unwrap();
                 } else {
                     // println!("Maximum KL reached after {batch_i} batches");
+                    // break;
                 }
 
-                let val = self.critic.forward(s);
-                let val_err = val.clone() - returns.clone().squeeze(1);
-                let value_loss = (val_err.clone() * val_err * 0.5).mean();
-                let vl = value_loss.clone().into_scalar();
-
-                total_val_loss.push(vl);
-                let y_true = returns.clone().squeeze(1);
-                let explained_var = if y_true.clone().var(0).into_scalar() == 0.0 {
-                    f32::NAN
-                } else {
-                    1.0 - ((y_true.clone() - val.clone().detach()).var(0) / y_true.var(0))
-                        .into_scalar()
-                };
-                total_explained_var.push(explained_var);
-                let critic_grads = value_loss.backward();
-                self.critic = self.critic_optim.step(
-                    self.critic_lr,
-                    self.critic.clone(),
-                    GradientsParams::from_grads(critic_grads, &self.critic),
-                );
-                let mut visitor = CheckNanWeights::default();
-                self.critic.visit(&mut visitor);
-                if vl.is_nan() || !visitor.nan_params.is_empty() {
-                    dbg!(
-                        mu.to_data(),
-                        cov.to_data(),
-                        advantage.to_data(),
-                        ratio.to_data(),
-                        log_ratio.to_data()
-                    );
-                    panic!("NaN Critic Loss/Params");
-                }
+                // let y_true = returns.clone().squeeze(1);
+                // let explained_var = if y_true.clone().var(0).into_scalar() == 0.0 {
+                //     f32::NAN
+                // } else {
+                //     1.0 - ((y_true.clone() - val.clone().detach()).var(0) / y_true.var(0))
+                //         .into_scalar()
+                // };
+                total_explained_var.push(0.0);
 
                 total_batches += 1;
             }
@@ -813,15 +575,18 @@ where
         self.status.explained_var = mean(&total_explained_var);
     }
 
-    fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-        self.actor.clone().save_file(
-            path.as_ref().join("actor"),
-            &BinGzFileRecorder::<FullPrecisionSettings>::new(),
-        )?;
-        self.critic.clone().save_file(
-            path.as_ref().join("critic"),
-            &BinGzFileRecorder::<FullPrecisionSettings>::new(),
-        )?;
+    fn save(
+        &self,
+        _path: impl AsRef<std::path::Path>,
+    ) -> std::result::Result<(), std::boxed::Box<(dyn std::error::Error + 'static)>> {
+        // self.actor.clone().save_file(
+        //     path.as_ref().join("actor"),
+        //     &BinGzFileRecorder::<FullPrecisionSettings>::new(),
+        // )?;
+        // self.critic.clone().save_file(
+        //     path.as_ref().join("critic"),
+        //     &BinGzFileRecorder::<FullPrecisionSettings>::new(),
+        // )?;
         Ok(())
     }
 }

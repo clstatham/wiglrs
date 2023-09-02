@@ -1,4 +1,4 @@
-use crate::brains::thinkers::ppo::{PpoParams, RmsNormalize};
+use crate::brains::thinkers::ppo::{PpoParams, RmsNormalize, DEVICE};
 use crate::ui::LogText;
 use crate::{
     brains::{
@@ -16,8 +16,7 @@ use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use bevy_rand::resource::GlobalEntropy;
 use bevy_rapier2d::prelude::*;
-use burn_tch::TchBackend;
-use burn_tensor::Tensor;
+use candle_core::Tensor;
 use itertools::Itertools;
 use rand_distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
@@ -295,17 +294,19 @@ fn setup(
     for team_id in 0..params.num_teams {
         for _ in 0..params.agents_per_team() {
             let mut rng_comp = EntropyComponent::from(&mut rng);
-            let thinker = SharedThinker::<Tdm, _>::new(PpoThinker::new(
-                obs_len,
-                params.ffa_params.agent_hidden_dim,
-                *ACTION_LEN,
-                params.ffa_params.agent_training_epochs,
-                params.ffa_params.agent_training_batch_size,
-                params.ffa_params.agent_entropy_beta,
-                params.ffa_params.agent_actor_lr,
-                params.ffa_params.agent_critic_lr,
-                &mut rng_comp,
-            ));
+            let thinker = SharedThinker::<Tdm, _>::new(
+                PpoThinker::new(
+                    obs_len,
+                    params.ffa_params.agent_hidden_dim,
+                    *ACTION_LEN,
+                    params.ffa_params.agent_training_epochs,
+                    params.ffa_params.agent_training_batch_size,
+                    params.ffa_params.agent_entropy_beta,
+                    params.ffa_params.agent_actor_lr,
+                    &mut rng_comp,
+                )
+                .unwrap(),
+            );
             let mut name = names::random_name(&mut rng_comp);
             while taken_names.contains(&name) {
                 name = names::random_name(&mut rng_comp);
@@ -353,13 +354,7 @@ fn setup(
 fn observation(
     params: Res<TdmParams>,
     cx: Res<RapierContext>,
-    mut fs: Query<
-        (
-            &mut FrameStack<Box<[f32]>>,
-            &mut RmsNormalize<TchBackend<f32>, 2>,
-        ),
-        With<Agent>,
-    >,
+    mut fs: Query<(&mut FrameStack<Box<[f32]>>, &mut RmsNormalize), With<Agent>>,
     queries: Query<
         (
             Entity,
@@ -372,7 +367,7 @@ fn observation(
         ),
         With<Agent>,
     >,
-    mut gizmos: Gizmos,
+    _gizmos: Gizmos,
 ) {
     queries.iter().for_each(
         |(agent, _agent_id, my_team, _action, velocity, transform, health)| {
@@ -387,7 +382,7 @@ fn observation(
                 enemies: vec![],
             };
             for (
-                other,
+                _other,
                 _other_id,
                 other_team,
                 other_action,
@@ -397,7 +392,7 @@ fn observation(
             ) in queries
                 .iter()
                 .filter(|q| q.0 != agent)
-                .sorted_by_key(|(_, id, _, _, _, t, _)| id.0)
+                .sorted_by_key(|(_, id, _, _, _, _t, _)| id.0)
             {
                 if my_team.0 == other_team.0 {
                     my_state.teammates.push(TeammateObs {
@@ -436,9 +431,10 @@ fn observation(
                 .get_mut(agent)
                 .unwrap()
                 .1
-                .forward_obs(Tensor::from_floats(&*my_state.as_slice()).unsqueeze())
-                .into_data()
-                .value
+                .forward_obs(&Tensor::new(&*my_state.as_slice(), &DEVICE).unwrap())
+                .unwrap()
+                .to_vec1()
+                .unwrap()
                 .into_boxed_slice();
             fs.get_mut(agent)
                 .unwrap()
@@ -450,7 +446,7 @@ fn observation(
 
 fn get_reward(
     params: Res<TdmParams>,
-    mut rewards: Query<(&mut Reward, &mut RmsNormalize<TchBackend<f32>, 2>), With<Agent>>,
+    mut rewards: Query<(&mut Reward, &mut RmsNormalize), With<Agent>>,
     actions: Query<&TdmAction, With<Agent>>,
     cx: Res<RapierContext>,
     agents: Query<Entity, With<Agent>>,
@@ -546,7 +542,7 @@ fn get_reward(
     }
 
     for (mut rew, mut norm) in rewards.iter_mut() {
-        rew.0 = norm.forward_ret(Tensor::from_floats([rew.0])).into_scalar();
+        rew.0 = norm.forward_ret(rew.0);
     }
 }
 

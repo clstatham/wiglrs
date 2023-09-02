@@ -2,8 +2,7 @@ use std::collections::VecDeque;
 
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::{prelude::EntropyComponent, resource::GlobalEntropy};
-use burn_tch::TchBackend;
-use burn_tensor::Tensor;
+use candle_core::Tensor;
 use itertools::Itertools;
 
 use bevy::{
@@ -18,7 +17,7 @@ use crate::{
     brains::{
         replay_buffer::{store_sarts, PpoBuffer, PpoMetadata},
         thinkers::{
-            ppo::{PpoParams, PpoStatus, PpoThinker, RmsNormalize},
+            ppo::{PpoParams, PpoStatus, PpoThinker, RmsNormalize, DEVICE},
             Thinker,
         },
         Brain,
@@ -397,7 +396,7 @@ where
     pub name: Name,
     pub brain: Brain<E, T>,
     pub obs: FrameStack<Box<[f32]>>,
-    pub obs_norm: RmsNormalize<TchBackend<f32>, 2>,
+    pub obs_norm: RmsNormalize,
     pub action: E::Action,
     pub replay_buffer: PpoBuffer<E>,
     pub reward: Reward,
@@ -427,7 +426,7 @@ where
             obs: FrameStack(
                 vec![vec![0.0; obs_len].into_boxed_slice(); params.agent_frame_stack_len()].into(),
             ),
-            obs_norm: RmsNormalize::new([1, obs_len].into()),
+            obs_norm: RmsNormalize::new(&[obs_len]).unwrap(),
             action: E::Action::default(),
             replay_buffer: PpoBuffer::new(Some(params.agent_rb_max_len())),
             reward: Reward(0.0),
@@ -547,9 +546,9 @@ fn setup(
             params.agent_training_batch_size,
             params.agent_entropy_beta,
             params.agent_actor_lr,
-            params.agent_critic_lr,
             &mut EntropyComponent::from(&mut rng),
-        );
+        )
+        .unwrap();
         let dist = Uniform::new(-250.0, 250.0);
         let agent_pos = Vec3::new(dist.sample(&mut rng_comp), dist.sample(&mut rng_comp), 0.0);
         let color = Color::rgb(rand::random(), rand::random(), rand::random());
@@ -588,13 +587,7 @@ fn setup(
 
 fn get_observation(
     params: Res<FfaParams>,
-    mut observations: Query<
-        (
-            &mut FrameStack<Box<[f32]>>,
-            &mut RmsNormalize<TchBackend<f32>, 2>,
-        ),
-        With<Agent>,
-    >,
+    mut observations: Query<(&mut FrameStack<Box<[f32]>>, &mut RmsNormalize), With<Agent>>,
     actions: Query<&FfaAction, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
     agent_velocity: Query<&Velocity, With<Agent>>,
@@ -602,12 +595,12 @@ fn get_observation(
     agent_health: Query<&Health, With<Agent>>,
     cx: Res<RapierContext>,
 ) {
-    let phys_scaling = PhysicalProperties {
+    let _phys_scaling = PhysicalProperties {
         position: Vec2::splat(params.distance_scaling),
         direction: Vec2::splat(1.0),
         linvel: Vec2::splat(params.distance_scaling),
     };
-    let map_scaling = MapInteractionProperties {
+    let _map_scaling = MapInteractionProperties {
         up_wall_dist: params.distance_scaling,
         down_wall_dist: params.distance_scaling,
         left_wall_dist: params.distance_scaling,
@@ -667,9 +660,10 @@ fn get_observation(
             .get_mut(agent_ent)
             .unwrap()
             .1
-            .forward_obs(Tensor::from_floats(&*my_state.as_slice()).unsqueeze())
-            .into_data()
-            .value
+            .forward_obs(&Tensor::new(&*my_state.as_slice(), &DEVICE).unwrap())
+            .unwrap()
+            .to_vec1()
+            .unwrap()
             .into_boxed_slice();
         observations
             .get_mut(agent_ent)
@@ -696,12 +690,8 @@ pub fn get_action<E: Env, T: Thinker<E>>(
         obs_brains_actions
             .par_iter_mut()
             .for_each_mut(|(obs, mut brain, mut actions, mut rng)| {
-                let action = brain.act(&obs, &*params, &mut rng);
-                // if let Some(action) = action {
-                // if let Some(action) = status.last_action {
+                let action = brain.act(obs, &*params, &mut rng);
                 *actions = action;
-                // }
-                // }
             });
     }
 }
@@ -713,7 +703,7 @@ fn get_reward(
     cx: Res<RapierContext>,
     agents: Query<Entity, With<Agent>>,
     agent_transform: Query<&Transform, With<Agent>>,
-    childs: Query<&Children, With<Agent>>,
+    _childs: Query<&Children, With<Agent>>,
     mut health: Query<&mut Health, With<Agent>>,
     mut kills: Query<&mut Kills, With<Agent>>,
     mut force: Query<&mut ExternalForce, With<Agent>>,

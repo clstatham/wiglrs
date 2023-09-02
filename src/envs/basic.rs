@@ -1,5 +1,5 @@
-use crate::brains::thinkers::ppo::{PpoParams, RmsNormalize};
-use crate::ui::LogText;
+use crate::brains::thinkers::ppo::{PpoParams, RmsNormalize, DEVICE};
+
 use crate::{
     brains::{
         replay_buffer::{store_sarts, PpoMetadata},
@@ -16,8 +16,7 @@ use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use bevy_rand::resource::GlobalEntropy;
 use bevy_rapier2d::prelude::*;
-use burn_tch::TchBackend;
-use burn_tensor::Tensor;
+use candle_core::Tensor;
 use itertools::Itertools;
 use rand_distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
@@ -25,11 +24,11 @@ use serde::{Deserialize, Serialize};
 use super::{
     ffa::{
         get_action, learn, send_reward, Agent, AgentBundle, Eyeballs, FfaParams, Health,
-        HealthBarBundle, Kills, Name, NameTextBundle, Reward, Terminal,
+        HealthBarBundle, NameTextBundle, Reward, Terminal,
     },
     modules::{
-        map_interaction::MapInteractionProperties, Behavior, CombatBehaviors, CombatProperties,
-        IdentityEmbedding, PhysicalBehaviors, PhysicalProperties, Property,
+        map_interaction::MapInteractionProperties, Behavior, IdentityEmbedding, PhysicalBehaviors,
+        PhysicalProperties, Property,
     },
     Action, DefaultFrameStack, Env, Observation, Params,
 };
@@ -162,11 +161,11 @@ lazy_static::lazy_static! {
 impl Action<Basic> for BasicAction {
     type Metadata = PpoMetadata;
 
-    fn as_slice(&self, params: &<Basic as Env>::Params) -> Box<[f32]> {
+    fn as_slice(&self, _params: &<Basic as Env>::Params) -> Box<[f32]> {
         self.phys.as_slice()
     }
 
-    fn from_slice(v: &[f32], metadata: Self::Metadata, params: &<Basic as Env>::Params) -> Self {
+    fn from_slice(v: &[f32], metadata: Self::Metadata, _params: &<Basic as Env>::Params) -> Self {
         Self {
             phys: PhysicalBehaviors::from_slice(v),
             metadata,
@@ -251,17 +250,19 @@ fn setup(
     let mut rng_comp = EntropyComponent::from(&mut rng);
 
     for agent_id in 0..params.num_agents() {
-        let thinker = SharedThinker::<Basic, _>::new(PpoThinker::new(
-            obs_len,
-            params.ffa_params.agent_hidden_dim,
-            *ACTION_LEN,
-            params.ffa_params.agent_training_epochs,
-            params.ffa_params.agent_training_batch_size,
-            params.ffa_params.agent_entropy_beta,
-            params.ffa_params.agent_actor_lr,
-            params.ffa_params.agent_critic_lr,
-            &mut rng_comp,
-        ));
+        let thinker = SharedThinker::<Basic, _>::new(
+            PpoThinker::new(
+                obs_len,
+                params.ffa_params.agent_hidden_dim,
+                *ACTION_LEN,
+                params.ffa_params.agent_training_epochs,
+                params.ffa_params.agent_training_batch_size,
+                params.ffa_params.agent_entropy_beta,
+                params.ffa_params.agent_actor_lr,
+                &mut rng_comp,
+            )
+            .unwrap(),
+        );
         let mut name = names::random_name(&mut rng_comp);
         while taken_names.contains(&name) {
             name = names::random_name(&mut rng_comp);
@@ -315,13 +316,7 @@ fn setup(
 fn observation(
     params: Res<BasicParams>,
     cx: Res<RapierContext>,
-    mut fs: Query<
-        (
-            &mut FrameStack<Box<[f32]>>,
-            &mut RmsNormalize<TchBackend<f32>, 2>,
-        ),
-        With<Agent>,
-    >,
+    mut fs: Query<(&mut FrameStack<Box<[f32]>>, &mut RmsNormalize), With<Agent>>,
     queries: Query<(Entity, &AgentId, &Velocity, &Transform), With<Agent>>,
     mut gizmos: Gizmos,
 ) {
@@ -353,12 +348,12 @@ fn observation(
                 map_interaction: MapInteractionProperties::new(transform, &cx),
                 others: Vec::new(),
             };
-            for (other, other_id, other_v, other_t) in queries
+            for (_other, other_id, other_v, other_t) in queries
                 .iter()
                 .filter(|a| a.0 != agent)
                 .sorted_by_key(|o| o.1 .0)
             {
-                let my_forward = transform.local_y().xy();
+                let _my_forward = transform.local_y().xy();
                 let other_loc_relative =
                     (other_t.translation.xy() - transform.translation.xy()).normalize();
                 // gizmos.line_2d(my_pos, my_pos + other_loc_relative * 100.0, Color::GREEN);
@@ -423,9 +418,10 @@ fn observation(
                 .get_mut(agent)
                 .unwrap()
                 .1
-                .forward_obs(Tensor::from_floats(&*my_state.as_slice()).unsqueeze())
-                .into_data()
-                .value
+                .forward_obs(&Tensor::new(&*my_state.as_slice(), &DEVICE).unwrap())
+                .unwrap()
+                .to_vec1()
+                .unwrap()
                 .into_boxed_slice();
             fs.get_mut(agent)
                 .unwrap()
@@ -436,7 +432,7 @@ fn observation(
 
 fn get_reward(
     params: Res<BasicParams>,
-    mut rewards: Query<(&mut Reward, &mut RmsNormalize<TchBackend<f32>, 2>), With<Agent>>,
+    mut rewards: Query<(&mut Reward, &mut RmsNormalize), With<Agent>>,
     actions: Query<&BasicAction, With<Agent>>,
     agents: Query<Entity, With<Agent>>,
     agents_ids: Query<&AgentId, With<Agent>>,
@@ -466,7 +462,7 @@ fn get_reward(
     }
 
     for (mut rew, mut norm) in rewards.iter_mut() {
-        rew.0 = norm.forward_ret(Tensor::from_floats([rew.0])).into_scalar();
+        rew.0 = norm.forward_ret(rew.0);
     }
 }
 
