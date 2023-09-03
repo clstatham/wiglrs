@@ -6,14 +6,11 @@ use bevy_egui::egui::plot::{Bar, BarChart, Line};
 use bevy_egui::EguiContexts;
 use itertools::Itertools;
 
-use crate::brains::thinkers::ppo::PpoStatus;
-use crate::envs::ffa::{Name, RunningReturn};
+use crate::brains::learners::ppo::PpoStatus;
+use crate::envs::{Name, RunningReturn};
 use crate::{
-    brains::{thinkers::Thinker, Brain},
-    envs::{
-        ffa::{Agent, Deaths, Kills},
-        Env,
-    },
+    brains::learners::Learner,
+    envs::{Agent, Deaths, Env, Kills},
 };
 
 #[derive(Debug, Default, Resource)]
@@ -37,7 +34,7 @@ impl std::fmt::Display for LogText {
     }
 }
 
-pub fn kdr<E: Env, T: Thinker<E>>(
+pub fn kdr<E: Env, T: Learner<E>>(
     mut cxs: EguiContexts,
     agents: Query<Entity, With<Agent>>,
     kills: Query<&Kills, With<Agent>>,
@@ -72,11 +69,11 @@ pub fn kdr<E: Env, T: Thinker<E>>(
     });
 }
 
-pub fn action_space<E: Env, T: Thinker<E, Status = PpoStatus>>(
+pub fn action_space<E: Env, T: Learner<E, Status = PpoStatus>>(
     mut cxs: EguiContexts,
     agents: Query<Entity, With<Agent>>,
     names: Query<&Name, With<Agent>>,
-    brains: Query<&Brain<E, T>, With<Agent>>,
+    learners: Query<&T, With<Agent>>,
 ) {
     egui::Window::new("Action Mean/Std/Entropy")
         .min_height(200.0)
@@ -94,7 +91,7 @@ pub fn action_space<E: Env, T: Thinker<E, Status = PpoStatus>>(
                             ui.vertical(|ui| {
                                 ui.heading(&names.get(brain).unwrap().0);
                                 // ui.group(|ui| {
-                                let status = T::status(&brains.get(brain).unwrap().thinker);
+                                let status = T::status(&learners.get(brain).unwrap());
                                 let mut mu = "mu:".to_owned();
                                 for m in status.mu.iter() {
                                     mu.push_str(&format!(" {:.4}", m));

@@ -13,9 +13,9 @@ use bevy_prng::ChaCha8Rng;
 use bevy_rapier2d::prelude::*;
 
 use bevy_rand::prelude::*;
+use brains::learners::DEVICE;
+use candle_core::Tensor;
 use envs::{
-    basic::{Basic, BasicParams},
-    ffa::{Ffa, FfaParams},
     maps::tdm::TdmMap,
     tdm::{Tdm, TdmParams},
     Env,
@@ -30,6 +30,13 @@ pub mod brains;
 pub mod envs;
 pub mod names;
 pub mod ui;
+
+/// Something that stores a state with interior mutability.
+pub trait Stateful: Sized {
+    type State;
+    fn replace_state(&self, s: Self::State) -> Option<Self::State>;
+    fn get_state(&self) -> Option<&Self::State>;
+}
 
 #[inline(always)]
 pub fn transform_angle_for_agent(x: f32) -> f32 {
@@ -82,6 +89,16 @@ where
     }
 }
 
+impl FrameStack<Box<[f32]>> {
+    pub fn as_tensor(&self) -> Tensor {
+        let mut obs = vec![];
+        for frame in self.0.iter() {
+            obs.push(Tensor::new(&**frame, &DEVICE).unwrap());
+        }
+        Tensor::stack(&obs, 0).unwrap().unsqueeze(0).unwrap()
+    }
+}
+
 #[derive(Component)]
 pub struct Wall;
 
@@ -108,7 +125,7 @@ impl std::fmt::Display for Timestamp {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Component)]
 pub struct TbWriter(Option<SummaryWriter>);
 
 impl TbWriter {
@@ -219,8 +236,6 @@ fn run_env<E: crate::envs::Env, M: crate::envs::maps::Map>(
 }
 
 pub enum EnvKind {
-    Basic,
-    Ffa,
     Tdm,
 }
 
@@ -247,32 +262,6 @@ fn main() {
                 }
             };
             run_env(bevy_seed, Tdm::init(), TdmMap, params);
-        }
-        EnvKind::Basic => {
-            let params = match BasicParams::from_yaml_file("basic.yaml").ok() {
-                Some(params) => {
-                    println!("Loaded environment parameters:\n{:?}", params);
-                    params
-                }
-                None => {
-                    println!("Using default environment parameters.");
-                    Default::default()
-                }
-            };
-            run_env(bevy_seed, Basic::init(), TdmMap, params);
-        }
-        EnvKind::Ffa => {
-            let params = match FfaParams::from_yaml_file("ffa.yaml").ok() {
-                Some(params) => {
-                    println!("Loaded environment parameters:\n{:?}", params);
-                    params
-                }
-                None => {
-                    println!("Using default environment parameters.");
-                    Default::default()
-                }
-            };
-            run_env(bevy_seed, Ffa::init(), TdmMap, params);
         }
     }
 }

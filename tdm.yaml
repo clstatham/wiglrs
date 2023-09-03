@@ -1,10 +1,10 @@
 ffa_params:
-  num_agents: 3
+  num_agents: 2
   agent_hidden_dim: 128
-  agent_actor_lr: 0.0001
-  agent_critic_lr: 0.0001
-  agent_training_epochs: 10
-  agent_training_batch_size: 64
+  agent_actor_lr: 0.0003
+  agent_critic_lr: 0.0003
+  agent_training_epochs: 5
+  agent_training_batch_size: 256
   agent_entropy_beta: 0.0
   agent_update_interval: 2048
   agent_warmup: 4096
@@ -22,7 +22,7 @@ ffa_params:
   reward_for_getting_hit: -1.0
   reward_for_miss: -1.0
 reward_for_friendly_fire: -1.0
-num_teams: 3
+num_teams: 2
 team_colors:
 - !Rgba
   red: 1.0

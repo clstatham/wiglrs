@@ -1,14 +1,15 @@
 use std::f32::consts::PI;
 
-use crate::brains::thinkers::ppo::{PpoParams, RmsNormalize, DEVICE};
+use crate::brains::learners::ppo::rollout_buffer::PpoBuffer;
+use crate::brains::learners::ppo::Ppo;
+use crate::brains::learners::utils::RmsNormalize;
+use crate::brains::learners::DEVICE;
+use crate::brains::models::linear_resnet::{LinResActor, LinResCritic};
+use crate::brains::{AgentLearner, AgentPolicy, AgentValue};
 use crate::ui::LogText;
 use crate::{
-    brains::{
-        replay_buffer::{store_sarts, PpoMetadata},
-        thinkers::ppo::PpoThinker,
-        Brain,
-    },
-    envs::ffa::{check_dead, update},
+    brains::learners::ppo::rollout_buffer::{store_sarts, PpoMetadata},
+    envs::{check_dead, update},
     names, FrameStack, Timestamp,
 };
 use bevy::ecs::schedule::SystemConfigs;
@@ -23,18 +24,18 @@ use itertools::Itertools;
 use rand_distr::{Distribution, Uniform};
 use serde::{Deserialize, Serialize};
 
-use super::basic::AgentId;
 use super::modules::RelativePhysicalProperties;
+use super::AgentId;
 use super::{
-    ffa::{
-        get_action, learn, send_reward, Agent, AgentBundle, Eyeballs, FfaParams, Health,
-        HealthBarBundle, Kills, Name, NameTextBundle, Reward, Terminal,
-    },
     modules::{
         map_interaction::MapInteractionProperties, Behavior, CombatBehaviors, CombatProperties,
         PhysicalBehaviors, PhysicalProperties, Property,
     },
     Action, DefaultFrameStack, Env, Observation, Params,
+    {
+        get_action, learn, send_reward, Agent, AgentBundle, Eyeballs, FfaParams, Health,
+        HealthBarBundle, Kills, Name, NameTextBundle, Reward, Terminal,
+    },
 };
 
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
@@ -67,9 +68,7 @@ impl Params for TdmParams {
     fn agent_max_health(&self) -> f32 {
         self.ffa_params.agent_max_health
     }
-}
 
-impl PpoParams for TdmParams {
     fn agent_warmup(&self) -> usize {
         self.ffa_params.agent_warmup
     }
@@ -190,10 +189,13 @@ impl DefaultFrameStack<Tdm> for TdmObs {
 }
 
 #[derive(Component, Default, Clone)]
-pub struct TdmAction {
+pub struct TdmAction
+where
+    Self: Action<Tdm>,
+{
     pub phys: PhysicalBehaviors,
     pub combat: CombatBehaviors,
-    pub metadata: PpoMetadata,
+    pub logits: Option<<Self as Action<Tdm>>::Logits>,
 }
 
 lazy_static::lazy_static! {
@@ -201,25 +203,24 @@ lazy_static::lazy_static! {
 }
 
 impl Action<Tdm> for TdmAction {
-    type Metadata = PpoMetadata;
-
-    fn as_slice(&self, _params: &<Tdm as Env>::Params) -> Box<[f32]> {
+    type Logits = (Tensor, Tensor);
+    fn as_slice(&self) -> Box<[f32]> {
         let mut out = vec![];
         out.extend_from_slice(&self.phys.as_slice());
         out.extend_from_slice(&self.combat.as_slice());
         out.into_boxed_slice()
     }
 
-    fn from_slice(v: &[f32], metadata: Self::Metadata, _params: &<Tdm as Env>::Params) -> Self {
+    fn from_slice(v: &[f32], logits: Self::Logits) -> Self {
         Self {
             phys: PhysicalBehaviors::from_slice(&v[0..PhysicalBehaviors::len()]),
             combat: CombatBehaviors::from_slice(&v[PhysicalBehaviors::len()..]),
-            metadata,
+            logits: Some(logits),
         }
     }
 
-    fn metadata(&self) -> Self::Metadata {
-        self.metadata.clone()
+    fn logits(&self) -> Option<&Self::Logits> {
+        self.logits.as_ref()
     }
 }
 
@@ -249,11 +250,11 @@ impl Env for Tdm {
     }
 
     fn action_system() -> SystemConfigs {
-        get_action::<Tdm, PpoThinker>.chain()
+        get_action::<Tdm, AgentPolicy, AgentValue>.chain()
     }
 
     fn reward_system() -> SystemConfigs {
-        (get_reward, send_reward::<Tdm, PpoThinker>).chain()
+        (get_reward, send_reward::<Tdm, AgentLearner>).chain()
     }
 
     fn terminal_system() -> SystemConfigs {
@@ -261,18 +262,23 @@ impl Env for Tdm {
     }
 
     fn update_system() -> SystemConfigs {
-        (update::<Tdm>, store_sarts::<Tdm>, check_dead::<Tdm>).chain()
+        (
+            update::<Tdm>,
+            store_sarts::<Tdm, AgentPolicy, AgentValue>,
+            check_dead::<Tdm>,
+        )
+            .chain()
     }
 
     fn learn_system() -> SystemConfigs {
-        learn::<Tdm, PpoThinker>.chain()
+        learn::<Tdm, AgentLearner, AgentPolicy, AgentValue>.chain()
     }
 
     fn ui_system() -> SystemConfigs {
         use crate::ui::*;
         (
-            kdr::<Tdm, PpoThinker>,
-            action_space::<Tdm, PpoThinker>,
+            kdr::<Tdm, AgentLearner>,
+            action_space::<Tdm, AgentLearner>,
             log,
             running_reward,
         )
@@ -297,16 +303,10 @@ fn setup(
     for team_id in 0..params.num_teams {
         for _ in 0..params.agents_per_team() {
             let mut rng_comp = EntropyComponent::from(&mut rng);
-            let thinker = PpoThinker::new(
-                obs_len,
-                params.ffa_params.agent_hidden_dim,
-                *ACTION_LEN,
+            let learner = AgentLearner::new(
                 params.ffa_params.agent_training_epochs,
                 params.ffa_params.agent_training_batch_size,
                 params.ffa_params.agent_entropy_beta,
-                params.ffa_params.agent_frame_stack_len,
-                params.ffa_params.agent_actor_lr,
-                &mut rng_comp,
             )
             .unwrap();
             let mut name = names::random_name(&mut rng_comp);
@@ -316,11 +316,26 @@ fn setup(
             let dist = Uniform::new(-250.0, 250.0);
             let agent_pos = Vec3::new(dist.sample(&mut rng_comp), dist.sample(&mut rng_comp), 0.0);
             taken_names.push(name.clone());
-            let mut agent = AgentBundle::<Tdm, _>::new(
+            let mut agent = AgentBundle::<Tdm, AgentPolicy, AgentValue, AgentLearner>::new(
                 agent_pos,
                 Some(params.team_colors[team_id]),
                 name.clone(),
-                Brain::<Tdm, _>::new(thinker, name, timestamp.clone()),
+                AgentPolicy::new(
+                    obs_len * params.agent_frame_stack_len(),
+                    params.ffa_params.agent_hidden_dim,
+                    *ACTION_LEN,
+                    params.ffa_params.agent_actor_lr,
+                )
+                .unwrap(),
+                AgentValue::new(
+                    obs_len * params.agent_frame_stack_len(),
+                    params.ffa_params.agent_hidden_dim,
+                    params.ffa_params.agent_critic_lr,
+                )
+                .unwrap(),
+                learner,
+                PpoBuffer::new(Some(params.ffa_params.agent_rb_max_len)),
+                &timestamp,
                 meshes.reborrow(),
                 materials.reborrow(),
                 &*params,
@@ -464,8 +479,8 @@ fn get_reward(
 
         if let Ok(action) = actions.get(agent_ent) {
             let mut my_force = force.get_mut(agent_ent).unwrap();
-            let x_direction = (action.phys.direction * PI).sin();
-            let y_direction = (action.phys.direction * PI).cos();
+            let x_direction = (action.phys.direction * PI - PI / 2.0).sin();
+            let y_direction = (action.phys.direction * PI - PI / 2.0).cos();
             let force = Vec2::new(x_direction, y_direction) * action.phys.thrust.clamp(-1.0, 1.0);
             my_force.impulse = force * params.ffa_params.agent_lin_move_force;
             // let direction_normalized = action.phys.desired_direction.try_normalize().unwrap();
@@ -482,110 +497,110 @@ fn get_reward(
                 delta += 2.0 * PI;
             }
             my_force.torque_impulse = delta * params.ffa_params.agent_ang_move_force;
+            /*
+                       if action.combat.shoot > 0.0 && my_health.0 > 0.0 {
+                           let my_team = team_id.get(agent_ent).unwrap();
+                           let (ray_dir, ray_pos) = {
+                               let ray_dir = my_t.local_y().xy();
+                               let ray_pos = my_t.translation.xy();
+                               (ray_dir, ray_pos)
+                           };
 
-            if action.combat.shoot > 0.0 && my_health.0 > 0.0 {
-                let my_team = team_id.get(agent_ent).unwrap();
-                let (ray_dir, ray_pos) = {
-                    let ray_dir = my_t.local_y().xy();
-                    let ray_pos = my_t.translation.xy();
-                    (ray_dir, ray_pos)
-                };
+                           let filter = QueryFilter::default().exclude_collider(agent_ent);
 
-                let filter = QueryFilter::default().exclude_collider(agent_ent);
+                           if let Some((hit_entity, toi)) = cx.cast_ray(
+                               ray_pos,
+                               ray_dir,
+                               params.ffa_params.agent_shoot_distance,
+                               true,
+                               filter,
+                           ) {
+                               gizmos.line_2d(
+                                   ray_pos,
+                                   ray_pos + ray_dir * toi,
+                                   params.team_colors[team_id.get(agent_ent).unwrap().0 as usize],
+                               );
 
-                if let Some((hit_entity, toi)) = cx.cast_ray(
-                    ray_pos,
-                    ray_dir,
-                    params.ffa_params.agent_shoot_distance,
-                    true,
-                    filter,
-                ) {
-                    gizmos.line_2d(
-                        ray_pos,
-                        ray_pos + ray_dir * toi,
-                        params.team_colors[team_id.get(agent_ent).unwrap().0 as usize],
-                    );
+                               if let Ok(mut health) = health.get_mut(hit_entity) {
+                                   if let Ok(other_team) = team_id.get(hit_entity) {
+                                       if my_team.0 == other_team.0 {
+                                           // friendly fire!
+                                           rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
+                                               params.reward_for_friendly_fire;
+                                           // kills.get_mut(agent_ent).unwrap().0 -= 1;
+                                       } else if health.0 > 0.0 {
+                                           health.0 -= 5.0;
+                                           rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
+                                               params.ffa_params.reward_for_hit;
+                                           rewards.get_component_mut::<Reward>(hit_entity).unwrap().0 +=
+                                               params.ffa_params.reward_for_getting_hit;
+                                           // kills.get_mut(agent_ent).unwrap().0 += 1;
+                                           if health.0 <= 0.0 {
+                                               rewards.get_mut(agent_ent).unwrap().0 .0 +=
+                                                   params.ffa_params.reward_for_kill;
+                                               rewards.get_mut(hit_entity).unwrap().0 .0 +=
+                                                   params.ffa_params.reward_for_death;
 
-                    if let Ok(mut health) = health.get_mut(hit_entity) {
-                        if let Ok(other_team) = team_id.get(hit_entity) {
-                            if my_team.0 == other_team.0 {
-                                // friendly fire!
-                                rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                                    params.reward_for_friendly_fire;
-                                // kills.get_mut(agent_ent).unwrap().0 -= 1;
-                            } else if health.0 > 0.0 {
-                                health.0 -= 5.0;
-                                rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                                    params.ffa_params.reward_for_hit;
-                                rewards.get_component_mut::<Reward>(hit_entity).unwrap().0 +=
-                                    params.ffa_params.reward_for_getting_hit;
-                                // kills.get_mut(agent_ent).unwrap().0 += 1;
-                                if health.0 <= 0.0 {
-                                    rewards.get_mut(agent_ent).unwrap().0 .0 +=
-                                        params.ffa_params.reward_for_kill;
-                                    rewards.get_mut(hit_entity).unwrap().0 .0 +=
-                                        params.ffa_params.reward_for_death;
+                                               // reward_team!(my_team.0, params.ffa_params.reward_for_kill);
+                                               // reward_team!(other_team.0, params.ffa_params.reward_for_death);
+                                               kills.get_mut(agent_ent).unwrap().0 += 1;
+                                               let msg = format!(
+                                                   "{} killed {}! Nice!",
+                                                   &names.get(agent_ent).unwrap().0,
+                                                   &names.get(hit_entity).unwrap().0
+                                               );
+                                               log.push(msg);
+                                           }
+                                       }
+                                   }
+                               } else {
+                                   // hit a wall
+                                   rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
+                                       params.ffa_params.reward_for_miss;
+                               }
+                           } else {
+                               gizmos.line_2d(
+                                   ray_pos,
+                                   ray_pos + ray_dir * params.ffa_params.agent_shoot_distance,
+                                   params.team_colors[team_id.get(agent_ent).unwrap().0 as usize],
+                               );
+                               // hit nothing
+                               rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
+                                   params.ffa_params.reward_for_miss;
+                           }
+                       }
+            */
+            for other in agents.iter() {
+                let my_t = agent_transform.get(agent_ent).unwrap();
+                let other_t = agent_transform.get(other).unwrap();
+                if other_t.translation != my_t.translation {
+                    let dist = other_t.translation.distance_squared(my_t.translation);
+                    let dot = my_t
+                        .local_y()
+                        .xy()
+                        .dot((other_t.translation.xy() - my_t.translation.xy()).normalize());
+                    if action.combat.shoot > 0.0 {
+                        if dot > 0.9 {
+                            rewards.get_mut(agent_ent).unwrap().0 .0 += dot;
+                            rewards.get_mut(other).unwrap().0 .0 -= dot;
 
-                                    // reward_team!(my_team.0, params.ffa_params.reward_for_kill);
-                                    // reward_team!(other_team.0, params.ffa_params.reward_for_death);
-                                    kills.get_mut(agent_ent).unwrap().0 += 1;
-                                    let msg = format!(
-                                        "{} killed {}! Nice!",
-                                        &names.get(agent_ent).unwrap().0,
-                                        &names.get(hit_entity).unwrap().0
-                                    );
-                                    log.push(msg);
-                                }
-                            }
+                            gizmos.line_2d(
+                                my_t.translation.xy(),
+                                my_t.translation.xy()
+                                    // + (other_t.translation.xy() - my_t.translation.xy())
+                                        // .normalize()
+                                        + my_t.local_y().xy()
+                                        * dot
+                                        * dist.sqrt(),
+                                params.team_colors[team_id.get(agent_ent).unwrap().0 as usize],
+                                // Color::WHITE,
+                            );
+                        } else {
+                            rewards.get_mut(agent_ent).unwrap().0 .0 -= 1.0;
                         }
-                    } else {
-                        // hit a wall
-                        rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                            params.ffa_params.reward_for_miss;
                     }
-                } else {
-                    gizmos.line_2d(
-                        ray_pos,
-                        ray_pos + ray_dir * params.ffa_params.agent_shoot_distance,
-                        params.team_colors[team_id.get(agent_ent).unwrap().0 as usize],
-                    );
-                    // hit nothing
-                    rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                        params.ffa_params.reward_for_miss;
                 }
             }
-
-            // for other in agents.iter() {
-            //     let my_t = agent_transform.get(agent_ent).unwrap();
-            //     let other_t = agent_transform.get(other).unwrap();
-            //     if other_t.translation != my_t.translation {
-            //         let dist = other_t.translation.distance_squared(my_t.translation);
-            //         let dot = my_t
-            //             .local_y()
-            //             .xy()
-            //             .dot((other_t.translation.xy() - my_t.translation.xy()).normalize());
-            //         if action.combat.shoot > 0.0 {
-            //             if dot > 0.9 {
-            //                 rewards.get_mut(agent_ent).unwrap().0 .0 += dot;
-            //                 rewards.get_mut(other).unwrap().0 .0 -= dot;
-
-            //                 gizmos.line_2d(
-            //                     my_t.translation.xy(),
-            //                     my_t.translation.xy()
-            //                         // + (other_t.translation.xy() - my_t.translation.xy())
-            //                             // .normalize()
-            //                             + my_t.local_y().xy()
-            //                             * dot
-            //                             * dist.sqrt(),
-            //                     params.team_colors[team_id.get(agent_ent).unwrap().0 as usize],
-            //                     // Color::WHITE,
-            //                 );
-            //             } else {
-            //                 rewards.get_mut(agent_ent).unwrap().0 .0 -= 1.0;
-            //             }
-            //         }
-            //     }
-            // }
         }
     }
 
