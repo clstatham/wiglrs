@@ -34,7 +34,7 @@ bevy_rand = "0.3.0"
 bevy_prng = { version = "0.1.0", features = ["rand_chacha"] }
 serde_json = "1.0.105"
 serde_yaml = "0.9.25"
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.2.1", features = ["cuda"] }
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.2.1", features = ["cuda", "cudnn"] }
 candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.2.1" }
 # [profile.dev.package."*"]
 # opt-level = 3

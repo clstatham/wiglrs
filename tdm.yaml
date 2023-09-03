@@ -1,5 +1,5 @@
 ffa_params:
-  num_agents: 2
+  num_agents: 3
   agent_hidden_dim: 128
   agent_actor_lr: 0.0001
   agent_critic_lr: 0.0001
@@ -7,21 +7,22 @@ ffa_params:
   agent_training_batch_size: 64
   agent_entropy_beta: 0.0
   agent_update_interval: 2048
+  agent_warmup: 4096
   agent_rb_max_len: 2048
-  agent_frame_stack_len: 4
+  agent_frame_stack_len: 2
   agent_radius: 20.0
-  agent_lin_move_force: 600.0
-  agent_ang_move_force: 1.0
+  agent_lin_move_force: 12.0
+  agent_ang_move_force: 0.05
   agent_max_health: 200.0
   agent_shoot_distance: 1000.0
   distance_scaling: 0.0005
-  reward_for_kill: 1.0
-  reward_for_death: -1.0
-  reward_for_hit: 0.1
-  reward_for_getting_hit: 0.0
-  reward_for_miss: 0.0
-reward_for_friendly_fire: -0.1
-num_teams: 2
+  reward_for_kill: 10.0
+  reward_for_death: -10.0
+  reward_for_hit: 1.0
+  reward_for_getting_hit: -1.0
+  reward_for_miss: -1.0
+reward_for_friendly_fire: -1.0
+num_teams: 3
 team_colors:
 - !Rgba
   red: 1.0

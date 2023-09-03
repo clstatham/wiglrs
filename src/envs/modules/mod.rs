@@ -2,13 +2,14 @@ use bevy::math::Vec3Swizzles;
 use bevy::prelude::*;
 use bevy_rapier2d::prelude::Velocity;
 
+use crate::transform_angle_for_agent;
+
 pub mod map_interaction;
 
 /// Like Observation, but independent of a specific Env
 pub trait Property: std::fmt::Debug + Clone + Default {
     fn as_slice(&self) -> Box<[f32]>;
     fn from_slice(s: &[f32]) -> Self;
-    fn scaled_by(&self, scaling: &Self) -> Self;
     fn len() -> usize;
 }
 
@@ -16,7 +17,6 @@ pub trait Property: std::fmt::Debug + Clone + Default {
 pub trait Behavior: std::fmt::Debug + Clone + Default {
     fn as_slice(&self) -> Box<[f32]>;
     fn from_slice(s: &[f32]) -> Self;
-    fn scaled_by(&self, scaling: &Self) -> Self;
     fn len() -> usize;
 }
 
@@ -47,16 +47,57 @@ impl Property for IdentityEmbedding {
     fn len() -> usize {
         unimplemented!()
     }
+}
 
-    fn scaled_by(&self, _scaling: &Self) -> Self {
-        unimplemented!()
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelativePhysicalProperties {
+    pub angle_direction: f32,
+    pub distance: f32,
+    pub direction_dot_product: f32,
+}
+
+impl RelativePhysicalProperties {
+    pub fn new(pov: &Transform, relative_to: &Transform) -> Self {
+        let relative_direction = (relative_to.translation.xy() - pov.translation.xy())
+            .try_normalize()
+            .unwrap();
+        Self {
+            angle_direction: transform_angle_for_agent(f32::atan2(
+                relative_direction.y,
+                relative_direction.x,
+            )),
+            distance: pov.translation.xy().distance(relative_to.translation.xy()),
+            direction_dot_product: pov.local_y().xy().dot(relative_direction),
+        }
+    }
+}
+
+impl Property for RelativePhysicalProperties {
+    fn len() -> usize {
+        3
+    }
+
+    fn as_slice(&self) -> Box<[f32]> {
+        Box::new([
+            self.angle_direction,
+            self.distance,
+            self.direction_dot_product,
+        ])
+    }
+
+    fn from_slice(s: &[f32]) -> Self {
+        Self {
+            angle_direction: s[0],
+            distance: s[1],
+            direction_dot_product: s[2],
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PhysicalProperties {
     pub position: Vec2,
-    pub direction: Vec2,
+    pub angle: f32,
     pub linvel: Vec2,
 }
 
@@ -64,7 +105,7 @@ impl PhysicalProperties {
     pub fn new(transform: &Transform, velocity: &Velocity) -> Self {
         Self {
             position: transform.translation.xy(),
-            direction: transform.local_y().xy(),
+            angle: transform_angle_for_agent(transform.rotation.to_euler(EulerRot::XYZ).2),
             linvel: velocity.linvel,
         }
     }
@@ -72,15 +113,14 @@ impl PhysicalProperties {
 
 impl Property for PhysicalProperties {
     fn len() -> usize {
-        6
+        5
     }
 
     fn as_slice(&self) -> Box<[f32]> {
         Box::new([
             self.position.x,
             self.position.y,
-            self.direction.x,
-            self.direction.y,
+            self.angle,
             self.linvel.x,
             self.linvel.y,
         ])
@@ -89,16 +129,8 @@ impl Property for PhysicalProperties {
     fn from_slice(s: &[f32]) -> Self {
         Self {
             position: Vec2::new(s[0], s[1]),
-            direction: Vec2::new(s[2], s[3]),
-            linvel: Vec2::new(s[4], s[5]),
-        }
-    }
-
-    fn scaled_by(&self, scaling: &Self) -> Self {
-        Self {
-            position: self.position * scaling.position,
-            direction: self.direction * scaling.direction,
-            linvel: self.linvel * scaling.linvel,
+            angle: s[2],
+            linvel: Vec2::new(s[3], s[4]),
         }
     }
 }
@@ -120,18 +152,13 @@ impl Property for CombatProperties {
     fn from_slice(s: &[f32]) -> Self {
         Self { health: s[0] }
     }
-
-    fn scaled_by(&self, scaling: &Self) -> Self {
-        Self {
-            health: self.health * scaling.health,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PhysicalBehaviors {
-    pub force: Vec2,
-    pub torque: f32,
+    pub direction: f32,
+    pub thrust: f32,
+    pub desired_rotation: f32,
 }
 
 impl Behavior for PhysicalBehaviors {
@@ -140,19 +167,14 @@ impl Behavior for PhysicalBehaviors {
     }
 
     fn as_slice(&self) -> Box<[f32]> {
-        Box::new([self.force.x, self.force.y, self.torque])
+        Box::new([self.direction, self.thrust, self.desired_rotation])
     }
 
     fn from_slice(s: &[f32]) -> Self {
         Self {
-            force: Vec2::new(s[0], s[1]),
-            torque: s[2],
-        }
-    }
-    fn scaled_by(&self, scaling: &Self) -> Self {
-        Self {
-            force: self.force * scaling.force,
-            torque: self.torque * scaling.torque,
+            direction: s[0],
+            thrust: s[1],
+            desired_rotation: s[2],
         }
     }
 }
@@ -173,9 +195,5 @@ impl Behavior for CombatBehaviors {
 
     fn from_slice(s: &[f32]) -> Self {
         Self { shoot: s[0] }
-    }
-
-    fn scaled_by(&self, _scaling: &Self) -> Self {
-        unimplemented!()
     }
 }

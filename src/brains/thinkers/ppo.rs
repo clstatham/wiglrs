@@ -6,10 +6,7 @@ use bevy_rand::prelude::EntropyComponent;
 
 use itertools::Itertools;
 use rand_distr::Distribution;
-use std::{
-    f32::consts::PI,
-    ops::{Add, Mul},
-};
+use std::{f32::consts::PI, ops::Mul};
 
 use crate::{
     brains::replay_buffer::{PpoBuffer, PpoMetadata},
@@ -29,6 +26,24 @@ lazy_static::lazy_static! {
     pub static ref DEVICE: Device = Device::Cpu;
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_log_prob() -> Result<()> {
+        let mu = Tensor::new(&[-0.0966f32, -0.5324, 0.1607, 0.4173], &DEVICE)?.unsqueeze(0)?;
+        let cov = Tensor::new(&[1.3077f32, 3.7718, 1.7900, 23.6713], &DEVICE)?.unsqueeze(0)?;
+        let action = Tensor::new(&[1.0094f32, -6.3756, -2.0827, 75.4585], &DEVICE)?.unsqueeze(0)?;
+        // let action =
+        //     Tensor::new(&[-1.7375f32, -0.1554, -2.1293, -2.1105], &DEVICE)?.unsqueeze(0)?;
+        let dist = MvNormal { mu, cov };
+        let lp = dist.log_prob(&action).reshape(())?.to_scalar::<f32>()?;
+        let difference = lp - -131.6919;
+        assert!(difference.abs() < 1e-4, "{:?}", lp);
+        Ok(())
+    }
+}
+
 pub struct MvNormal {
     pub mu: Tensor,
     pub cov: Tensor,
@@ -46,43 +61,17 @@ impl MvNormal {
         z.broadcast_mul(&self.cov)?.broadcast_add(&self.mu)
     }
 
-    // https://online.stat.psu.edu/stat505/book/export/html/636
+    // https://github.com/pytorch/pytorch/blob/ba9acbebfc54b6a81d3db40c58e49b12041980ae/torch/distributions/normal.py#L77C10-L77C10
     pub fn log_prob(&self, x: &Tensor) -> Tensor {
-        let _nbatch = self.mu.shape().dims()[0];
         let x = x.to_device(self.mu.device()).unwrap();
-        let first = self
-            .cov
-            .ones_like()
-            .unwrap()
-            .broadcast_div(
-                &self
-                    .cov
-                    .broadcast_mul(&Tensor::new(2.0 * PI, &DEVICE).unwrap())
-                    .unwrap(),
-            )
-            .unwrap()
-            .sqrt()
-            .unwrap();
-        let second = {
-            let a = self
-                .cov
-                .ones_like()
-                .unwrap()
-                .neg()
-                .unwrap()
-                .div(
-                    &self
-                        .cov
-                        .broadcast_mul(&Tensor::new(2.0f32, &DEVICE).unwrap())
-                        .unwrap(),
-                )
-                .unwrap();
-            let b = x.sub(&self.mu).unwrap();
-            (a.mul(&b).unwrap().mul(&b).unwrap()).exp().unwrap()
-        };
-        let factors = first.mul(&second).unwrap();
+        let log_scale = (self.cov.sqrt().unwrap() + 1e-8).unwrap().log().unwrap();
+        let first = ((x - &self.mu).unwrap().sqr().unwrap().neg().unwrap()
+            / self.cov.affine(2.0, 1e-8).unwrap())
+        .unwrap();
+        let third = (2.0 * std::f64::consts::PI).sqrt().ln();
 
-        factors.log().unwrap().sum(1).unwrap()
+        let individuals = (first - log_scale).unwrap().affine(1.0, -third).unwrap();
+        individuals.sum(1).unwrap()
     }
 
     pub fn entropy(&self) -> Result<Tensor> {
@@ -100,9 +89,10 @@ impl MvNormal {
 }
 
 pub fn linear(in_len: usize, out_len: usize, gain: f64, vs: VarBuilder) -> Linear {
-    let w_init = candle_nn::init::Init::Randn {
-        mean: 0.0,
-        stdev: gain,
+    let w_init = candle_nn::init::Init::Kaiming {
+        dist: candle_nn::init::NormalOrUniform::Normal,
+        fan: candle_nn::init::FanInOut::FanIn,
+        non_linearity: candle_nn::init::NonLinearity::ExplicitGain(gain),
     };
     let b_init = candle_nn::init::Init::Const(0.0);
     let weight = vs
@@ -112,30 +102,57 @@ pub fn linear(in_len: usize, out_len: usize, gain: f64, vs: VarBuilder) -> Linea
     Linear::new(weight, Some(bias))
 }
 
+pub struct ResBlock {
+    pub l1: Linear,
+    pub l2: Linear,
+}
+
+impl ResBlock {
+    pub fn new(in_out_len: usize, hidden_len: usize, vs: VarBuilder) -> ResBlock {
+        ResBlock {
+            l1: linear(in_out_len, hidden_len, 5. / 3., vs.pp("l1")),
+            l2: linear(hidden_len, in_out_len, 5. / 3., vs.pp("l2")),
+        }
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x1 = self.l1.forward(x)?.tanh()?;
+        let x2 = self.l2.forward(&x1)?;
+        (x2 + x)?.tanh()
+    }
+}
+
 pub struct PpoActor {
     common1: Linear,
-    common2: Linear,
+    common2: ResBlock,
+    common3: ResBlock,
     mu_head: Linear,
     cov_head: Linear,
 }
 
 impl PpoActor {
     pub fn forward(&mut self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (_, nseq, _) = x.shape().dims3().unwrap();
-        let x = x
-            .index_select(
-                &Tensor::from_slice::<_, i64>(&[nseq as i64 - 1], (1,), &DEVICE)?,
-                1,
-            )?
-            .squeeze(1)
-            .unwrap();
+        // let (_, nseq, _) = x.shape().dims3().unwrap();
+        // let x = x
+        //     .index_select(
+        //         &Tensor::from_slice::<_, i64>(&[nseq as i64 - 1], (1,), &DEVICE)?,
+        //         1,
+        //     )?
+        //     .squeeze(1)
+        //     .unwrap();
+        let x = x.flatten(1, 2)?;
+
         let x = self.common1.forward(&x)?.tanh()?;
-        let x = self.common2.forward(&x)?.tanh()?;
+        let x = self.common2.forward(&x)?;
+        let x = self.common3.forward(&x)?;
 
         let mu = self.mu_head.forward(&x)?.tanh()?;
 
-        let cov = self.cov_head.forward(&x)?;
-        let cov = (cov.exp()? + 1.0)?.log()?;
+        let cov = self.cov_head.forward(&x)?.exp()?;
+        // let cov = (self.cov_head.exp()? + 1.0)?
+        //     .log()?
+        //     .repeat(mu.shape().dims()[0])?;
+        // let cov = (cov.exp()? + 1.0)?.log()?;
 
         Ok((mu, cov))
     }
@@ -149,42 +166,48 @@ impl PpoActor {
         vs: VarBuilder,
     ) -> Result<Self> {
         Ok(Self {
-            common1: linear(obs_len, hidden_len, 2.0f64.sqrt(), vs.pp("common1")),
-            common2: linear(hidden_len, hidden_len, 2.0f64.sqrt(), vs.pp("common2")),
+            common1: linear(obs_len, hidden_len, 5. / 3., vs.pp("common1")),
+            common2: ResBlock::new(hidden_len, hidden_len / 2, vs.pp("common2")),
+            common3: ResBlock::new(hidden_len, hidden_len / 2, vs.pp("common3")),
             mu_head: linear(hidden_len, action_len, 0.01, vs.pp("mu_head")),
+            // cov_head: vs.get_with_hints((1, action_len), "cov_head", Init::Const(0.0))?,
             cov_head: linear(hidden_len, action_len, 0.01, vs.pp("cov_head")),
         })
     }
 }
 
 pub struct PpoCritic {
-    common1: Linear,
-    common2: Linear,
+    l1: Linear,
+    l2: ResBlock,
+    l3: ResBlock,
     head: Linear,
 }
 
 impl PpoCritic {
     pub fn new(obs_len: usize, hidden_len: usize, vs: VarBuilder) -> Result<Self> {
         Ok(Self {
-            common1: linear(obs_len, hidden_len, 2.0f64.sqrt(), vs.pp("common1")),
-            common2: linear(hidden_len, hidden_len, 2.0f64.sqrt(), vs.pp("common2")),
-            head: linear(hidden_len, 1, 1.0, vs.push_prefix("head")),
+            l1: linear(obs_len, hidden_len, 5. / 3., vs.pp("l1")),
+            l2: ResBlock::new(hidden_len, hidden_len / 2, vs.pp("l2")),
+            l3: ResBlock::new(hidden_len, hidden_len / 2, vs.pp("l3")),
+            head: linear(hidden_len, 1, 1.0, vs.pp("head")),
         })
     }
 }
 
 impl PpoCritic {
     pub fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
-        let (_, nseq, _) = x.shape().dims3().unwrap();
-        let x = x
-            .index_select(
-                &Tensor::from_slice::<_, i64>(&[nseq as i64 - 1], (1,), &DEVICE)?,
-                1,
-            )?
-            .squeeze(1)
-            .unwrap();
-        let x = self.common1.forward(&x)?.tanh()?;
-        let x = (&x + self.common2.forward(&x)?.tanh()?)?;
+        // let (_, nseq, _) = x.shape().dims3().unwrap();
+        // let x = x
+        //     .index_select(
+        //         &Tensor::from_slice::<_, i64>(&[nseq as i64 - 1], (1,), &DEVICE)?,
+        //         1,
+        //     )?
+        //     .squeeze(1)
+        //     .unwrap();
+        let x = x.flatten(1, 2)?;
+        let x = self.l1.forward(&x)?.tanh()?;
+        let x = self.l2.forward(&x)?;
+        let x = self.l3.forward(&x)?;
 
         let x = self.head.forward(&x)?.squeeze(1)?;
         Ok(x)
@@ -234,6 +257,7 @@ pub trait PpoParams: Params {
     fn training_batch_size(&self) -> usize;
     fn training_epochs(&self) -> usize;
     fn agent_rb_max_len(&self) -> usize;
+    fn agent_warmup(&self) -> usize;
     fn agent_update_interval(&self) -> usize;
 }
 
@@ -296,7 +320,7 @@ impl RmsNormalize {
     }
 
     pub fn forward_ret(&mut self, rew: f32) -> f32 {
-        self.returns = self.returns * 0.9999 + rew;
+        self.returns = self.returns * 0.99 + rew;
         self.update_ret(self.returns);
         rew / (self.ret_var + 1e-8).sqrt()
     }
@@ -323,9 +347,11 @@ impl PpoThinker {
         training_epochs: usize,
         training_batch_size: usize,
         entropy_beta: f32,
+        frame_stack_len: usize,
         lr: f64,
         _rng: &mut EntropyComponent<ChaCha8Rng>,
     ) -> Result<Self> {
+        let obs_len = obs_len * frame_stack_len;
         let device = DEVICE.to_owned();
         let varmap = VarMap::new();
         let vs = VarBuilder::from_varmap(&varmap, DType::F32, &device);
@@ -525,20 +551,32 @@ where
                     cov: cov.clone(),
                 };
                 let entropy = dist.entropy().unwrap();
-                total_entropy_loss.push(entropy.mean(0).unwrap().to_scalar().unwrap());
+                total_entropy_loss.push(
+                    entropy
+                        .detach()
+                        .unwrap()
+                        .mean(0)
+                        .unwrap()
+                        .to_scalar()
+                        .unwrap(),
+                );
                 let lp = dist.log_prob(&a);
-                let log_ratio = (lp - old_lp).unwrap();
+                let log_ratio = (&lp - &old_lp).unwrap();
 
                 let ratio = log_ratio.exp().unwrap();
                 let surr1 = (&ratio * &advantage).unwrap();
 
-                let lo = Tensor::new(0.9f32, &self.device).unwrap();
-                let hi = Tensor::new(1.1f32, &self.device).unwrap();
+                let lo = Tensor::new(0.8f32, &self.device).unwrap();
+                let hi = Tensor::new(1.2f32, &self.device).unwrap();
 
                 let nclamp: f32 = (ratio
+                    .detach()
+                    .unwrap()
                     .lt(&lo.broadcast_left(ratio.shape()).unwrap())
                     .unwrap()
                     + ratio
+                        .detach()
+                        .unwrap()
                         .gt(&hi.broadcast_left(ratio.shape()).unwrap())
                         .unwrap())
                 .unwrap()
@@ -560,7 +598,9 @@ where
                 let masked = surr2.minimum(&surr1).unwrap();
                 let policy_loss = masked.neg().unwrap().mean(0).unwrap();
 
-                let kl = log_ratio
+                let kl: f32 = log_ratio
+                    .detach()
+                    .unwrap()
                     .neg()
                     .unwrap()
                     .mean(0)
@@ -574,27 +614,74 @@ where
                 total_pi_loss.push(pl);
 
                 let val = self.critic.forward(&s).unwrap();
-                let val_err = (&val - &returns).unwrap();
-                let value_loss = (&val_err * &val_err).unwrap().mean(0).unwrap();
+                let value_loss = (&val - &returns).unwrap().sqr().unwrap().mean(0).unwrap();
                 let vl = value_loss.to_scalar().unwrap();
                 total_val_loss.push(vl);
 
-                let loss = (policy_loss + (value_loss * 0.5).unwrap()).unwrap();
-                if kl <= 0.02 {
-                    total_policy_batches += 1;
-                    let grads = loss.backward().unwrap();
-
-                    self.optim.step(&grads).unwrap();
-                }
-                let y_true = returns.clone();
+                let y_true = returns.detach().unwrap();
                 let explained_var: f32 = (Tensor::new(&[1.0f32], &DEVICE).unwrap()
-                    - (variance(&(&y_true - &val).unwrap()).div(&variance(&y_true))))
+                    - (variance(&(&y_true - &val.detach().unwrap()).unwrap())
+                        .div(&(variance(&y_true) + 1e-8).unwrap())))
                 .unwrap()
                 .reshape(())
                 .unwrap()
                 .to_scalar()
                 .unwrap();
                 total_explained_var.push(explained_var);
+
+                if pl.is_normal() && vl.is_normal() && kl.is_normal() {
+                    if kl <= 0.02 * 1.5 {
+                        let loss = (policy_loss + (value_loss * 0.5).unwrap()).unwrap();
+
+                        total_policy_batches += 1;
+                        let mut grads = loss.backward().unwrap();
+
+                        // gradient clip-by-norm
+                        for var in self.varmap.all_vars().iter() {
+                            let var = var.as_tensor();
+                            let grad = grads.get(var).unwrap();
+                            let norm: f32 = grad
+                                .sqr()
+                                .unwrap()
+                                .sum_all()
+                                .unwrap()
+                                .sqrt()
+                                .unwrap()
+                                .to_scalar()
+                                .unwrap();
+                            let grad = if norm >= 0.5 {
+                                (grad * 0.5)
+                                    .unwrap()
+                                    .affine((norm as f64).recip(), 0.0)
+                                    .unwrap()
+                            } else {
+                                grad.to_owned()
+                            };
+                            grads.insert(var, grad);
+                        }
+
+                        self.optim.step(&grads).unwrap();
+                    }
+                } else {
+                    eprintln!("kl: {:?}\n", kl);
+                    eprintln!("s: {:?}\n", s.to_vec3::<f32>().ok());
+                    eprintln!("a: {:?}\n", a.to_vec2::<f32>().ok());
+                    eprintln!("adv: {:?}\n", advantage.to_vec1::<f32>().ok());
+                    eprintln!("ret: {:?}\n", returns.to_vec1::<f32>().ok());
+                    eprintln!("mu: {:?}\n", mu.to_vec2::<f32>().ok());
+                    eprintln!("cov: {:?}\n", cov.to_vec2::<f32>().ok());
+                    eprintln!("lp: {:?}\n", lp.to_vec1::<f32>().ok());
+
+                    if !pl.is_normal() {
+                        panic!("pl={pl}");
+                    }
+                    if !vl.is_normal() {
+                        panic!("vl={vl}");
+                    }
+                    if !kl.is_normal() {
+                        panic!("kl={kl}");
+                    }
+                }
 
                 total_batches += 1;
             }
@@ -617,16 +704,10 @@ where
 
     fn save(
         &self,
-        _path: impl AsRef<std::path::Path>,
+        path: impl AsRef<std::path::Path>,
     ) -> std::result::Result<(), std::boxed::Box<(dyn std::error::Error + 'static)>> {
-        // self.actor.clone().save_file(
-        //     path.as_ref().join("actor"),
-        //     &BinGzFileRecorder::<FullPrecisionSettings>::new(),
-        // )?;
-        // self.critic.clone().save_file(
-        //     path.as_ref().join("critic"),
-        //     &BinGzFileRecorder::<FullPrecisionSettings>::new(),
-        // )?;
+        self.varmap.save(path.as_ref().join("model.safetensors"))?;
+
         Ok(())
     }
 }

@@ -70,13 +70,4 @@ impl Property for MapInteractionProperties {
             right_wall_dist: s[3],
         }
     }
-
-    fn scaled_by(&self, scaling: &Self) -> Self {
-        Self {
-            up_wall_dist: self.up_wall_dist * scaling.up_wall_dist,
-            down_wall_dist: self.down_wall_dist * scaling.down_wall_dist,
-            left_wall_dist: self.left_wall_dist * scaling.left_wall_dist,
-            right_wall_dist: self.right_wall_dist * scaling.right_wall_dist,
-        }
-    }
 }

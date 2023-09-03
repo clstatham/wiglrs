@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, f32::consts::PI};
 
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::{prelude::EntropyComponent, resource::GlobalEntropy};
@@ -29,7 +29,7 @@ use crate::{
 use super::{
     modules::{
         map_interaction::MapInteractionProperties, Behavior, CombatBehaviors, CombatProperties,
-        PhysicalBehaviors, PhysicalProperties, Property,
+        PhysicalBehaviors, PhysicalProperties, Property, RelativePhysicalProperties,
     },
     Action, DefaultFrameStack, Env, Observation, Params,
 };
@@ -44,6 +44,7 @@ pub struct FfaParams {
     pub agent_training_batch_size: usize,
     pub agent_entropy_beta: f32,
     pub agent_update_interval: usize,
+    pub agent_warmup: usize,
     pub agent_rb_max_len: usize,
     pub agent_frame_stack_len: usize,
     pub agent_radius: f32,
@@ -65,24 +66,25 @@ impl Default for FfaParams {
             num_agents: 6,
             agent_hidden_dim: 128,
             agent_actor_lr: 0.001,
-            agent_critic_lr: 0.01,
+            agent_critic_lr: 0.001,
             agent_training_epochs: 10,
-            agent_training_batch_size: 512,
+            agent_training_batch_size: 64,
             agent_entropy_beta: 0.00001,
-            agent_update_interval: 1_000,
-            agent_rb_max_len: 100_000,
-            agent_frame_stack_len: 5,
+            agent_update_interval: 2048,
+            agent_warmup: 4096,
+            agent_rb_max_len: 2048,
+            agent_frame_stack_len: 4,
             agent_radius: 20.0,
             agent_lin_move_force: 600.0,
             agent_ang_move_force: 1.0,
             agent_max_health: 100.0,
             agent_shoot_distance: 1000.0,
             distance_scaling: 1.0 / 2000.0,
-            reward_for_kill: 100.0,
-            reward_for_death: -50.0,
-            reward_for_hit: 1.0,
-            reward_for_getting_hit: -0.5,
-            reward_for_miss: -2.0,
+            reward_for_kill: 1.0,
+            reward_for_death: -1.0,
+            reward_for_hit: 0.1,
+            reward_for_getting_hit: -0.1,
+            reward_for_miss: -0.1,
         }
     }
 }
@@ -106,6 +108,10 @@ impl Params for FfaParams {
 }
 
 impl PpoParams for FfaParams {
+    fn agent_warmup(&self) -> usize {
+        self.agent_warmup
+    }
+
     fn actor_lr(&self) -> f64 {
         self.agent_actor_lr
     }
@@ -137,7 +143,7 @@ impl PpoParams for FfaParams {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OtherState {
-    pub phys: PhysicalProperties,
+    pub phys: RelativePhysicalProperties,
     pub combat: CombatProperties,
     pub map_inter: MapInteractionProperties,
     pub firing: bool,
@@ -209,10 +215,11 @@ impl Action<Ffa> for FfaAction {
     fn from_slice(action: &[f32], metadata: Self::Metadata, _params: &FfaParams) -> Self {
         Self {
             phys: PhysicalBehaviors {
-                force: Vec2::new(action[0], action[1]),
-                torque: action[2],
+                direction: action[0],
+                thrust: action[1],
+                desired_rotation: action[2],
             },
-            combat: CombatBehaviors { shoot: action[3] },
+            combat: CombatBehaviors { shoot: action[4] },
             metadata,
         }
     }
@@ -327,6 +334,7 @@ pub struct Reward(pub f32);
 #[derive(Component)]
 pub struct RunningReturn {
     pub buf: VecDeque<f32>,
+    // pub returns: VecDeque<f32>,
     pub history: VecDeque<f32>,
     pub max_len: usize,
 }
@@ -335,6 +343,7 @@ impl RunningReturn {
     pub fn new(max_len: usize) -> Self {
         Self {
             buf: VecDeque::default(),
+            // returns: VecDeque::default(),
             history: VecDeque::default(),
             max_len,
         }
@@ -348,17 +357,21 @@ impl RunningReturn {
         }
         self.buf.push_back(reward);
 
-        self.history.clear();
-        let mut val = reward;
+        // self.returns.clear();
+        let mut val = 0.0;
         for r in self.buf.iter().rev() {
-            val = *r + 0.9999 * val;
-            self.history.push_front(val);
+            val = *r + 0.99 * val;
+            // self.returns.push_front(val);
         }
-        self.get()
+        if self.history.len() >= self.max_len {
+            self.history.pop_front();
+        }
+        self.history.push_back(val);
+        Some(val)
     }
 
     pub fn get(&self) -> Option<f32> {
-        self.history.front().copied()
+        self.history.back().copied()
     }
 }
 
@@ -429,9 +442,7 @@ where
             action: E::Action::default(),
             replay_buffer: PpoBuffer::new(Some(params.agent_rb_max_len())),
             reward: Reward(0.0),
-            running_reward: RunningReturn::new(
-                params.agent_rb_max_len() / params.agent_frame_stack_len(),
-            ),
+            running_reward: RunningReturn::new(params.agent_update_interval()),
             terminal: Terminal(false),
             marker: Agent,
             rb: RigidBody::Dynamic,
@@ -444,7 +455,7 @@ where
             gravity: GravityScale(0.0),
             velocity: Velocity::default(),
             damping: Damping {
-                angular_damping: 30.0,
+                angular_damping: 120.0,
                 linear_damping: 10.0,
             },
             force: ExternalForce::default(),
@@ -546,6 +557,7 @@ fn setup(
             params.agent_training_epochs,
             params.agent_training_batch_size,
             params.agent_entropy_beta,
+            params.agent_frame_stack_len,
             params.agent_actor_lr,
             &mut EntropyComponent::from(&mut rng),
         )
@@ -596,27 +608,12 @@ fn get_observation(
     agent_health: Query<&Health, With<Agent>>,
     cx: Res<RapierContext>,
 ) {
-    let _phys_scaling = PhysicalProperties {
-        position: Vec2::splat(params.distance_scaling),
-        direction: Vec2::splat(1.0),
-        linvel: Vec2::splat(params.distance_scaling),
-    };
-    let _map_scaling = MapInteractionProperties {
-        up_wall_dist: params.distance_scaling,
-        down_wall_dist: params.distance_scaling,
-        left_wall_dist: params.distance_scaling,
-        right_wall_dist: params.distance_scaling,
-    };
     for agent_ent in agents.iter() {
         let my_t = agent_transform.get(agent_ent).unwrap();
         let my_v = agent_velocity.get(agent_ent).unwrap();
         let my_h = agent_health.get(agent_ent).unwrap();
         let mut my_state = FfaObs {
-            phys: PhysicalProperties {
-                position: my_t.translation.xy(),
-                direction: my_t.local_y().xy(),
-                linvel: my_v.linvel,
-            },
+            phys: PhysicalProperties::new(my_t, my_v),
             // .scaled_by(&phys_scaling),
             combat: CombatProperties { health: my_h.0 }, //.scaled_by(&CombatProperties {
             // health: 1.0 / params.agent_max_health,
@@ -634,15 +631,10 @@ fn get_observation(
             })
         {
             let other_t = agent_transform.get(other_ent).unwrap();
-            let other_v = agent_velocity.get(other_ent).unwrap();
             let other_h = agent_health.get(other_ent).unwrap();
             // let status = brains.with_brain(other_id.0, |brain| brain.thinker.status());
             let other_state = OtherState {
-                phys: PhysicalProperties {
-                    position: my_t.translation.xy() - other_t.translation.xy(),
-                    direction: other_t.local_y().xy(),
-                    linvel: other_v.linvel,
-                },
+                phys: RelativePhysicalProperties::new(my_t, other_t),
                 //.scaled_by(&phys_scaling),
                 combat: CombatProperties { health: other_h.0 }, //.scaled_by(&CombatProperties {
                 // health: 1.0 / params.agent_max_health,
@@ -707,7 +699,7 @@ fn get_reward(
     _childs: Query<&Children, With<Agent>>,
     mut health: Query<&mut Health, With<Agent>>,
     mut kills: Query<&mut Kills, With<Agent>>,
-    mut force: Query<&mut ExternalForce, With<Agent>>,
+    mut force: Query<&mut ExternalImpulse, With<Agent>>,
     names: Query<&Name, With<Agent>>,
     mut log: ResMut<LogText>,
     mut gizmos: Gizmos,
@@ -759,9 +751,12 @@ fn get_reward(
             }
 
             let mut my_force = force.get_mut(agent_ent).unwrap();
-            my_force.force = action.phys.force.clamp(Vec2::splat(-1.0), Vec2::splat(1.0))
-                * params.agent_lin_move_force;
-            my_force.torque = action.phys.torque.clamp(-1.0, 1.0) * params.agent_ang_move_force;
+            let x_direction = (action.phys.direction * PI).sin();
+            let y_direction = (action.phys.direction * PI).cos();
+            let force = Vec2::new(x_direction, y_direction) * action.phys.thrust.clamp(-1.0, 1.0);
+            my_force.impulse = force * params.agent_lin_move_force;
+            todo!("orientation");
+            // my_force.torque = action.phys.torque.clamp(-1.0, 1.0) * params.agent_ang_move_force;
         }
     }
 }
@@ -773,17 +768,21 @@ pub fn send_reward<E: Env, T: Thinker<E>>(
     rewards: Query<&Reward, With<Agent>>,
     mut running_rewards: Query<&mut RunningReturn, With<Agent>>,
     mut brains: Query<&mut Brain<E, T>, With<Agent>>,
-) {
-    if frame_count.0 as usize % params.agent_frame_stack_len() == 0 {
-        for agent_ent in agents.iter() {
-            let reward = rewards.get(agent_ent).unwrap().0;
+) where
+    E::Params: PpoParams,
+{
+    for agent_ent in agents.iter() {
+        let reward = rewards.get(agent_ent).unwrap().0;
+        let running = running_rewards.get_mut(agent_ent).unwrap().update(reward);
+        if frame_count.0 as usize >= params.agent_warmup()
+            && frame_count.0 as usize % params.agent_frame_stack_len() == 0
+        {
             brains.get_mut(agent_ent).unwrap().writer.add_scalar(
                 "Reward/Frame",
                 reward,
                 frame_count.0 as usize,
             );
-            if let Some(running_reward) = running_rewards.get_mut(agent_ent).unwrap().update(reward)
-            {
+            if let Some(running_reward) = running {
                 brains.get_mut(agent_ent).unwrap().writer.add_scalar(
                     "Reward/Running",
                     running_reward,
@@ -894,7 +893,7 @@ pub fn learn<E: Env, T>(
     E::Action: Action<E, Metadata = PpoMetadata>,
     T: Thinker<E, Status = PpoStatus>,
 {
-    if frame_count.0 as usize >= params.training_batch_size()
+    if frame_count.0 as usize >= params.agent_warmup()
         && frame_count.0 as usize % params.agent_update_interval() == 0
     {
         query.par_iter_mut().for_each_mut(

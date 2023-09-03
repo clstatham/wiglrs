@@ -1,5 +1,5 @@
 ffa_params:
-  num_agents: 4
+  num_agents: 6
   agent_hidden_dim: 128
   agent_actor_lr: 0.001
   agent_critic_lr: 0.001

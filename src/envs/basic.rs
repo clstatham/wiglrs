@@ -61,6 +61,10 @@ impl Params for BasicParams {
 }
 
 impl PpoParams for BasicParams {
+    fn agent_warmup(&self) -> usize {
+        self.ffa_params.agent_warmup
+    }
+
     fn actor_lr(&self) -> f64 {
         self.ffa_params.agent_actor_lr
     }
@@ -258,6 +262,7 @@ fn setup(
                 params.ffa_params.agent_training_epochs,
                 params.ffa_params.agent_training_batch_size,
                 params.ffa_params.agent_entropy_beta,
+                params.ffa_params.agent_frame_stack_len,
                 params.ffa_params.agent_actor_lr,
                 &mut rng_comp,
             )
@@ -269,7 +274,7 @@ fn setup(
         }
         let dist = Uniform::new(-250.0, 250.0);
         let agent_pos = Vec3::new(dist.sample(&mut rng_comp), dist.sample(&mut rng_comp), 0.0);
-        let color = if agent_id % 2 == 0 {
+        let color = if agent_id % 3 == 0 {
             Color::RED
         } else {
             Color::BLUE
@@ -325,7 +330,7 @@ fn observation(
         .for_each(|(agent, agent_id, velocity, transform)| {
             // draw their vision cones
             let my_pos = transform.translation.xy();
-            // let required_angle = if agent_id.0 % 2 == 0 {
+            // let required_angle = if agent_id.0 % 3 == 0 {
             //     45.0f32.to_radians()
             // } else {
             //     80.0f32.to_radians()
@@ -360,11 +365,6 @@ fn observation(
 
                 // check line of sight
                 let filter = QueryFilter::new().exclude_collider(agent);
-                // for (ent, ent_id, _, _) in queries.iter() {
-                //     if agent_id.0 % 2 == ent_id.0 % 2 {
-                //         filter = filter.exclude_collider(ent);
-                //     }
-                // }
                 if let Some((hit_ent, _)) = cx.cast_ray(
                     transform.translation.xy(),
                     (other_t.translation.xy() - transform.translation.xy()).normalize(),
@@ -381,7 +381,7 @@ fn observation(
                         gizmos.line_2d(
                             my_pos,
                             my_pos + other_loc_relative * 100.0,
-                            if other_id.0 % 2 == 0 {
+                            if other_id.0 % 3 == 0 {
                                 Color::RED
                             } else {
                                 Color::BLUE
@@ -442,10 +442,11 @@ fn get_reward(
     for agent_ent in agents.iter() {
         let action = actions.get(agent_ent).unwrap();
         let mut my_force = force.get_mut(agent_ent).unwrap();
-        my_force.force = action.phys.force.clamp(Vec2::splat(-1.0), Vec2::splat(1.0))
-            * params.ffa_params.agent_lin_move_force;
-        my_force.torque =
-            action.phys.torque.clamp(-1.0, 1.0) * params.ffa_params.agent_ang_move_force;
+        todo!();
+        // my_force.force = action.phys.force.clamp(Vec2::splat(-1.0), Vec2::splat(1.0))
+        //     * params.ffa_params.agent_lin_move_force;
+        // my_force.torque =
+        //     action.phys.torque.clamp(-1.0, 1.0) * params.ffa_params.agent_ang_move_force;
         let my_id = agents_ids.get(agent_ent).unwrap();
         let my_t = agent_transform.get(agent_ent).unwrap();
         for other_agent in agents.iter().filter(|a| *a != agent_ent) {
@@ -453,9 +454,9 @@ fn get_reward(
             let other_id = agents_ids.get(other_agent).unwrap();
             let reward =
                 my_t.translation.distance(other_t.translation) * params.distance_reward_mult;
-            if my_id.0 % 2 == 0 && other_id.0 % 2 == 1 {
+            if my_id.0 % 3 == 0 && other_id.0 % 3 != 0 {
                 rewards.get_mut(agent_ent).unwrap().0 .0 -= reward * reward;
-            } else if my_id.0 % 2 == 1 && other_id.0 % 2 == 0 {
+            } else if my_id.0 % 3 != 0 && other_id.0 % 3 == 0 {
                 rewards.get_mut(agent_ent).unwrap().0 .0 += reward * reward;
             }
         }

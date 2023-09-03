@@ -1,7 +1,7 @@
 #![feature(return_position_impl_trait_in_trait)]
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
-use std::{collections::VecDeque, fmt, path::Path, sync::Arc};
+use std::{collections::VecDeque, f32::consts::PI, fmt, path::Path, sync::Arc};
 
 use bevy::{
     prelude::*,
@@ -30,6 +30,19 @@ pub mod brains;
 pub mod envs;
 pub mod names;
 pub mod ui;
+
+#[inline(always)]
+pub fn transform_angle_for_agent(x: f32) -> f32 {
+    // rotate to be local to +Y
+    let mut x = x + PI / 2.0;
+    if x > PI {
+        x -= 2.0 * PI;
+    }
+    if x < -PI {
+        x += 2.0 * PI;
+    }
+    x
+}
 
 #[derive(Component)]
 pub struct FrameStack<O>(pub VecDeque<O>);
@@ -145,7 +158,7 @@ fn handle_input(
 fn run_env<E: crate::envs::Env, M: crate::envs::maps::Map>(
     seed: [u8; 32],
     env: E,
-    map: M,
+    _map: M,
     params: E::Params,
 ) where
     E::Params: Serialize,
@@ -219,7 +232,7 @@ fn main() {
     let _tch_seed: u64 = 0xcafebabe;
     let bevy_seed: [u8; 32] = [42; 32];
 
-    let env = EnvKind::Basic;
+    let env = EnvKind::Tdm;
 
     match env {
         EnvKind::Tdm => {

@@ -139,8 +139,8 @@ where
         let mut gae = 0.0;
         for i in (startpoint..endpoint).rev() {
             let mask = if self.terminal[i] { 0.0 } else { 1.0 };
-            let delta = self.reward[i] + 0.9999 * vals[i + 1] * mask - vals[i];
-            gae = delta + 0.9999 * 0.95 * mask * gae;
+            let delta = self.reward[i] + 0.99 * vals[i + 1] * mask - vals[i];
+            gae = delta + 0.99 * 1.0 * mask * gae;
             self.advantage[i] = Some(gae);
             // ret = self.reward[i] + 0.99 * mask * ret;
             // self.returns[i] = Some(ret);
