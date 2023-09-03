@@ -31,8 +31,6 @@ pub struct HiddenStates {}
 
 #[derive(Debug, Clone, Default, Component)]
 pub struct PpoStatus {
-    pub mu: Box<[f32]>,
-    pub cov: Box<[f32]>,
     pub recent_entropy: f32,
     pub policy_loss: f32,
     pub value_loss: f32,
@@ -89,72 +87,6 @@ impl<E: Env> Learner<E> for Ppo {
     fn status(&self) -> Self::Status {
         self.status.clone()
     }
-
-    // fn act(
-    //     &mut self,
-    //     obs: &FrameStack<Box<[f32]>>,
-    //     metadata: &mut Self::Metadata,
-    //     params: &E::Params,
-    //     rng: &mut EntropyComponent<ChaCha8Rng>,
-    // ) -> E::Action {
-    //     let hiddens = metadata.clone(); //.to_device(&TchDEVICE);
-    //     let obs = obs
-    //         .as_vec()
-    //         .into_iter()
-    //         .map(|o| Tensor::from_slice(&o, (o.len(),), &DEVICE).unwrap())
-    //         .collect::<Vec<_>>();
-    //     let obs = Tensor::stack(obs.as_slice(), 0)
-    //         .unwrap()
-    //         .unsqueeze(0)
-    //         .unwrap();
-
-    //     let (mu, cov) = self.actor.action_logits(&obs).unwrap();
-    //     self.status.mu = mu
-    //         .reshape((self.action_len,))
-    //         .unwrap()
-    //         .to_vec1()
-    //         .unwrap()
-    //         .into_boxed_slice();
-    //     self.status.cov = cov
-    //         .reshape((self.action_len,))
-    //         .unwrap()
-    //         .to_vec1()
-    //         .unwrap()
-    //         .into_boxed_slice();
-    //     let dist = MvNormal { mu, cov };
-    //     self.status.recent_entropy = dist
-    //         .entropy()
-    //         .unwrap()
-    //         .reshape(())
-    //         .unwrap()
-    //         .to_scalar()
-    //         .unwrap();
-    //     let action = dist.sample(rng).unwrap();
-    //     let val = self.critic.estimate_value(&obs).unwrap();
-
-    //     let action_vec = action
-    //         .reshape((self.action_len,))
-    //         .unwrap()
-    //         .to_vec1()
-    //         .unwrap();
-
-    //     let logp = dist
-    //         .log_prob(&action)
-    //         .reshape(())
-    //         .unwrap()
-    //         .to_scalar()
-    //         .unwrap();
-
-    //     E::Action::from_slice(
-    //         action_vec.as_slice(),
-    //         PpoMetadata {
-    //             val: val.reshape(()).unwrap().to_scalar().unwrap(),
-    //             logp,
-    //             hiddens: Some(hiddens),
-    //         },
-    //         params,
-    //     )
-    // }
 
     fn learn<P: Policy, V: ValueEstimator>(
         &mut self,

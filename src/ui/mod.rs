@@ -7,6 +7,8 @@ use bevy_egui::EguiContexts;
 use itertools::Itertools;
 
 use crate::brains::learners::ppo::PpoStatus;
+use crate::brains::models::Policy;
+use crate::brains::AgentPolicy;
 use crate::envs::{Name, RunningReturn};
 use crate::{
     brains::learners::Learner,
@@ -69,11 +71,11 @@ pub fn kdr<E: Env, T: Learner<E>>(
     });
 }
 
-pub fn action_space<E: Env, T: Learner<E, Status = PpoStatus>>(
+pub fn action_space<E: Env>(
     mut cxs: EguiContexts,
     agents: Query<Entity, With<Agent>>,
     names: Query<&Name, With<Agent>>,
-    learners: Query<&T, With<Agent>>,
+    policies: Query<&AgentPolicy, With<Agent>>,
 ) {
     egui::Window::new("Action Mean/Std/Entropy")
         .min_height(200.0)
@@ -86,81 +88,83 @@ pub fn action_space<E: Env, T: Learner<E, Status = PpoStatus>>(
                 egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(false),
                 |ui| {
                     // egui::Grid::new("mean/std grid").show(ui, |ui| {
-                    for (_i, brain) in agents.iter().enumerate() {
+                    for (_i, agent) in agents.iter().enumerate() {
                         ui.group(|ui| {
                             ui.vertical(|ui| {
-                                ui.heading(&names.get(brain).unwrap().0);
+                                ui.heading(&names.get(agent).unwrap().0);
                                 // ui.group(|ui| {
-                                let status = T::status(&learners.get(brain).unwrap());
-                                let mut mu = "mu:".to_owned();
-                                for m in status.mu.iter() {
-                                    mu.push_str(&format!(" {:.4}", m));
-                                }
-                                ui.label(mu);
-                                let mut cov = "cov:".to_owned();
-                                for s in status.cov.iter() {
-                                    cov.push_str(&format!(" {:.4}", s));
-                                }
-                                ui.label(cov);
-                                ui.label(format!("ent: {}", status.recent_entropy));
-                                // });
+                                let status = AgentPolicy::status(&policies.get(agent).unwrap());
+                                if let Some(status) = status {
+                                    let mut mu = "mu:".to_owned();
+                                    for m in status.mu.iter() {
+                                        mu.push_str(&format!(" {:.4}", m));
+                                    }
+                                    ui.label(mu);
+                                    let mut cov = "cov:".to_owned();
+                                    for s in status.cov.iter() {
+                                        cov.push_str(&format!(" {:.4}", s));
+                                    }
+                                    ui.label(cov);
+                                    ui.label(format!("ent: {}", status.entropy));
+                                    // });
 
-                                // ui.horizontal_top(|ui| {
+                                    // ui.horizontal_top(|ui| {
 
-                                let ms = status
-                                    .mu
-                                    .iter()
-                                    .zip(status.cov.iter())
-                                    .enumerate()
-                                    .map(|(i, (mu, cov))| {
-                                        // https://www.desmos.com/calculator/rkoehr8rve
-                                        let scale = cov.sqrt() * 3.0;
-                                        let _rg =
-                                            Vec2::new(scale.exp(), (1.0 / scale).exp()).normalize();
-                                        let m = Bar::new(i as f64, *mu as f64)
-                                            // .fill(Color32::from_rgb(
-                                            //     (rg.x * 255.0) as u8,
-                                            //     (rg.y * 255.0) as u8,
-                                            //     0,
-                                            // ));
-                                            .fill(egui::Color32::RED);
-                                        let std = cov.sqrt();
-                                        let s = Line::new(vec![
-                                            [i as f64, *mu as f64 - std as f64],
-                                            [i as f64, *mu as f64 + std as f64],
-                                        ])
-                                        .stroke(egui::Stroke::new(4.0, egui::Color32::LIGHT_GREEN));
-                                        (m, s)
-                                        // .width(1.0 - *std as f64 / 6.0)
-                                    })
-                                    .collect_vec();
+                                    let ms = status
+                                        .mu
+                                        .iter()
+                                        .zip(status.cov.iter())
+                                        .enumerate()
+                                        .map(|(i, (mu, cov))| {
+                                            // https://www.desmos.com/calculator/rkoehr8rve
+                                            let scale = cov.sqrt() * 3.0;
+                                            let _rg = Vec2::new(scale.exp(), (1.0 / scale).exp())
+                                                .normalize();
+                                            let m = Bar::new(i as f64, *mu as f64)
+                                                // .fill(Color32::from_rgb(
+                                                //     (rg.x * 255.0) as u8,
+                                                //     (rg.y * 255.0) as u8,
+                                                //     0,
+                                                // ));
+                                                .fill(egui::Color32::RED);
+                                            let std = cov.sqrt();
+                                            let s = Line::new(vec![
+                                                [i as f64, *mu as f64 - std as f64],
+                                                [i as f64, *mu as f64 + std as f64],
+                                            ])
+                                            .stroke(egui::Stroke::new(
+                                                4.0,
+                                                egui::Color32::LIGHT_GREEN,
+                                            ));
+                                            (m, s)
+                                            // .width(1.0 - *std as f64 / 6.0)
+                                        })
+                                        .collect_vec();
 
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.label("Action Space");
-                                            egui::plot::Plot::new(format!(
-                                                "ActionSpace{}",
-                                                names.get(brain).unwrap().0,
-                                            ))
-                                            .center_y_axis(true)
-                                            .data_aspect(1.0 / 2.0)
-                                            .height(80.0)
-                                            .width(220.0)
-                                            .show(
-                                                ui,
-                                                |plot| {
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.label("Action Space");
+                                                egui::plot::Plot::new(format!(
+                                                    "ActionSpace{}",
+                                                    names.get(agent).unwrap().0,
+                                                ))
+                                                .center_y_axis(true)
+                                                .data_aspect(1.0 / 2.0)
+                                                .height(80.0)
+                                                .width(220.0)
+                                                .show(ui, |plot| {
                                                     let (mu, std): (Vec<Bar>, Vec<Line>) =
                                                         ms.into_iter().multiunzip();
                                                     plot.bar_chart(BarChart::new(mu));
                                                     for std in std {
                                                         plot.line(std);
                                                     }
-                                                },
-                                            );
+                                                });
+                                            });
                                         });
                                     });
-                                });
+                                }
                             });
                         });
                     }

@@ -278,7 +278,7 @@ impl Env for Tdm {
         use crate::ui::*;
         (
             kdr::<Tdm, AgentLearner>,
-            action_space::<Tdm, AgentLearner>,
+            action_space::<Tdm>,
             log,
             running_reward,
         )

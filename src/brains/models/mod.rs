@@ -7,11 +7,13 @@ pub mod linear_resnet;
 
 pub trait Policy: Component {
     type Logits;
+    type Status: Clone;
     fn action_logits(&self, obs: &Tensor) -> Result<Self::Logits>;
     fn act(&self, obs: &Tensor) -> Result<(Tensor, Self::Logits)>;
     fn log_prob(&self, logits: &Self::Logits, action: &Tensor) -> Result<Tensor>;
     fn entropy(&self, logits: &Self::Logits) -> Result<Tensor>;
     fn apply_gradients(&self, grads: &GradStore) -> Result<()>;
+    fn status(&self) -> Option<Self::Status>;
 }
 
 pub trait ValueEstimator: Component {

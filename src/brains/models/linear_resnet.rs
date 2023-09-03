@@ -4,16 +4,19 @@ use bevy::prelude::Component;
 use candle_core::{backprop::GradStore, Module, Result, Tensor};
 use candle_nn::{AdamW, Linear, Optimizer, VarBuilder, VarMap};
 
-use crate::{
-    brains::learners::{
-        utils::{linear, MvNormal, ResBlock},
-        DEVICE,
-    },
-    envs::Action,
-    FrameStack,
+use crate::brains::learners::{
+    utils::{linear, MvNormal, ResBlock},
+    DEVICE,
 };
 
 use super::{Policy, ValueEstimator};
+
+#[derive(Clone, Debug)]
+pub struct LinearResnetStatus {
+    pub mu: Box<[f32]>,
+    pub cov: Box<[f32]>,
+    pub entropy: f32,
+}
 
 #[derive(Component)]
 pub struct LinResActor {
@@ -24,6 +27,7 @@ pub struct LinResActor {
     cov_head: Linear,
     varmap: VarMap,
     optim: Mutex<AdamW>,
+    status: Mutex<Option<LinearResnetStatus>>,
 }
 
 impl LinResActor {
@@ -44,12 +48,14 @@ impl LinResActor {
             mu_head,
             cov_head,
             optim: Mutex::new(optim),
+            status: Mutex::new(None),
         })
     }
 }
 
 impl Policy for LinResActor {
     type Logits = (Tensor, Tensor);
+    type Status = LinearResnetStatus;
 
     fn action_logits(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         let x = x.flatten(1, 2)?;
@@ -75,6 +81,14 @@ impl Policy for LinResActor {
             mu: mu.clone(),
             cov: cov.clone(),
         };
+        *self.status.lock().unwrap() = Some(LinearResnetStatus {
+            mu: mu.squeeze(0)?.to_vec1::<f32>()?.into_boxed_slice(),
+            cov: cov.squeeze(0)?.to_vec1::<f32>()?.into_boxed_slice(),
+            entropy: self
+                .entropy(&(mu.clone(), cov.clone()))?
+                .reshape(())?
+                .to_scalar::<f32>()?,
+        });
         let action = dist.sample()?;
         Ok((action, (mu, cov)))
     }
@@ -93,6 +107,10 @@ impl Policy for LinResActor {
 
     fn apply_gradients(&self, grads: &GradStore) -> Result<()> {
         self.optim.lock().unwrap().step(grads)
+    }
+
+    fn status(&self) -> Option<Self::Status> {
+        self.status.lock().unwrap().as_ref().cloned()
     }
 }
 
