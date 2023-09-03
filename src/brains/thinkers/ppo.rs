@@ -629,7 +629,7 @@ where
                 .unwrap();
                 total_explained_var.push(explained_var);
 
-                if pl.is_normal() && vl.is_normal() && kl.is_normal() {
+                if pl.is_normal() && vl.is_normal() && kl.is_finite() && !kl.is_nan() {
                     if kl <= 0.02 * 1.5 {
                         let loss = (policy_loss + (value_loss * 0.5).unwrap()).unwrap();
 
