@@ -1,8 +1,6 @@
 use std::{f32::consts::PI, ops::Mul};
 
 use bevy::prelude::*;
-use bevy_prng::ChaCha8Rng;
-use bevy_rand::prelude::EntropyComponent;
 use candle_core::{DType, Module, Result, Tensor};
 use candle_nn::{Linear, VarBuilder};
 use itertools::Itertools;

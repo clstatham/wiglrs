@@ -1,14 +1,12 @@
 use std::f32::consts::PI;
 
 use crate::brains::learners::ppo::rollout_buffer::PpoBuffer;
-use crate::brains::learners::ppo::Ppo;
 use crate::brains::learners::utils::RmsNormalize;
 use crate::brains::learners::DEVICE;
-use crate::brains::models::linear_resnet::{LinResActor, LinResCritic};
 use crate::brains::{AgentLearner, AgentPolicy, AgentValue};
 use crate::ui::LogText;
 use crate::{
-    brains::learners::ppo::rollout_buffer::{store_sarts, PpoMetadata},
+    brains::learners::ppo::rollout_buffer::store_sarts,
     envs::{check_dead, update},
     names, FrameStack, Timestamp,
 };
@@ -250,7 +248,7 @@ impl Env for Tdm {
     }
 
     fn action_system() -> SystemConfigs {
-        get_action::<Tdm, AgentPolicy, AgentValue>.chain()
+        get_action::<Tdm, AgentPolicy>.chain()
     }
 
     fn reward_system() -> SystemConfigs {

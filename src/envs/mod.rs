@@ -7,11 +7,7 @@ use std::{
 
 use crate::{
     brains::{
-        learners::{
-            ppo::{rollout_buffer::PpoMetadata, PpoStatus},
-            utils::RmsNormalize,
-            Learner, Sart, DEVICE,
-        },
+        learners::{ppo::PpoStatus, utils::RmsNormalize, Learner, DEVICE},
         models::{Policy, ValueEstimator},
     },
     ui::LogText,
@@ -501,33 +497,24 @@ impl<E: Env, P: Policy, V: ValueEstimator, L: Learner<E>> AgentBundle<E, P, V, L
     }
 }
 
-pub fn get_action<E: Env, P: Policy, V: ValueEstimator>(
+pub fn get_action<E: Env, P: Policy>(
     params: Res<E::Params>,
-    mut obs_brains_actions: Query<
-        (
-            &FrameStack<Box<[f32]>>,
-            &P,
-            &V,
-            &mut E::Action,
-            &mut EntropyComponent<ChaCha8Rng>,
-        ),
-        With<Agent>,
-    >,
+    mut obs_brains_actions: Query<(&FrameStack<Box<[f32]>>, &P, &mut E::Action), With<Agent>>,
     frame_count: Res<FrameCount>,
 ) where
     E::Action: Action<E, Logits = P::Logits>,
 {
     if frame_count.0 as usize % params.agent_frame_stack_len() == 0 {
-        obs_brains_actions.par_iter_mut().for_each_mut(
-            |(fs, policy, value, mut actions, mut rng)| {
+        obs_brains_actions
+            .par_iter_mut()
+            .for_each_mut(|(fs, policy, mut actions)| {
                 let obs = fs.as_tensor();
                 let (action, logits) = policy.act(&obs).unwrap();
                 *actions = <E::Action as Action<E>>::from_slice(
                     action.squeeze(0).unwrap().to_vec1().unwrap().as_slice(),
                     logits,
                 );
-            },
-        );
+            });
     }
 }
 
@@ -644,6 +631,7 @@ pub fn learn<E: Env, L: Learner<E>, P: Policy, V: ValueEstimator>(
         With<Agent>,
     >,
     frame_count: Res<FrameCount>,
+    mut writers: Query<&mut TbWriter, With<Agent>>,
     mut log: ResMut<LogText>,
 ) where
     L: Learner<E, Status = PpoStatus>,
@@ -665,8 +653,10 @@ pub fn learn<E: Env, L: Learner<E>, P: Policy, V: ValueEstimator>(
                 learner.learn(policy, value, &*rb, &mut rng);
             },
         );
-        for (_, _, name, learner, _, _, _) in query.iter() {
+        for (agent, _, name, learner, _, _, _) in query.iter() {
             let status = learner.status();
+            use crate::brains::learners::Status;
+            status.log(&mut writers.get_mut(agent).unwrap(), frame_count.0 as usize);
             log.push(format!("{} Policy Loss: {}", name.0, status.policy_loss));
             log.push(format!(
                 "{} Policy Entropy: {}",

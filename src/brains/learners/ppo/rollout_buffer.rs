@@ -8,7 +8,7 @@ use rand::seq::SliceRandom;
 
 use crate::{
     brains::{
-        learners::{Buffer, Learner, Sart},
+        learners::{Buffer, Sart},
         models::{Policy, ValueEstimator},
     },
     envs::{Action, Agent, Env, Params, Reward, StepMetadata, Terminal},

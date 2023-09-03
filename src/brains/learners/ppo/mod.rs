@@ -7,22 +7,14 @@ use bevy_rand::prelude::EntropyComponent;
 use itertools::Itertools;
 
 use crate::brains::models::{Policy, ValueEstimator};
-use crate::envs::Params;
-use crate::{
-    envs::{Action, Env},
-    FrameStack,
-};
+use crate::envs::{Action, Env};
 
-use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{AdamW, Linear, Module, Optimizer, VarBuilder, VarMap};
+use candle_core::{DType, Result, Tensor};
 
-use self::rollout_buffer::{PpoBuffer, PpoMetadata};
+use self::rollout_buffer::PpoBuffer;
 
 use super::Buffer;
-use super::{
-    utils::{linear, MvNormal, ResBlock},
-    Learner, Status, DEVICE,
-};
+use super::{Learner, Status, DEVICE};
 
 pub mod rollout_buffer;
 
@@ -263,7 +255,7 @@ impl<E: Env> Learner<E> for Ppo {
                         let loss = (policy_loss + (value_loss * 0.5).unwrap()).unwrap();
 
                         total_policy_batches += 1;
-                        let mut grads = loss.backward().unwrap();
+                        let grads = loss.backward().unwrap();
 
                         // // gradient clip-by-norm
                         // for var in self.varmap.all_vars().iter() {
