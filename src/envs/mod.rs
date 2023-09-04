@@ -7,8 +7,15 @@ use std::{
 
 use crate::{
     brains::{
-        learners::{ppo::PpoStatus, utils::RmsNormalize, Learner, DEVICE},
+        learners::{
+            // ppo::{rollout_buffer::PpoBuffer, PpoStatus},
+            utils::RmsNormalize,
+            Learner,
+            OffPolicyBuffer,
+            DEVICE,
+        },
         models::{Policy, ValueEstimator},
+        AgentPolicy, Policies, ValueEstimators,
     },
     ui::LogText,
     FrameStack, TbWriter, Timestamp,
@@ -36,6 +43,19 @@ pub trait StepMetadata: Default {
     ) -> Self
     where
         E::Action: Action<E, Logits = P::Logits>;
+}
+
+impl StepMetadata for () {
+    fn calculate<E: Env, P: Policy, V: ValueEstimator>(
+        obs: &FrameStack<Box<[f32]>>,
+        action: &E::Action,
+        policy: &P,
+        value: &V,
+    ) -> Self
+    where
+        E::Action: Action<E, Logits = P::Logits>,
+    {
+    }
 }
 
 pub trait Action<E: Env + ?Sized>: Clone + Default {
@@ -402,7 +422,7 @@ pub struct Deaths(pub usize);
 pub struct Name(pub String);
 
 #[derive(Bundle)]
-pub struct AgentBundle<E: Env, P: Policy, V: ValueEstimator, L: Learner<E>> {
+pub struct AgentBundle<E: Env> {
     pub rb: RigidBody,
     pub col: Collider,
     pub rest: Restitution,
@@ -417,29 +437,21 @@ pub struct AgentBundle<E: Env, P: Policy, V: ValueEstimator, L: Learner<E>> {
     pub kills: Kills,
     pub deaths: Deaths,
     pub name: Name,
-    pub policy: P,
-    pub value: V,
     pub writer: TbWriter,
     pub obs: FrameStack<Box<[f32]>>,
     pub obs_norm: RmsNormalize,
     pub action: E::Action,
-    pub learner: L,
-    pub replay_buffer: L::Buffer,
     pub reward: Reward,
     pub running_reward: RunningReturn,
     pub terminal: Terminal,
     pub rng: EntropyComponent<ChaCha8Rng>,
     marker: Agent,
 }
-impl<E: Env, P: Policy, V: ValueEstimator, L: Learner<E>> AgentBundle<E, P, V, L> {
+impl<E: Env> AgentBundle<E> {
     pub fn new(
         pos: Vec3,
         color: Option<Color>,
         name: String,
-        policy: P,
-        value: V,
-        learner: L,
-        buffer: L::Buffer,
         timestamp: &Timestamp,
         mut meshes: Mut<Assets<Mesh>>,
         mut materials: Mut<Assets<ColorMaterial>>,
@@ -450,17 +462,13 @@ impl<E: Env, P: Policy, V: ValueEstimator, L: Learner<E>> AgentBundle<E, P, V, L
         let mut writer = TbWriter::default();
         writer.init(Some(name.as_str()), timestamp);
         Self {
-            policy,
-            value,
             writer,
-            learner,
             rng: EntropyComponent::from(rng),
             obs: FrameStack(
                 vec![vec![0.0; obs_len].into_boxed_slice(); params.agent_frame_stack_len()].into(),
             ),
             obs_norm: RmsNormalize::new(&[obs_len]).unwrap(),
             action: E::Action::default(),
-            replay_buffer: buffer,
             reward: Reward(0.0),
             running_reward: RunningReturn::new(params.agent_update_interval()),
             terminal: Terminal(false),
@@ -499,17 +507,18 @@ impl<E: Env, P: Policy, V: ValueEstimator, L: Learner<E>> AgentBundle<E, P, V, L
 
 pub fn get_action<E: Env, P: Policy>(
     params: Res<E::Params>,
-    mut obs_brains_actions: Query<(&FrameStack<Box<[f32]>>, &P, &mut E::Action), With<Agent>>,
+    policies: Res<Policies<P>>,
+    mut obs_brains_actions: Query<(&FrameStack<Box<[f32]>>, &AgentId, &mut E::Action), With<Agent>>,
     frame_count: Res<FrameCount>,
 ) where
-    E::Action: Action<E, Logits = P::Logits>,
+    E::Action: Action<E, Logits = <P as Policy>::Logits>,
 {
     if frame_count.0 as usize % params.agent_frame_stack_len() == 0 {
         obs_brains_actions
             .par_iter_mut()
-            .for_each_mut(|(fs, policy, mut actions)| {
+            .for_each_mut(|(fs, id, mut actions)| {
                 let obs = fs.as_tensor();
-                let (action, logits) = policy.act(&obs).unwrap();
+                let (action, logits) = policies.0.get(id.0).unwrap().act(&obs).unwrap();
                 *actions = <E::Action as Action<E>>::from_slice(
                     action.squeeze(0).unwrap().to_vec1().unwrap().as_slice(),
                     logits,
@@ -518,7 +527,7 @@ pub fn get_action<E: Env, P: Policy>(
     }
 }
 
-pub fn send_reward<E: Env, T: Learner<E>>(
+pub fn send_reward<E: Env, P: Policy, V: ValueEstimator>(
     params: Res<E::Params>,
     agents: Query<Entity, With<Agent>>,
     frame_count: Res<FrameCount>,
@@ -529,7 +538,7 @@ pub fn send_reward<E: Env, T: Learner<E>>(
     for agent_ent in agents.iter() {
         let reward = rewards.get(agent_ent).unwrap().0;
         let running = running_rewards.get_mut(agent_ent).unwrap().update(reward);
-        if frame_count.0 as usize >= params.agent_warmup()
+        if frame_count.0 as usize > params.agent_warmup() + params.training_batch_size()
             && frame_count.0 as usize % params.agent_frame_stack_len() == 0
         {
             writers.get_mut(agent_ent).unwrap().add_scalar(
@@ -615,55 +624,38 @@ pub fn check_dead<E: Env>(
     }
 }
 
-pub fn learn<E: Env, L: Learner<E>, P: Policy, V: ValueEstimator>(
+pub fn learn<E: Env, P: Policy, V: ValueEstimator, L: Learner<E, P, V>>(
     params: Res<E::Params>,
-    obs: Query<&FrameStack<Box<[f32]>>, With<Agent>>,
-    mut query: Query<
-        (
-            Entity,
-            &mut EntropyComponent<ChaCha8Rng>,
-            &Name,
-            &mut L,
-            &mut L::Buffer,
-            &P,
-            &V,
-        ),
-        With<Agent>,
-    >,
+    mut learner: ResMut<L>,
+    policies: Res<Policies<P>>,
+    values: Res<ValueEstimators<V>>,
+    query: Query<(Entity, &Name), With<Agent>>,
     frame_count: Res<FrameCount>,
     mut writers: Query<&mut TbWriter, With<Agent>>,
     mut log: ResMut<LogText>,
 ) where
-    L: Learner<E, Status = PpoStatus>,
+    L: Learner<E, P, V>,
+    L::Buffer: OffPolicyBuffer<E>,
 {
-    if frame_count.0 as usize >= params.agent_warmup()
+    if frame_count.0 as usize
+        > params.agent_warmup()
+            // + (params.training_batch_size() + 1)
+            //     * params.agent_frame_stack_len()
+            //     * params.num_agents()
         && frame_count.0 as usize % params.agent_update_interval() == 0
     {
-        query.par_iter_mut().for_each_mut(
-            |(ent, mut rng, _name, mut learner, mut rb, policy, value)| {
-                let val: f32 = value
-                    .estimate_value(&obs.get(ent).unwrap().as_tensor())
-                    .unwrap()
-                    .reshape(())
-                    .unwrap()
-                    .to_scalar()
-                    .unwrap();
-                use crate::brains::learners::Buffer;
-                rb.finish_trajectory(Some(val));
-                learner.learn(policy, value, &*rb, &mut rng);
-            },
-        );
-        for (agent, _, name, learner, _, _, _) in query.iter() {
+        learner.learn(policies.0.as_slice(), values.0.as_slice());
+        for (agent, name) in query.iter() {
             let status = learner.status();
             use crate::brains::learners::Status;
             status.log(&mut writers.get_mut(agent).unwrap(), frame_count.0 as usize);
-            log.push(format!("{} Policy Loss: {}", name.0, status.policy_loss));
-            log.push(format!(
-                "{} Policy Entropy: {}",
-                name.0, status.entropy_loss
-            ));
-            log.push(format!("{} Policy Clip Ratio: {}", name.0, status.nclamp));
-            log.push(format!("{} Value Loss: {}", name.0, status.value_loss));
+            //     log.push(format!("{} Policy Loss: {}", name.0, status.policy_loss));
+            //     log.push(format!(
+            //         "{} Policy Entropy: {}",
+            //         name.0, status.entropy_loss
+            //     ));
+            //     log.push(format!("{} Policy Clip Ratio: {}", name.0, status.nclamp));
+            //     log.push(format!("{} Value Loss: {}", name.0, status.value_loss));
         }
     }
 }

@@ -8,10 +8,13 @@ use rand::seq::SliceRandom;
 
 use crate::{
     brains::{
-        learners::{Buffer, Sart},
+        learners::{
+            maddpg::replay_buffer::{MaddpgBuffer, MaddpgMetadata},
+            Buffer, OnPolicyBuffer, Sart,
+        },
         models::{Policy, ValueEstimator},
     },
-    envs::{Action, Agent, Env, Params, Reward, StepMetadata, Terminal},
+    envs::{Action, Agent, AgentId, Env, Params, Reward, StepMetadata, Terminal},
     FrameStack,
 };
 
@@ -34,7 +37,7 @@ impl StepMetadata for PpoMetadata {
         let obs = obs.as_tensor();
         Self {
             val: value
-                .estimate_value(&obs)
+                .estimate_value(&obs, Some(&action.as_tensor()))
                 .unwrap()
                 .reshape(())
                 .unwrap()
@@ -57,7 +60,7 @@ impl StepMetadata for PpoMetadata {
 #[derive(Component)]
 pub struct PpoBuffer<E: Env>
 where
-    Self: Buffer<E>,
+    Self: OnPolicyBuffer<E>,
 {
     pub max_len: Option<usize>,
     pub obs: VecDeque<FrameStack<Box<[f32]>>>,
@@ -139,7 +142,8 @@ impl<E: Env> Buffer<E> for PpoBuffer<E> {
         self.advantage.push_back(None);
         self.metadata.push_back(metadata);
     }
-
+}
+impl<E: Env> OnPolicyBuffer<E> for PpoBuffer<E> {
     fn finish_trajectory(&mut self, final_val: Option<f32>) {
         let endpoint = self.obs.len();
         let mut vals = self.metadata.iter().map(|m| m.val).collect_vec();

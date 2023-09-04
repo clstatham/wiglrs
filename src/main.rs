@@ -13,7 +13,13 @@ use bevy_prng::ChaCha8Rng;
 use bevy_rapier2d::prelude::*;
 
 use bevy_rand::prelude::*;
-use brains::learners::DEVICE;
+use brains::{
+    learners::{
+        maddpg::{replay_buffer::MaddpgBuffer, MaddpgStatus},
+        DEVICE,
+    },
+    AgentLearner, AgentPolicy, AgentValue, Policies, ValueEstimators,
+};
 use candle_core::Tensor;
 use envs::{
     maps::tdm::TdmMap,
@@ -96,6 +102,10 @@ impl FrameStack<Box<[f32]>> {
             obs.push(Tensor::new(&**frame, &DEVICE).unwrap());
         }
         Tensor::stack(&obs, 0).unwrap().unsqueeze(0).unwrap()
+    }
+
+    pub fn as_flat_tensor(&self) -> Tensor {
+        self.as_tensor().flatten_all().unwrap()
     }
 }
 
@@ -186,6 +196,17 @@ fn run_env<E: crate::envs::Env, M: crate::envs::maps::Map>(
     std::fs::create_dir_all(&p).ok();
     p.push("env.yaml");
     params.to_yaml_file(p).ok();
+
+    let learner: AgentLearner<E> = AgentLearner {
+        gamma: 0.99,
+        tau: 0.01,
+        // soft_update_interval: 100,
+        steps_done: 0,
+        batch_size: params.training_batch_size(),
+        buffer: MaddpgBuffer::new(params.num_agents(), Some(params.agent_rb_max_len())),
+        status: MaddpgStatus::default(),
+    };
+
     let mut app = App::new();
     app.insert_resource(Msaa::default())
         .insert_resource(WinitSettings {
@@ -193,6 +214,9 @@ fn run_env<E: crate::envs::Env, M: crate::envs::maps::Map>(
             ..default()
         })
         .insert_resource(ts)
+        .insert_resource(Policies(Vec::<AgentPolicy>::new()))
+        .insert_resource(ValueEstimators(Vec::<AgentValue>::new()))
+        .insert_resource(learner)
         .insert_resource(ui::LogText::default())
         .insert_resource(ClearColor(Color::DARK_GRAY))
         .add_plugins(EntropyPlugin::<ChaCha8Rng>::with_seed(seed))
@@ -251,12 +275,13 @@ fn main() {
 
     match env {
         EnvKind::Tdm => {
-            let params = match TdmParams::from_yaml_file("tdm.yaml").ok() {
-                Some(params) => {
+            let params = match TdmParams::from_yaml_file("tdm.yaml") {
+                Ok(params) => {
                     println!("Loaded environment parameters:\n{:?}", params);
                     params
                 }
-                None => {
+                Err(e) => {
+                    dbg!(e);
                     println!("Using default environment parameters.");
                     Default::default()
                 }

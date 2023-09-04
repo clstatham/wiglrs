@@ -1,4 +1,4 @@
-use bevy::prelude::Component;
+use bevy::prelude::{Component, Resource};
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 use candle_core::Device;
@@ -10,7 +10,9 @@ use crate::{
 
 use super::models::{Policy, ValueEstimator};
 
-pub mod ppo;
+pub mod maddpg;
+// pub mod coma;
+// pub mod ppo;
 pub mod utils;
 
 lazy_static::lazy_static! {
@@ -25,17 +27,11 @@ impl Status for () {
     fn log(&self, _writer: &mut TbWriter, _step: usize) {}
 }
 
-pub trait Learner<E: Env>: Component {
+pub trait Learner<E: Env, P: Policy, V: ValueEstimator>: Resource {
     type Buffer: Buffer<E>;
-    type Status: Status + Clone + Default + Component;
+    type Status: Status + Clone + Default;
 
-    fn learn<P: Policy, V: ValueEstimator>(
-        &mut self,
-        policy: &P,
-        value: &V,
-        buffer: &Self::Buffer,
-        rng: &mut EntropyComponent<ChaCha8Rng>,
-    );
+    fn learn(&mut self, policies: &[P], values: &[V]);
     fn status(&self) -> Self::Status;
 }
 
@@ -60,13 +56,16 @@ impl<E: Env, M: StepMetadata> Sart<E, M> {
     }
 }
 
-pub trait Buffer<E: Env>: Clone + Component {
+pub trait Buffer<E: Env>: Clone + Resource {
     type Metadata: StepMetadata;
     fn remember_sart(&mut self, step: Sart<E, Self::Metadata>);
+}
+
+pub trait OnPolicyBuffer<E: Env>: Buffer<E> {
     fn finish_trajectory(&mut self, final_val: Option<f32>);
-    fn shuffled_and_batched(
-        &self,
-        batch_size: usize,
-        rng: &mut EntropyComponent<ChaCha8Rng>,
-    ) -> Vec<Self>;
+    fn shuffled_and_batched(&self, batch_size: usize) -> Vec<Self>;
+}
+
+pub trait OffPolicyBuffer<E: Env>: Buffer<E> {
+    fn sample(&self, batch_size: usize) -> Self;
 }

@@ -1,11 +1,12 @@
 #![allow(clippy::single_range_in_vec_init)]
 
-use bevy::prelude::Component;
+use bevy::prelude::{Component, Resource};
 use bevy_prng::ChaCha8Rng;
 use bevy_rand::prelude::EntropyComponent;
 
 use itertools::Itertools;
 
+use crate::brains::learners::OnPolicyBuffer;
 use crate::brains::models::{Policy, ValueEstimator};
 use crate::envs::{Action, Env};
 
@@ -49,7 +50,7 @@ impl Status for PpoStatus {
     }
 }
 
-#[derive(Component)]
+#[derive(Resource)]
 pub struct Ppo {
     status: PpoStatus,
     training_epochs: usize,
@@ -72,7 +73,7 @@ impl Ppo {
     }
 }
 
-impl<E: Env> Learner<E> for Ppo {
+impl<E: Env, P: Policy, V: ValueEstimator> Learner<E, P, V> for Ppo {
     type Status = PpoStatus;
     type Buffer = PpoBuffer<E>;
 
@@ -80,7 +81,7 @@ impl<E: Env> Learner<E> for Ppo {
         self.status.clone()
     }
 
-    fn learn<P: Policy, V: ValueEstimator>(
+    fn learn(
         &mut self,
         policy: &P,
         value: &V,
@@ -234,7 +235,7 @@ impl<E: Env> Learner<E> for Ppo {
 
                 total_pi_loss.push(pl);
 
-                let val = value.estimate_value(&s).unwrap();
+                let val = value.estimate_value(&s, Some(&a)).unwrap();
                 let value_loss = (&val - &returns).unwrap().sqr().unwrap().mean(0).unwrap();
                 let vl = value_loss.to_scalar().unwrap();
                 total_val_loss.push(vl);
@@ -250,7 +251,7 @@ impl<E: Env> Learner<E> for Ppo {
                 .unwrap();
                 total_explained_var.push(explained_var);
 
-                if pl.is_normal() && vl.is_normal() && kl.is_finite() && !kl.is_nan() {
+                if pl.is_finite() && vl.is_finite() && kl.is_finite() {
                     if kl <= 0.02 * 1.5 {
                         let loss = (policy_loss + (value_loss * 0.5).unwrap()).unwrap();
 
@@ -293,13 +294,13 @@ impl<E: Env> Learner<E> for Ppo {
                     // eprintln!("cov: {:?}\n", cov.to_vec2::<f32>().ok());
                     eprintln!("lp: {:?}\n", lp.to_vec1::<f32>().ok());
 
-                    if !pl.is_normal() {
+                    if !pl.is_finite() {
                         panic!("pl={pl}");
                     }
-                    if !vl.is_normal() {
+                    if !vl.is_finite() {
                         panic!("vl={vl}");
                     }
-                    if !kl.is_normal() {
+                    if !kl.is_finite() {
                         panic!("kl={kl}");
                     }
                 }
