@@ -21,14 +21,7 @@ use brains::{
     AgentLearner, AgentPolicy, AgentValue, Policies, ValueEstimators,
 };
 use candle_core::Tensor;
-use envs::{
-    maps::tdm::TdmMap,
-    tdm::{Tdm, TdmParams},
-    Env,
-    // tdm::Tdm,
-    Params,
-};
-use serde::Serialize;
+use envs::{maps::tdm::TdmMap, tdm::Tdm, Env, Params};
 use tensorboard_rs::summary_writer::SummaryWriter;
 use ui::LogText;
 
@@ -186,10 +179,8 @@ fn run_env<E: crate::envs::Env, M: crate::envs::maps::Map>(
     seed: [u8; 32],
     env: E,
     _map: M,
-    params: E::Params,
-) where
-    E::Params: Serialize,
-{
+    params: Params,
+) {
     let ts = Timestamp::default();
     let mut p = Path::new("./training").to_path_buf();
     p.push(ts.to_string());
@@ -202,8 +193,11 @@ fn run_env<E: crate::envs::Env, M: crate::envs::maps::Map>(
         tau: 0.01,
         // soft_update_interval: 100,
         steps_done: 0,
-        batch_size: params.training_batch_size(),
-        buffer: MaddpgBuffer::new(params.num_agents(), Some(params.agent_rb_max_len())),
+        batch_size: params.get_int("agent_training_batch_size").unwrap() as usize,
+        buffer: MaddpgBuffer::new(
+            params.get_int("num_agents").unwrap() as usize,
+            Some(params.get_int("agent_rb_max_len").unwrap() as usize),
+        ),
         status: MaddpgStatus::default(),
     };
 
@@ -275,17 +269,7 @@ fn main() {
 
     match env {
         EnvKind::Tdm => {
-            let params = match TdmParams::from_yaml_file("tdm.yaml") {
-                Ok(params) => {
-                    println!("Loaded environment parameters:\n{:?}", params);
-                    params
-                }
-                Err(e) => {
-                    dbg!(e);
-                    println!("Using default environment parameters.");
-                    Default::default()
-                }
-            };
+            let params = Params::from_yaml_file("tdm.yaml").unwrap();
             run_env(bevy_seed, Tdm::init(), TdmMap, params);
         }
     }

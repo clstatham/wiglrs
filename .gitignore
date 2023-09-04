@@ -1,6 +1,4 @@
 /target
 /training
 profile.json
-/burn
-/dfdx
 *.dot

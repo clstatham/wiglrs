@@ -1,19 +1,14 @@
 use bevy::prelude::*;
-use bevy_prng::ChaCha8Rng;
-use bevy_rand::prelude::EntropyComponent;
 use itertools::Itertools;
 
 use crate::{
-    brains::models::{
-        CentralizedCritic, CompoundPolicy, CopyWeights, CriticWithTarget, Policy, PolicyWithTarget,
-        ValueEstimator,
-    },
+    brains::models::{CopyWeights, CriticWithTarget, Policy, PolicyWithTarget, ValueEstimator},
     envs::{Action, Env},
 };
 
 use candle_core::{IndexOp, Tensor};
 
-use self::replay_buffer::{MaddpgBuffer, MaddpgBufferInner};
+use self::replay_buffer::MaddpgBuffer;
 
 use super::{Learner, OffPolicyBuffer, Status, DEVICE};
 

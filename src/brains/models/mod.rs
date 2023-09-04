@@ -1,11 +1,7 @@
-use std::{
-    ops::Deref,
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
-};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use bevy::prelude::Component;
-use candle_core::{backprop::GradStore, IndexOp, Result, Tensor};
-use itertools::Itertools;
+use candle_core::{backprop::GradStore, Result, Tensor};
 
 pub mod deterministic_mlp;
 pub mod linear_resnet;
@@ -62,134 +58,6 @@ impl<C: ValueEstimator> ValueEstimator for CentralizedCritic<C> {
 
     fn apply_gradients(&self, grads: &GradStore) -> Result<()> {
         self.get().apply_gradients(grads)
-    }
-}
-
-#[derive(Component)]
-pub struct CompoundPolicy<P: Policy> {
-    policies: Vec<Arc<RwLock<P>>>,
-}
-
-impl<P: Policy> Clone for CompoundPolicy<P> {
-    fn clone(&self) -> Self {
-        Self {
-            policies: self.policies.clone(),
-        }
-    }
-}
-
-impl<P: Policy> CompoundPolicy<P> {
-    pub fn new() -> Self {
-        Self {
-            policies: Vec::new(),
-        }
-    }
-
-    pub fn push(&mut self, policy: P) -> usize {
-        let id = self.policies.len();
-        self.policies.push(Arc::new(RwLock::new(policy)));
-        id
-    }
-
-    pub fn len(&self) -> usize {
-        self.policies.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn get(&self, i: usize) -> Option<RwLockReadGuard<'_, P>> {
-        self.policies.get(i).map(|p| p.as_ref().read().unwrap())
-    }
-
-    pub fn get_mut(&self, i: usize) -> Option<RwLockWriteGuard<'_, P>> {
-        self.policies.get(i).map(|p| p.as_ref().write().unwrap())
-    }
-}
-
-impl<P: Policy> Default for CompoundPolicy<P> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<P: Policy> Policy for CompoundPolicy<P> {
-    type Logits = P::Logits;
-    type Status = P::Status;
-
-    fn action_logits(&self, obs: &Tensor) -> Result<Self::Logits> {
-        // assert_eq!(obs.shape().dims()[0], self.len());
-        // let logits_vec = self
-        //     .policies
-        //     .iter()
-        //     .enumerate()
-        //     .map(|(i, p)| {
-        //         let obs = obs.i(i).unwrap();
-        //         p.read().unwrap().action_logits(&obs).unwrap()
-        //     })
-        //     .collect_vec();
-        // Ok(logits_vec)
-        unimplemented!()
-    }
-
-    fn act(&self, obs: &Tensor) -> Result<(Tensor, Self::Logits)> {
-        // assert_eq!(obs.shape().dims()[0], self.len());
-        // let (actions, logits): (Vec<_>, Vec<_>) = self
-        //     .policies
-        //     .iter()
-        //     .map(|p| p.read().unwrap().act(obs).unwrap())
-        //     .multiunzip();
-        // let actions = Tensor::stack(&actions, 0)?;
-        // Ok((actions, logits))
-        unimplemented!()
-    }
-
-    fn log_prob(&self, logits: &Self::Logits, action: &Tensor) -> Result<Tensor> {
-        // assert_eq!(action.shape().dims()[0], self.len());
-        // assert_eq!(logits.len(), self.len());
-        // let lp_vec = self
-        //     .policies
-        //     .iter()
-        //     .zip(logits.iter())
-        //     .enumerate()
-        //     .map(|(i, (p, l))| {
-        //         let action = action.i(i).unwrap();
-        //         p.read().unwrap().log_prob(l, &action).unwrap()
-        //     })
-        //     .collect_vec();
-        // Tensor::stack(&lp_vec, 0)
-        unimplemented!()
-    }
-
-    fn entropy(&self, logits: &Self::Logits) -> Result<Tensor> {
-        // assert_eq!(logits.len(), self.len());
-        // let entropy_vec = self
-        //     .policies
-        //     .iter()
-        //     .zip(logits.iter())
-        //     .map(|(p, l)| p.read().unwrap().entropy(l).unwrap())
-        //     .collect_vec();
-        // Tensor::stack(&entropy_vec, 0)
-        unimplemented!()
-    }
-
-    fn apply_gradients(&self, grads: &GradStore) -> Result<()> {
-        // for policy in self.policies.iter() {
-        //     policy.read().unwrap().apply_gradients(grads)?;
-        // }
-        // Ok(())
-        unimplemented!()
-    }
-
-    fn status(&self) -> Option<Self::Status> {
-        // Some(
-        //     self.policies
-        //         .iter()
-        //         .map(|p| p.read().unwrap().status().unwrap())
-        //         .collect_vec(),
-        // )
-        unimplemented!()
     }
 }
 

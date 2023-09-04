@@ -1,6 +1,4 @@
 use bevy::{core::FrameCount, prelude::*};
-use bevy_prng::ChaCha8Rng;
-use bevy_rand::prelude::EntropyComponent;
 use itertools::Itertools;
 use rand_distr::Distribution;
 
@@ -148,14 +146,14 @@ pub struct MaddpgMetadata {
 }
 
 impl StepMetadata for MaddpgMetadata {
-    fn calculate<E: Env, P: Policy, V: ValueEstimator>(
-        obs: &FrameStack<Box<[f32]>>,
-        action: &E::Action,
-        policy: &P,
-        value: &V,
+    fn calculate<A, P: Policy, V: ValueEstimator>(
+        _obs: &FrameStack<Box<[f32]>>,
+        _action: &A,
+        _policy: &P,
+        _value: &V,
     ) -> Self
     where
-        E::Action: Action<E, Logits = P::Logits>,
+        A: Action<Logits = P::Logits>,
     {
         unimplemented!()
     }
@@ -234,7 +232,7 @@ impl<E: Env> OffPolicyBuffer<E> for MaddpgBuffer<E> {
 }
 
 pub fn store_sarts<E: Env, P: Policy, V: ValueEstimator>(
-    params: Res<E::Params>,
+    params: Res<Params>,
     observations: Query<&FrameStack<Box<[f32]>>, With<Agent>>,
     actions: Query<&E::Action, With<Agent>>,
     mut rewards: Query<(&mut Reward, &mut RmsNormalize), With<Agent>>,
@@ -244,10 +242,10 @@ pub fn store_sarts<E: Env, P: Policy, V: ValueEstimator>(
     agent_ids: Query<&AgentId, With<Agent>>,
     frame_count: Res<FrameCount>,
 ) where
-    E::Action: Action<E, Logits = P::Logits>,
+    E::Action: Action<Logits = P::Logits>,
 {
-    if frame_count.0 as usize % params.agent_frame_stack_len() == 0 {
-        if frame_count.0 as usize > params.agent_warmup() {
+    if frame_count.0 as usize % params.get_int("agent_frame_stack_len").unwrap() as usize == 0 {
+        if frame_count.0 as usize > params.get_int("agent_warmup").unwrap() as usize {
             for agent_ent in agents.iter() {
                 let (action, reward, terminal) = (
                     actions.get(agent_ent).unwrap().clone(),

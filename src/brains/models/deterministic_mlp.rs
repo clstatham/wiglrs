@@ -25,6 +25,7 @@ use super::{CopyWeights, Policy, PolicyWithTarget, ValueEstimator};
 #[derive(Clone)]
 pub struct DeterministicMlpActorStatus {
     pub action: Box<[f32]>,
+    pub std: f32,
 }
 
 #[derive(Component)]
@@ -61,6 +62,7 @@ impl DeterministicMlpActor {
             layers,
             optim,
             status: Mutex::new(DeterministicMlpActorStatus {
+                std: 1.0,
                 action: vec![0.0f32; last_out].into_boxed_slice(),
             }),
         }
@@ -78,22 +80,26 @@ impl Policy for DeterministicMlpActor {
         for layer in self.layers[..n_layers - 1].iter() {
             x = layer.forward(&x)?.tanh()?;
         }
-        x = self.layers[n_layers - 1].forward(&x)?;
+        x = self.layers[n_layers - 1].forward(&x)?.tanh()?;
         Ok(x)
     }
 
     fn act(&self, obs: &Tensor) -> Result<(Tensor, Self::Logits)> {
         let logits = self.action_logits(obs)?;
-        self.status.lock().unwrap().action = logits.squeeze(0)?.to_vec1()?.into_boxed_slice();
-        let logits = (&logits + logits.randn_like(0.0, 0.1)?)?;
-        Ok((logits.clone(), logits))
+        let mut status = self.status.lock().unwrap();
+        status.action = logits.squeeze(0)?.to_vec1()?.into_boxed_slice();
+        let actions = (&logits + logits.randn_like(0.0, status.std as f64)?)?;
+        if status.std > 0.05 {
+            status.std *= 0.99998;
+        }
+        Ok((actions, logits))
     }
 
-    fn log_prob(&self, logits: &Self::Logits, action: &Tensor) -> Result<Tensor> {
+    fn log_prob(&self, _logits: &Self::Logits, _action: &Tensor) -> Result<Tensor> {
         unimplemented!()
     }
 
-    fn entropy(&self, logits: &Self::Logits) -> Result<Tensor> {
+    fn entropy(&self, _logits: &Self::Logits) -> Result<Tensor> {
         unimplemented!()
     }
 
@@ -238,6 +244,7 @@ pub fn action_space_ui<E: Env>(
                                     action.push_str(&format!(" {:.4}", a));
                                 }
                                 ui.label(action);
+                                ui.label(format!("std: {}", status.std));
                                 // });
 
                                 // ui.horizontal_top(|ui| {
@@ -247,15 +254,14 @@ pub fn action_space_ui<E: Env>(
                                     .iter()
                                     .enumerate()
                                     .map(|(i, a)| {
-                                        let m = Bar::new(i as f64, *a as f64)
-                                            // .fill(Color32::from_rgb(
-                                            //     (rg.x * 255.0) as u8,
-                                            //     (rg.y * 255.0) as u8,
-                                            //     0,
-                                            // ));
-                                            .fill(egui::Color32::RED);
-                                        m
-                                        // .width(1.0 - *std as f64 / 6.0)
+                                        let s = Line::new(vec![
+                                            [i as f64, *a as f64 - status.std as f64],
+                                            [i as f64, *a as f64 + status.std as f64],
+                                        ])
+                                        .stroke(egui::Stroke::new(4.0, egui::Color32::LIGHT_GREEN));
+                                        let m =
+                                            Bar::new(i as f64, *a as f64).fill(egui::Color32::RED);
+                                        (m, s)
                                     })
                                     .collect_vec();
 
@@ -274,7 +280,12 @@ pub fn action_space_ui<E: Env>(
                                             .show(
                                                 ui,
                                                 |plot| {
-                                                    plot.bar_chart(BarChart::new(ms));
+                                                    let (m, s): (Vec<_>, Vec<_>) =
+                                                        ms.into_iter().multiunzip();
+                                                    plot.bar_chart(BarChart::new(m));
+                                                    for s in s {
+                                                        plot.line(s);
+                                                    }
                                                 },
                                             );
                                         });

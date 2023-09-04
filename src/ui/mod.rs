@@ -2,13 +2,12 @@ use std::collections::VecDeque;
 
 use bevy::prelude::*;
 use bevy_egui::egui;
-use bevy_egui::egui::plot::{Bar, BarChart, Line};
+use bevy_egui::egui::plot::Line;
 use bevy_egui::EguiContexts;
 use itertools::Itertools;
 
-use crate::brains::models::linear_resnet::LinResActor;
 use crate::brains::models::{Policy, ValueEstimator};
-use crate::brains::AgentPolicy;
+
 use crate::envs::{Name, RunningReturn};
 use crate::{
     brains::learners::Learner,

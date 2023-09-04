@@ -1,130 +1,41 @@
 use std::f32::consts::PI;
 
-use crate::brains::learners::maddpg::replay_buffer::{store_sarts, MaddpgBuffer};
-use crate::brains::learners::maddpg::MaddpgStatus;
-use crate::brains::learners::utils::RmsNormalize;
-use crate::brains::learners::DEVICE;
-use crate::brains::models::deterministic_mlp::{DeterministicMlpActor, DeterministicMlpCritic};
-use crate::brains::models::linear_resnet::LinResCritic;
-use crate::brains::models::{
-    self, CentralizedCritic, CopyWeights, CriticWithTarget, PolicyWithTarget,
-};
-use crate::brains::{AgentLearner, AgentPolicy, AgentValue, Policies, ValueEstimators};
-use crate::ui::LogText;
 use crate::{
+    brains::{
+        learners::{maddpg::replay_buffer::store_sarts, utils::RmsNormalize, DEVICE},
+        models::{
+            self,
+            deterministic_mlp::{DeterministicMlpActor, DeterministicMlpCritic},
+            CopyWeights, CriticWithTarget, PolicyWithTarget,
+        },
+        AgentLearner, AgentPolicy, AgentValue, Policies, ValueEstimators,
+    },
     envs::{check_dead, update},
-    names, FrameStack, Timestamp,
+    names,
+    ui::LogText,
+    FrameStack, Timestamp,
 };
-use bevy::ecs::schedule::SystemConfigs;
-use bevy::math::Vec3Swizzles;
 use bevy::prelude::*;
+use bevy::{ecs::schedule::SystemConfigs, math::Vec3Swizzles};
 use bevy_prng::ChaCha8Rng;
-use bevy_rand::prelude::EntropyComponent;
-use bevy_rand::resource::GlobalEntropy;
+use bevy_rand::{prelude::EntropyComponent, resource::GlobalEntropy};
 use bevy_rapier2d::prelude::*;
 use candle_core::Tensor;
 use itertools::Itertools;
 use rand_distr::{Distribution, Uniform};
-use serde::{Deserialize, Serialize};
 
-use super::modules::{IdentityEmbedding, RelativePhysicalProperties};
-use super::AgentId;
 use super::{
     modules::{
         map_interaction::MapInteractionProperties, Behavior, CombatBehaviors, CombatProperties,
-        PhysicalBehaviors, PhysicalProperties, Property,
+        IdentityEmbedding, PhysicalBehaviors, PhysicalProperties, Property,
+        RelativePhysicalProperties,
     },
-    Action, DefaultFrameStack, Env, Observation, Params,
+    Action, AgentId, DefaultFrameStack, Env, Observation, Params,
     {
-        get_action, learn, send_reward, Agent, AgentBundle, Eyeballs, FfaParams, Health,
-        HealthBarBundle, Kills, Name, NameTextBundle, Reward, Terminal,
+        get_action, learn, send_reward, Agent, AgentBundle, Eyeballs, Health, HealthBarBundle,
+        Kills, Name, NameTextBundle, Reward, Terminal,
     },
 };
-
-#[derive(Resource, Debug, Clone, Serialize, Deserialize)]
-pub struct TdmParams {
-    pub ffa_params: FfaParams,
-    pub reward_for_friendly_fire: f32,
-    pub num_teams: usize,
-    pub team_colors: Vec<Color>,
-}
-
-impl TdmParams {
-    pub fn agents_per_team(&self) -> usize {
-        self.ffa_params.num_agents / self.num_teams
-    }
-}
-
-impl Params for TdmParams {
-    fn num_agents(&self) -> usize {
-        self.ffa_params.num_agents
-    }
-
-    fn agent_frame_stack_len(&self) -> usize {
-        self.ffa_params.agent_frame_stack_len
-    }
-
-    fn agent_radius(&self) -> f32 {
-        self.ffa_params.agent_radius
-    }
-
-    fn agent_max_health(&self) -> f32 {
-        self.ffa_params.agent_max_health
-    }
-
-    fn agent_warmup(&self) -> usize {
-        self.ffa_params.agent_warmup
-    }
-
-    fn actor_lr(&self) -> f64 {
-        self.ffa_params.agent_actor_lr
-    }
-
-    fn agent_rb_max_len(&self) -> usize {
-        self.ffa_params.agent_rb_max_len
-    }
-
-    fn critic_lr(&self) -> f64 {
-        self.ffa_params.agent_critic_lr
-    }
-
-    fn entropy_beta(&self) -> f32 {
-        self.ffa_params.agent_entropy_beta
-    }
-
-    fn training_batch_size(&self) -> usize {
-        self.ffa_params.agent_training_batch_size
-    }
-
-    fn training_epochs(&self) -> usize {
-        self.ffa_params.agent_training_epochs
-    }
-
-    fn agent_update_interval(&self) -> usize {
-        self.ffa_params.agent_update_interval
-    }
-}
-
-impl Default for TdmParams {
-    fn default() -> Self {
-        Self {
-            ffa_params: FfaParams {
-                num_agents: 6,
-                ..Default::default()
-            },
-            reward_for_friendly_fire: -10.0,
-            num_teams: 3,
-            team_colors: vec![
-                Color::RED,
-                Color::BLUE,
-                Color::GREEN,
-                Color::YELLOW,
-                Color::FUCHSIA,
-                Color::CYAN,
-            ],
-        }
-    }
-}
 
 #[derive(Component, Clone, Default)]
 pub struct TeammateObs {
@@ -180,47 +91,51 @@ impl Observation for TdmObs {
     }
 }
 
-impl DefaultFrameStack<Tdm> for TdmObs {
-    fn default_frame_stack(params: &TdmParams) -> crate::FrameStack<Self> {
+impl DefaultFrameStack for TdmObs {
+    fn default_frame_stack(params: &Params) -> crate::FrameStack<Self> {
+        let num_agents = params.get_int("num_agents").unwrap() as usize;
+        let agents_per_team = params.get_int("agents_per_team").unwrap() as usize;
         let this = Self {
-            ident: IdentityEmbedding::new(0, params.num_agents()),
+            ident: IdentityEmbedding::new(0, num_agents),
             phys: Default::default(),
             combat: Default::default(),
             map_interaction: Default::default(),
             teammates: vec![
                 TeammateObs {
-                    ident: IdentityEmbedding::new(0, params.num_agents()),
+                    ident: IdentityEmbedding::new(0, num_agents),
                     ..Default::default()
                 };
-                params.agents_per_team() - 1
+                agents_per_team - 1
             ],
             enemies: vec![
                 EnemyObs {
-                    ident: IdentityEmbedding::new(0, params.num_agents()),
+                    ident: IdentityEmbedding::new(0, num_agents),
                     ..Default::default()
                 };
-                params.agents_per_team() * (params.num_teams - 1)
+                agents_per_team * (num_agents / agents_per_team - 1)
             ],
         };
-        crate::FrameStack(vec![this; params.ffa_params.agent_frame_stack_len].into())
+        crate::FrameStack(
+            vec![this; params.get_int("agent_frame_stack_len").unwrap() as usize].into(),
+        )
     }
 }
 
 #[derive(Component, Default, Clone)]
 pub struct TdmAction
 where
-    Self: Action<Tdm>,
+    Self: Action,
 {
     pub phys: PhysicalBehaviors,
     pub combat: CombatBehaviors,
-    pub logits: Option<<Self as Action<Tdm>>::Logits>,
+    pub logits: Option<<Self as Action>::Logits>,
 }
 
 lazy_static::lazy_static! {
     pub static ref ACTION_LEN: usize = PhysicalBehaviors::len() + CombatBehaviors::len();
 }
 
-impl Action<Tdm> for TdmAction {
+impl Action for TdmAction {
     type Logits = Tensor;
     fn as_slice(&self) -> Box<[f32]> {
         let mut out = vec![];
@@ -245,12 +160,19 @@ impl Action<Tdm> for TdmAction {
 #[derive(Component)]
 pub struct TeamId(pub i32);
 
+pub const TEAM_COLORS: &[Color] = &[
+    Color::RED,
+    Color::BLUE,
+    Color::GREEN,
+    Color::YELLOW,
+    Color::FUCHSIA,
+    Color::CYAN,
+];
+
 #[derive(Resource)]
 pub struct Tdm;
 
 impl Env for Tdm {
-    type Params = TdmParams;
-
     type Observation = TdmObs;
 
     type Action = TdmAction;
@@ -268,11 +190,11 @@ impl Env for Tdm {
     }
 
     fn action_system() -> SystemConfigs {
-        get_action::<Tdm, AgentPolicy>.chain()
+        get_action::<TdmAction, AgentPolicy>.chain()
     }
 
     fn reward_system() -> SystemConfigs {
-        (get_reward, send_reward::<Tdm, AgentPolicy, AgentValue>).chain()
+        (get_reward, send_reward::<AgentPolicy, AgentValue>).chain()
     }
 
     fn terminal_system() -> SystemConfigs {
@@ -281,9 +203,9 @@ impl Env for Tdm {
 
     fn update_system() -> SystemConfigs {
         (
-            update::<Tdm>,
+            update,
             store_sarts::<Tdm, AgentPolicy, AgentValue>,
-            check_dead::<Tdm>,
+            check_dead,
         )
             .chain()
     }
@@ -296,7 +218,6 @@ impl Env for Tdm {
         use crate::ui::*;
         (
             kdr::<Tdm, AgentPolicy, AgentValue, AgentLearner<Tdm>>,
-            // action_space::<Tdm>,
             models::deterministic_mlp::action_space_ui::<Tdm>,
             log,
             running_reward,
@@ -306,7 +227,7 @@ impl Env for Tdm {
 }
 
 fn setup(
-    params: Res<TdmParams>,
+    params: Res<Params>,
     mut policies: ResMut<Policies<AgentPolicy>>,
     mut values: ResMut<ValueEstimators<AgentValue>>,
     mut commands: Commands,
@@ -316,27 +237,39 @@ fn setup(
     timestamp: Res<Timestamp>,
     mut rng: ResMut<GlobalEntropy<ChaCha8Rng>>,
 ) {
+    let num_agents = params.get_int("num_agents").unwrap() as usize;
+    let agents_per_team = params.get_int("agents_per_team").unwrap() as usize;
+    let num_teams = num_agents / agents_per_team;
+    let agent_hidden_dim = params.get_int("agent_hidden_dim").unwrap() as usize;
+    let agent_frame_stack_len = params.get_int("agent_frame_stack_len").unwrap() as usize;
+    let actor_lr = params.get_float("actor_lr").unwrap();
+    let critic_lr = params.get_float("critic_lr").unwrap();
+    let agent_max_health = params.get_float("agent_max_health").unwrap() as f32;
+    let agent_radius = params.get_float("agent_radius").unwrap() as f32;
+
     let mut taken_names = vec![];
     let obs_len = *BASE_OBS_LEN
-        + *TEAMMATE_OBS_LEN * (params.agents_per_team() - 1)
-        + *ENEMY_OBS_LEN * params.agents_per_team() * (params.num_teams - 1);
+        + *TEAMMATE_OBS_LEN * (agents_per_team - 1)
+        + *ENEMY_OBS_LEN * agents_per_team * (num_teams - 1);
     let mut agent_id = 0;
-    for _ in 0..params.num_agents() {
+    for _ in 0..num_agents {
         let policy = DeterministicMlpActor::new(
             &[
-                obs_len * params.agent_frame_stack_len(),
-                params.ffa_params.agent_hidden_dim,
+                obs_len * agent_frame_stack_len,
+                agent_hidden_dim,
+                agent_hidden_dim,
                 *ACTION_LEN,
             ],
-            params.actor_lr(),
+            actor_lr,
         );
         let target_policy = DeterministicMlpActor::new(
             &[
-                obs_len * params.agent_frame_stack_len(),
-                params.ffa_params.agent_hidden_dim,
+                obs_len * agent_frame_stack_len,
+                agent_hidden_dim,
+                agent_hidden_dim,
                 *ACTION_LEN,
             ],
-            params.actor_lr(),
+            actor_lr,
         );
         target_policy.hard_update(&policy);
         policies.0.push(PolicyWithTarget {
@@ -347,19 +280,21 @@ fn setup(
 
     let critic = DeterministicMlpCritic::new(
         &[
-            (*ACTION_LEN + obs_len * params.agent_frame_stack_len()) * params.num_agents(),
-            params.ffa_params.agent_hidden_dim,
+            (*ACTION_LEN + obs_len * agent_frame_stack_len) * num_agents,
+            agent_hidden_dim,
+            agent_hidden_dim,
             1,
         ],
-        params.critic_lr(),
+        critic_lr,
     );
     let target_critic = DeterministicMlpCritic::new(
         &[
-            (*ACTION_LEN + obs_len * params.agent_frame_stack_len()) * params.num_agents(),
-            params.ffa_params.agent_hidden_dim,
+            (*ACTION_LEN + obs_len * agent_frame_stack_len) * num_agents,
+            agent_hidden_dim,
+            agent_hidden_dim,
             1,
         ],
-        params.critic_lr(),
+        critic_lr,
     );
     target_critic.hard_update(&critic);
     let value = CriticWithTarget {
@@ -368,8 +303,8 @@ fn setup(
     };
     values.0.push(value);
 
-    for team_id in 0..params.num_teams {
-        for _ in 0..params.agents_per_team() {
+    for team_id in 0..num_teams {
+        for _ in 0..agents_per_team {
             let mut rng_comp = EntropyComponent::from(&mut rng);
 
             let mut name = names::random_name(&mut rng_comp);
@@ -380,18 +315,18 @@ fn setup(
             let agent_pos = Vec3::new(dist.sample(&mut rng_comp), dist.sample(&mut rng_comp), 0.0);
             taken_names.push(name.clone());
 
-            let mut agent = AgentBundle::<Tdm>::new(
+            let mut agent = AgentBundle::<TdmAction>::new(
                 agent_pos,
-                Some(params.team_colors[team_id]),
+                Some(TEAM_COLORS[team_id]),
                 name.clone(),
                 &timestamp,
                 meshes.reborrow(),
                 materials.reborrow(),
-                &*params,
+                &params,
                 obs_len,
                 &mut rng,
             );
-            agent.health = Health(params.ffa_params.agent_max_health);
+            agent.health = Health(agent_max_health);
             let id = commands
                 .spawn(agent)
                 .insert(AgentId(agent_id))
@@ -401,7 +336,7 @@ fn setup(
                         parent,
                         meshes.reborrow(),
                         materials.reborrow(),
-                        params.ffa_params.agent_radius,
+                        agent_radius,
                     );
                 })
                 .id();
@@ -418,7 +353,7 @@ fn setup(
 }
 
 fn observation(
-    params: Res<TdmParams>,
+    params: Res<Params>,
     cx: Res<RapierContext>,
     mut fs: Query<(&mut FrameStack<Box<[f32]>>, &mut RmsNormalize), With<Agent>>,
     queries: Query<
@@ -433,18 +368,17 @@ fn observation(
         ),
         With<Agent>,
     >,
-    mut gizmos: Gizmos,
 ) {
     queries.iter().for_each(
         |(agent, agent_id, my_team, _action, velocity, transform, health)| {
             let mut my_state = TdmObs {
-                ident: IdentityEmbedding::new(agent_id.0, params.num_agents()),
-                phys: PhysicalProperties::new(transform, velocity), //.scaled_by(&phys_scaling),
-                combat: CombatProperties {
-                    health: health.0, // / params.ffa_params.agent_max_health,
-                },
+                ident: IdentityEmbedding::new(
+                    agent_id.0,
+                    params.get_int("num_agents").unwrap() as usize,
+                ),
+                phys: PhysicalProperties::new(transform, velocity),
+                combat: CombatProperties { health: health.0 },
                 map_interaction: MapInteractionProperties::new(transform, &cx),
-                // .scaled_by(&map_scaling),
                 teammates: vec![],
                 enemies: vec![],
             };
@@ -453,7 +387,7 @@ fn observation(
                 other_id,
                 other_team,
                 other_action,
-                other_vel,
+                _other_vel,
                 other_transform,
                 other_health,
             ) in queries
@@ -463,7 +397,10 @@ fn observation(
             {
                 if my_team.0 == other_team.0 {
                     my_state.teammates.push(TeammateObs {
-                        ident: IdentityEmbedding::new(other_id.0, params.num_agents()),
+                        ident: IdentityEmbedding::new(
+                            other_id.0,
+                            params.get_int("num_agents").unwrap() as usize,
+                        ),
                         phys: RelativePhysicalProperties::new(transform, other_transform),
                         combat: CombatProperties {
                             health: other_health.0,
@@ -473,7 +410,10 @@ fn observation(
                     });
                 } else {
                     my_state.enemies.push(EnemyObs {
-                        ident: IdentityEmbedding::new(other_id.0, params.num_agents()),
+                        ident: IdentityEmbedding::new(
+                            other_id.0,
+                            params.get_int("num_agents").unwrap() as usize,
+                        ),
                         phys: RelativePhysicalProperties::new(transform, other_transform),
                         combat: CombatProperties {
                             health: other_health.0,
@@ -493,16 +433,16 @@ fn observation(
                 .to_vec1()
                 .unwrap()
                 .into_boxed_slice();
-            fs.get_mut(agent)
-                .unwrap()
-                .0
-                .push(obs, Some(params.agent_frame_stack_len()));
+            fs.get_mut(agent).unwrap().0.push(
+                obs,
+                Some(params.get_int("agent_frame_stack_len").unwrap() as usize),
+            );
         },
     );
 }
 
 fn get_reward(
-    params: Res<TdmParams>,
+    params: Res<Params>,
     mut rewards: Query<(&mut Reward, &mut RmsNormalize), With<Agent>>,
     actions: Query<&TdmAction, With<Agent>>,
     cx: Res<RapierContext>,
@@ -516,7 +456,7 @@ fn get_reward(
     mut log: ResMut<LogText>,
     mut gizmos: Gizmos,
 ) {
-    macro_rules! reward_team {
+    macro_rules! _reward_team {
         ($team:expr, $reward:expr) => {
             for agent in agents.iter() {
                 if team_id.get(agent).unwrap().0 == $team {
@@ -534,7 +474,7 @@ fn get_reward(
             let x_direction = (action.phys.direction * PI - PI / 2.0).sin();
             let y_direction = (action.phys.direction * PI - PI / 2.0).cos();
             let force = Vec2::new(x_direction, y_direction) * action.phys.thrust.clamp(-1.0, 1.0);
-            my_force.impulse = force * params.ffa_params.agent_lin_move_force;
+            my_force.impulse = force * params.get_float("agent_lin_move_force").unwrap() as f32;
             // let direction_normalized = action.phys.desired_direction.try_normalize().unwrap();
 
             // let desired_angle = f32::atan2(direction_normalized.y, direction_normalized.x);
@@ -548,7 +488,8 @@ fn get_reward(
             if delta < -PI {
                 delta += 2.0 * PI;
             }
-            my_force.torque_impulse = delta * params.ffa_params.agent_ang_move_force;
+            my_force.torque_impulse =
+                delta * params.get_float("agent_ang_move_force").unwrap() as f32;
 
             if action.combat.shoot > 0.0 && my_health.0 > 0.0 {
                 let my_team = team_id.get(agent_ent).unwrap();
@@ -563,14 +504,14 @@ fn get_reward(
                 if let Some((hit_entity, toi)) = cx.cast_ray(
                     ray_pos,
                     ray_dir,
-                    params.ffa_params.agent_shoot_distance,
+                    params.get_float("agent_shoot_distance").unwrap() as f32,
                     true,
                     filter,
                 ) {
                     gizmos.line_2d(
                         ray_pos,
                         ray_pos + ray_dir * toi,
-                        params.team_colors[team_id.get(agent_ent).unwrap().0 as usize],
+                        TEAM_COLORS[team_id.get(agent_ent).unwrap().0 as usize],
                     );
 
                     if let Ok(mut health) = health.get_mut(hit_entity) {
@@ -578,23 +519,18 @@ fn get_reward(
                             if my_team.0 == other_team.0 {
                                 // friendly fire!
                                 rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                                    params.reward_for_friendly_fire;
-                                // kills.get_mut(agent_ent).unwrap().0 -= 1;
+                                    params.get_float("reward_for_friendly_fire").unwrap() as f32;
                             } else if health.0 > 0.0 {
                                 health.0 -= 5.0;
                                 rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                                    params.ffa_params.reward_for_hit;
+                                    params.get_float("reward_for_hit").unwrap() as f32;
                                 rewards.get_component_mut::<Reward>(hit_entity).unwrap().0 +=
-                                    params.ffa_params.reward_for_getting_hit;
-                                // kills.get_mut(agent_ent).unwrap().0 += 1;
+                                    params.get_float("reward_for_getting_hit").unwrap() as f32;
                                 if health.0 <= 0.0 {
                                     rewards.get_mut(agent_ent).unwrap().0 .0 +=
-                                        params.ffa_params.reward_for_kill;
+                                        params.get_float("reward_for_kill").unwrap() as f32;
                                     rewards.get_mut(hit_entity).unwrap().0 .0 +=
-                                        params.ffa_params.reward_for_death;
-
-                                    // reward_team!(my_team.0, params.ffa_params.reward_for_kill);
-                                    // reward_team!(other_team.0, params.ffa_params.reward_for_death);
+                                        params.get_float("reward_for_death").unwrap() as f32;
                                     kills.get_mut(agent_ent).unwrap().0 += 1;
                                     let msg = format!(
                                         "{} killed {}! Nice!",
@@ -608,17 +544,18 @@ fn get_reward(
                     } else {
                         // hit a wall
                         rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                            params.ffa_params.reward_for_miss;
+                            params.get_float("reward_for_miss").unwrap() as f32;
                     }
                 } else {
                     gizmos.line_2d(
                         ray_pos,
-                        ray_pos + ray_dir * params.ffa_params.agent_shoot_distance,
-                        params.team_colors[team_id.get(agent_ent).unwrap().0 as usize],
+                        ray_pos
+                            + ray_dir * params.get_float("agent_shoot_distance").unwrap() as f32,
+                        TEAM_COLORS[team_id.get(agent_ent).unwrap().0 as usize],
                     );
                     // hit nothing
                     rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                        params.ffa_params.reward_for_miss;
+                        params.get_float("reward_for_miss").unwrap() as f32;
                 }
             }
 
@@ -656,9 +593,9 @@ fn get_reward(
         }
     }
 
-    for (mut rew, mut norm) in rewards.iter_mut() {
-        rew.0 = norm.forward_ret(rew.0);
-    }
+    // for (mut rew, mut norm) in rewards.iter_mut() {
+    //     rew.0 = norm.forward_ret(rew.0);
+    // }
 }
 
 fn get_terminal(

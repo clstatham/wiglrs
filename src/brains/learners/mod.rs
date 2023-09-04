@@ -1,6 +1,4 @@
-use bevy::prelude::{Component, Resource};
-use bevy_prng::ChaCha8Rng;
-use bevy_rand::prelude::EntropyComponent;
+use bevy::prelude::Resource;
 use candle_core::Device;
 
 use crate::{

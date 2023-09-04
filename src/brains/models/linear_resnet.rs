@@ -36,7 +36,7 @@ pub struct LinResActor {
     common3: ResBlock,
     mu_head: Linear,
     cov_head: Linear,
-    varmap: VarMap,
+    _varmap: VarMap,
     optim: Mutex<AdamW>,
     status: Mutex<Option<LinearResnetStatus>>,
 }
@@ -52,7 +52,7 @@ impl LinResActor {
         let cov_head = linear(hidden_len, action_len, 0.01, vs.pp("cov_head"));
         let optim = AdamW::new_lr(varmap.all_vars(), lr)?;
         Ok(Self {
-            varmap,
+            _varmap: varmap,
             common1,
             common2,
             common3,
@@ -155,7 +155,7 @@ impl LinResCritic {
     }
 }
 impl ValueEstimator for LinResCritic {
-    fn estimate_value(&self, x: &Tensor, action: Option<&Tensor>) -> Result<Tensor> {
+    fn estimate_value(&self, x: &Tensor, _action: Option<&Tensor>) -> Result<Tensor> {
         let x = x.flatten_from(1)?;
         let x = self.l1.forward(&x)?.tanh()?;
         let x = self.l2.forward(&x)?;
@@ -214,7 +214,7 @@ pub fn action_space_ui<E: Env>(
                             ui.vertical(|ui| {
                                 ui.heading(&names.get(agent).unwrap().0);
                                 // ui.group(|ui| {
-                                let status = LinResActor::status(&policies.get(agent).unwrap());
+                                let status = policies.get(agent).unwrap().status();
                                 if let Some(status) = status {
                                     let mut mu = "mu:".to_owned();
                                     for m in status.mu.iter() {
@@ -237,10 +237,6 @@ pub fn action_space_ui<E: Env>(
                                         .zip(status.cov.iter())
                                         .enumerate()
                                         .map(|(i, (mu, cov))| {
-                                            // https://www.desmos.com/calculator/rkoehr8rve
-                                            let scale = cov.sqrt() * 3.0;
-                                            let _rg = Vec2::new(scale.exp(), (1.0 / scale).exp())
-                                                .normalize();
                                             let m = Bar::new(i as f64, *mu as f64)
                                                 // .fill(Color32::from_rgb(
                                                 //     (rg.x * 255.0) as u8,
