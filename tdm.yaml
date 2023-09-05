@@ -1,6 +1,6 @@
 params:
-  num_agents: 3
-  agents_per_team: 1
+  num_agents: 6
+  agents_per_team: 2
   agent_hidden_dim: 64
   actor_lr: 0.01
   critic_lr: 0.01
@@ -16,8 +16,4 @@ params:
   agent_shoot_distance: 1000.0
   reward_for_kill: 100.0
   reward_for_death: -100.0
-  reward_for_hit: 0.0
-  reward_for_getting_hit: 0.0
-  reward_for_miss: 0.0
-  reward_for_friendly_fire: 0.0
   

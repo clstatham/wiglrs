@@ -343,7 +343,7 @@ impl RunningReturn {
 pub struct Terminal(pub bool);
 
 #[derive(Component)]
-pub struct Kills(pub usize);
+pub struct Kills(pub isize);
 
 #[derive(Component)]
 pub struct Deaths(pub usize);

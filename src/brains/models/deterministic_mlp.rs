@@ -61,7 +61,7 @@ impl DeterministicMlpActor {
             last_out = *next_out;
         }
         let optim = Mutex::new(adam(varmap.all_vars(), lr).unwrap());
-        let noise = Mutex::new(OuNoise::new(last_out, 0.0, 0.15, 0.3, 0.05, 1000000));
+        let noise = Mutex::new(OuNoise::new(last_out, 0.0, 0.15, 0.3, 0.05, 100000));
         Self {
             varmap,
             layers,

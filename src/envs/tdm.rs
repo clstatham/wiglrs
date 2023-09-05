@@ -357,6 +357,7 @@ fn observation(
         ),
         With<Agent>,
     >,
+    mut gizmos: Gizmos,
 ) {
     queries.iter().for_each(
         |(agent, agent_id, my_team, _action, velocity, transform, health)| {
@@ -372,7 +373,7 @@ fn observation(
                 enemies: vec![],
             };
             for (
-                _other,
+                other,
                 other_id,
                 other_team,
                 other_action,
@@ -381,21 +382,82 @@ fn observation(
                 other_health,
             ) in queries
                 .iter()
-                .filter(|q| q.0 != agent)
+                .filter(|(ent, ..)| *ent != agent)
                 .sorted_by_key(|(_, id, _, _, _, _t, _)| id.0)
             {
-                if my_team.0 == other_team.0 {
+                // check line of sight
+                let f = |ent| queries.get(ent).is_err() || ent == other;
+                let filter = QueryFilter::new().predicate(&f);
+                if let Some((hit_ent, _toi)) = cx.cast_ray(
+                    transform.translation.xy(),
+                    (other_transform.translation.xy() - transform.translation.xy()).normalize(),
+                    Real::MAX,
+                    true,
+                    filter,
+                ) {
+                    if hit_ent == other {
+                        // gizmos.line_2d(
+                        //     transform.translation.xy(),
+                        //     other_transform.translation.xy(),
+                        //     Color::WHITE,
+                        // );
+                        if my_team.0 == other_team.0 {
+                            my_state.teammates.push(TeammateObs {
+                                ident: IdentityEmbedding::new(
+                                    other_id.0,
+                                    params.get_int("num_agents").unwrap() as usize,
+                                ),
+                                phys: RelativePhysicalProperties::new(transform, other_transform),
+                                combat: CombatProperties {
+                                    health: other_health.0,
+                                },
+                                map_interaction: MapInteractionProperties::new(
+                                    other_transform,
+                                    &cx,
+                                ),
+                                firing: other_action.combat.shoot > 0.0,
+                            });
+                        } else {
+                            my_state.enemies.push(EnemyObs {
+                                ident: IdentityEmbedding::new(
+                                    other_id.0,
+                                    params.get_int("num_agents").unwrap() as usize,
+                                ),
+                                phys: RelativePhysicalProperties::new(transform, other_transform),
+                                combat: CombatProperties {
+                                    health: other_health.0,
+                                },
+                                map_interaction: MapInteractionProperties::new(
+                                    other_transform,
+                                    &cx,
+                                ),
+                                firing: other_action.combat.shoot > 0.0,
+                            });
+                        }
+                    } else if my_team.0 == other_team.0 {
+                        my_state.teammates.push(TeammateObs {
+                            ident: IdentityEmbedding::new(
+                                other_id.0,
+                                params.get_int("num_agents").unwrap() as usize,
+                            ),
+                            ..Default::default()
+                        });
+                    } else {
+                        my_state.enemies.push(EnemyObs {
+                            ident: IdentityEmbedding::new(
+                                other_id.0,
+                                params.get_int("num_agents").unwrap() as usize,
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                } else if my_team.0 == other_team.0 {
                     my_state.teammates.push(TeammateObs {
                         ident: IdentityEmbedding::new(
                             other_id.0,
                             params.get_int("num_agents").unwrap() as usize,
                         ),
-                        phys: RelativePhysicalProperties::new(transform, other_transform),
-                        combat: CombatProperties {
-                            health: other_health.0,
-                        },
-                        map_interaction: MapInteractionProperties::new(other_transform, &cx),
-                        firing: other_action.combat.shoot > 0.0,
+                        ..Default::default()
                     });
                 } else {
                     my_state.enemies.push(EnemyObs {
@@ -403,12 +465,7 @@ fn observation(
                             other_id.0,
                             params.get_int("num_agents").unwrap() as usize,
                         ),
-                        phys: RelativePhysicalProperties::new(transform, other_transform),
-                        combat: CombatProperties {
-                            health: other_health.0,
-                        },
-                        map_interaction: MapInteractionProperties::new(other_transform, &cx),
-                        firing: other_action.combat.shoot > 0.0,
+                        ..Default::default()
                     });
                 }
             }
@@ -501,54 +558,51 @@ fn get_reward(
                     true,
                     filter,
                 ) {
-                    gizmos.line_2d(
-                        ray_pos,
-                        ray_pos + ray_dir * toi,
-                        TEAM_COLORS[team_id.get(agent_ent).unwrap().0 as usize],
-                    );
+                    gizmos.line_2d(ray_pos, ray_pos + ray_dir * toi, Color::WHITE);
 
                     if let Ok(mut health) = health.get_mut(hit_entity) {
                         if let Ok(other_team) = team_id.get(hit_entity) {
-                            if my_team.0 == other_team.0 {
-                                // friendly fire!
-                                rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                                    params.get_float("reward_for_friendly_fire").unwrap() as f32;
-                            } else if health.0 > 0.0 {
+                            if health.0 > 0.0 {
                                 health.0 -= 5.0;
-                                rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                                    params.get_float("reward_for_hit").unwrap() as f32;
-                                rewards.get_component_mut::<Reward>(hit_entity).unwrap().0 +=
-                                    params.get_float("reward_for_getting_hit").unwrap() as f32;
                                 if health.0 <= 0.0 {
-                                    rewards.get_mut(agent_ent).unwrap().0 .0 +=
-                                        params.get_float("reward_for_kill").unwrap() as f32;
+                                    if my_team.0 == other_team.0 {
+                                        // friendly fire!
+                                        rewards.get_mut(agent_ent).unwrap().0 .0 -=
+                                            params.get_float("reward_for_kill").unwrap() as f32;
+                                        kills.get_mut(agent_ent).unwrap().0 -= 1;
+                                        let msg = format!(
+                                            "{} killed their TEAMMATE {}! Not nice!",
+                                            &names.get(agent_ent).unwrap().0,
+                                            &names.get(hit_entity).unwrap().0
+                                        );
+                                        log.push(msg);
+                                    } else {
+                                        rewards.get_mut(agent_ent).unwrap().0 .0 +=
+                                            params.get_float("reward_for_kill").unwrap() as f32;
+                                        kills.get_mut(agent_ent).unwrap().0 += 1;
+                                        let msg = format!(
+                                            "{} killed {}! Nice!",
+                                            &names.get(agent_ent).unwrap().0,
+                                            &names.get(hit_entity).unwrap().0
+                                        );
+                                        log.push(msg);
+                                    }
                                     rewards.get_mut(hit_entity).unwrap().0 .0 +=
                                         params.get_float("reward_for_death").unwrap() as f32;
-                                    kills.get_mut(agent_ent).unwrap().0 += 1;
-                                    let msg = format!(
-                                        "{} killed {}! Nice!",
-                                        &names.get(agent_ent).unwrap().0,
-                                        &names.get(hit_entity).unwrap().0
-                                    );
-                                    log.push(msg);
                                 }
                             }
                         }
                     } else {
                         // hit a wall
-                        rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                            params.get_float("reward_for_miss").unwrap() as f32;
                     }
                 } else {
                     gizmos.line_2d(
                         ray_pos,
                         ray_pos
                             + ray_dir * params.get_float("agent_shoot_distance").unwrap() as f32,
-                        TEAM_COLORS[team_id.get(agent_ent).unwrap().0 as usize],
+                        Color::WHITE,
                     );
                     // hit nothing
-                    rewards.get_component_mut::<Reward>(agent_ent).unwrap().0 +=
-                        params.get_float("reward_for_miss").unwrap() as f32;
                 }
             }
 
