@@ -14,24 +14,28 @@ use itertools::Itertools;
 
 use crate::{
     brains::{
-        learners::{utils::linear, DEVICE},
+        learners::{
+            utils::{adam, linear, OuNoise},
+            DEVICE,
+        },
         Policies,
     },
     envs::{Agent, AgentId, Env, Name},
 };
 
-use super::{CopyWeights, Policy, PolicyWithTarget, ValueEstimator};
+use super::{Policy, PolicyWithTarget, ValueEstimator};
 
 #[derive(Clone)]
 pub struct DeterministicMlpActorStatus {
     pub action: Box<[f32]>,
-    pub std: f32,
+    pub sigma: f32,
 }
 
 #[derive(Component)]
 pub struct DeterministicMlpActor {
     pub layers: Vec<Linear>,
     pub varmap: VarMap,
+    pub noise: Mutex<OuNoise>,
     pub optim: Mutex<AdamW>,
     pub status: Mutex<DeterministicMlpActorStatus>,
 }
@@ -56,13 +60,15 @@ impl DeterministicMlpActor {
             ));
             last_out = *next_out;
         }
-        let optim = Mutex::new(AdamW::new_lr(varmap.all_vars(), lr).unwrap());
+        let optim = Mutex::new(adam(varmap.all_vars(), lr).unwrap());
+        let noise = Mutex::new(OuNoise::new(last_out, 0.0, 0.15, 0.3, 0.05, 1000000));
         Self {
             varmap,
             layers,
             optim,
+            noise,
             status: Mutex::new(DeterministicMlpActorStatus {
-                std: 1.0,
+                sigma: 0.3,
                 action: vec![0.0f32; last_out].into_boxed_slice(),
             }),
         }
@@ -73,6 +79,10 @@ impl Policy for DeterministicMlpActor {
     type Logits = Tensor;
 
     type Status = DeterministicMlpActorStatus;
+
+    fn varmap(&self) -> &VarMap {
+        &self.varmap
+    }
 
     fn action_logits(&self, obs: &Tensor) -> Result<Self::Logits> {
         let mut x = obs.flatten_from(1).unwrap();
@@ -85,13 +95,11 @@ impl Policy for DeterministicMlpActor {
     }
 
     fn act(&self, obs: &Tensor) -> Result<(Tensor, Self::Logits)> {
-        let logits = self.action_logits(obs)?;
+        let logits = self.action_logits(obs)?.squeeze(0)?.detach()?;
         let mut status = self.status.lock().unwrap();
-        status.action = logits.squeeze(0)?.to_vec1()?.into_boxed_slice();
-        let actions = (&logits + logits.randn_like(0.0, status.std as f64)?)?;
-        if status.std > 0.05 {
-            status.std *= 0.99998;
-        }
+        status.action = logits.to_vec1()?.into_boxed_slice();
+        let actions = (&logits + self.noise.lock().unwrap().gen_next())?;
+        status.sigma = self.noise.lock().unwrap().sigma as f32;
         Ok((actions, logits))
     }
 
@@ -109,28 +117,6 @@ impl Policy for DeterministicMlpActor {
 
     fn status(&self) -> Option<Self::Status> {
         Some(self.status.lock().unwrap().clone())
-    }
-}
-
-impl CopyWeights for DeterministicMlpActor {
-    fn soft_update(&self, other: &Self, tau: f32) {
-        for (varname, my_var) in self.varmap.data().lock().unwrap().iter() {
-            let other_var = &other.varmap.data().lock().unwrap()[varname];
-            let new_var = my_var
-                .affine(1.0 - tau as f64, 0.0)
-                .unwrap()
-                .add(&other_var.affine(tau as f64, 0.0).unwrap())
-                .unwrap();
-            my_var.set(&new_var).unwrap();
-        }
-    }
-
-    fn hard_update(&self, other: &Self) {
-        for (varname, my_var) in self.varmap.data().lock().unwrap().iter() {
-            my_var
-                .set(&other.varmap.data().lock().unwrap()[varname])
-                .unwrap();
-        }
     }
 }
 
@@ -161,7 +147,7 @@ impl DeterministicMlpCritic {
             ));
             last_out = *next_out;
         }
-        let optim = Mutex::new(AdamW::new_lr(varmap.all_vars(), lr).unwrap());
+        let optim = Mutex::new(adam(varmap.all_vars(), lr).unwrap());
         Self {
             varmap,
             layers,
@@ -171,6 +157,10 @@ impl DeterministicMlpCritic {
 }
 
 impl ValueEstimator for DeterministicMlpCritic {
+    fn varmap(&self) -> &VarMap {
+        &self.varmap
+    }
+
     fn estimate_value(&self, obs: &Tensor, action: Option<&Tensor>) -> Result<Tensor> {
         let action = action.unwrap().flatten_from(1).unwrap();
         let obs = obs.flatten_from(1).unwrap();
@@ -184,28 +174,6 @@ impl ValueEstimator for DeterministicMlpCritic {
     }
     fn apply_gradients(&self, grads: &GradStore) -> Result<()> {
         self.optim.lock().unwrap().step(grads)
-    }
-}
-
-impl CopyWeights for DeterministicMlpCritic {
-    fn soft_update(&self, other: &Self, tau: f32) {
-        for (varname, my_var) in self.varmap.data().lock().unwrap().iter() {
-            let other_var = &other.varmap.data().lock().unwrap()[varname];
-            let new_var = my_var
-                .affine(1.0 - tau as f64, 0.0)
-                .unwrap()
-                .add(&other_var.affine(tau as f64, 0.0).unwrap())
-                .unwrap();
-            my_var.set(&new_var).unwrap();
-        }
-    }
-
-    fn hard_update(&self, other: &Self) {
-        for (varname, my_var) in self.varmap.data().lock().unwrap().iter() {
-            my_var
-                .set(&other.varmap.data().lock().unwrap()[varname])
-                .unwrap();
-        }
     }
 }
 
@@ -244,7 +212,7 @@ pub fn action_space_ui<E: Env>(
                                     action.push_str(&format!(" {:.4}", a));
                                 }
                                 ui.label(action);
-                                ui.label(format!("std: {}", status.std));
+                                ui.label(format!("std: {}", status.sigma));
                                 // });
 
                                 // ui.horizontal_top(|ui| {
@@ -255,8 +223,8 @@ pub fn action_space_ui<E: Env>(
                                     .enumerate()
                                     .map(|(i, a)| {
                                         let s = Line::new(vec![
-                                            [i as f64, *a as f64 - status.std as f64],
-                                            [i as f64, *a as f64 + status.std as f64],
+                                            [i as f64, *a as f64 - status.sigma as f64],
+                                            [i as f64, *a as f64 + status.sigma as f64],
                                         ])
                                         .stroke(egui::Stroke::new(4.0, egui::Color32::LIGHT_GREEN));
                                         let m =

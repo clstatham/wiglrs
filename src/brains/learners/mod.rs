@@ -55,8 +55,8 @@ impl<E: Env, M: StepMetadata> Sart<E, M> {
 }
 
 pub trait Buffer<E: Env>: Clone + Resource {
-    type Metadata: StepMetadata;
-    fn remember_sart(&mut self, step: Sart<E, Self::Metadata>);
+    type Experience;
+    fn remember_sart(&mut self, step: Self::Experience);
 }
 
 pub trait OnPolicyBuffer<E: Env>: Buffer<E> {
@@ -65,5 +65,5 @@ pub trait OnPolicyBuffer<E: Env>: Buffer<E> {
 }
 
 pub trait OffPolicyBuffer<E: Env>: Buffer<E> {
-    fn sample(&self, batch_size: usize) -> Self;
+    fn sample(&self, batch_size: usize) -> Vec<Self::Experience>;
 }

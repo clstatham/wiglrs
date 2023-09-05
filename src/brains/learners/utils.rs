@@ -1,13 +1,24 @@
 use std::{f32::consts::PI, ops::Mul};
 
 use bevy::prelude::*;
-use candle_core::{DType, Module, Result, Tensor};
-use candle_nn::{Linear, VarBuilder};
+use candle_core::{DType, Module, Result, Tensor, Var};
+use candle_nn::{AdamW, Linear, Optimizer, ParamsAdamW, VarBuilder};
 use itertools::Itertools;
 use rand::thread_rng;
 use rand_distr::Distribution;
 
 use super::DEVICE;
+
+pub fn adam(vars: Vec<Var>, lr: f64) -> Result<AdamW> {
+    AdamW::new(
+        vars,
+        ParamsAdamW {
+            lr,
+            weight_decay: 0.0,
+            ..Default::default()
+        },
+    )
+}
 
 pub fn linear(in_len: usize, out_len: usize, gain: f64, vs: VarBuilder) -> Linear {
     let w_init = candle_nn::init::Init::Kaiming {
@@ -167,5 +178,149 @@ impl MvNormal {
             .mul(0.5)
             .unwrap()
             .broadcast_add(&Tensor::new(second_term, &DEVICE).unwrap())
+    }
+}
+
+pub struct OuNoise {
+    pub mu: f64,
+    pub theta: f64,
+    pub sigma: f64,
+    pub max_sigma: f64,
+    pub min_sigma: f64,
+    pub decay_period: usize,
+    pub action_len: usize,
+    t: usize,
+    state: Tensor,
+}
+
+impl OuNoise {
+    pub fn new(
+        action_len: usize,
+        mu: f64,
+        theta: f64,
+        max_sigma: f64,
+        min_sigma: f64,
+        decay_period: usize,
+    ) -> Self {
+        Self {
+            mu,
+            theta,
+            sigma: max_sigma,
+            max_sigma,
+            min_sigma,
+            decay_period,
+            action_len,
+            t: 0,
+            state: Tensor::zeros(action_len, DType::F32, &DEVICE).unwrap(),
+        }
+    }
+
+    fn evolve(&mut self) {
+        let x = self.state.clone();
+        let dx = ((self.theta * (x.neg().unwrap() + self.mu).unwrap()).unwrap()
+            + (self.sigma * self.state.randn_like(0.0, 1.0).unwrap()).unwrap())
+        .unwrap();
+        self.state = (x + dx).unwrap();
+    }
+
+    pub fn gen_next(&mut self) -> Tensor {
+        self.evolve();
+        self.sigma = self.max_sigma
+            - (self.max_sigma - self.min_sigma)
+                * 1.0f64.min(self.t as f64 / self.decay_period as f64);
+        self.t += 1;
+        self.state.clone()
+    }
+}
+
+// https://github.com/rlcode/per/blob/master/SumTree.py
+#[derive(Clone)]
+pub struct SumTree<T: Clone> {
+    write_head: usize,
+    tree: Vec<f64>,
+    data: Vec<Option<T>>,
+    capacity: usize,
+    n_entries: usize,
+}
+
+impl<T: Clone> SumTree<T> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            write_head: 0,
+            tree: vec![0.0; 2 * capacity - 1],
+            data: vec![None; capacity],
+            capacity,
+            n_entries: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.n_entries
+    }
+
+    pub fn data(&self) -> &[Option<T>] {
+        &self.data
+    }
+
+    pub fn data_mut(&mut self) -> &mut [Option<T>] {
+        &mut self.data
+    }
+
+    pub fn last(&self) -> Option<&T> {
+        self.data
+            .get(self.write_head.checked_sub(1)?)
+            .and_then(|t| t.as_ref())
+    }
+
+    pub fn write_head(&self) -> usize {
+        self.write_head
+    }
+
+    fn propagate(&mut self, idx: usize, change: f64) {
+        let parent = (idx - 1) / 2;
+        self.tree[parent] += change;
+        if parent != 0 {
+            self.propagate(parent, change);
+        }
+    }
+    fn retrieve(&self, idx: usize, s: f64) -> usize {
+        let left = 2 * idx + 1;
+        let right = left + 1;
+        if left >= self.tree.len() {
+            idx
+        } else if s <= self.tree[left] {
+            self.retrieve(left, s)
+        } else {
+            self.retrieve(right, s - self.tree[left])
+        }
+    }
+
+    pub fn total(&self) -> f64 {
+        self.tree[0]
+    }
+
+    pub fn add(&mut self, p: f64, data: T) {
+        let idx = self.write_head + self.capacity - 1;
+        self.data[self.write_head] = Some(data);
+        self.update(idx, p);
+        self.write_head += 1;
+        if self.write_head >= self.capacity {
+            self.write_head = 0;
+        }
+        if self.n_entries < self.capacity {
+            self.n_entries += 1;
+        }
+    }
+
+    pub fn update(&mut self, idx: usize, p: f64) {
+        let change = p - self.tree[idx];
+        self.tree[idx] = p;
+        self.propagate(idx, change);
+    }
+
+    pub fn get(&self, s: f64) -> (usize, f64, Option<T>) {
+        let idx = self.retrieve(0, s);
+        let data_idx = idx - self.capacity + 1;
+        (idx, self.tree[idx], self.data[data_idx].clone())
     }
 }

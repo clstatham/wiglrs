@@ -2,7 +2,10 @@ use bevy::prelude::*;
 use itertools::Itertools;
 
 use crate::{
-    brains::models::{CopyWeights, CriticWithTarget, Policy, PolicyWithTarget, ValueEstimator},
+    brains::{
+        learners::maddpg::replay_buffer::Experience,
+        models::{CriticWithTarget, Policy, PolicyWithTarget, ValueEstimator},
+    },
     envs::{Action, Env},
 };
 
@@ -31,17 +34,18 @@ impl Status for MaddpgStatus {
 pub struct Maddpg<E: Env> {
     pub gamma: f32,
     pub tau: f32,
-    // pub soft_update_interval: usize,
+    pub soft_update_interval: usize,
     pub steps_done: usize,
     pub batch_size: usize,
     pub status: MaddpgStatus,
     pub buffer: MaddpgBuffer<E>,
 }
 
-impl<E: Env, P: Policy + CopyWeights, V: ValueEstimator + CopyWeights>
-    Learner<E, PolicyWithTarget<P>, CriticWithTarget<V>> for Maddpg<E>
+impl<E: Env, P: Policy, V: ValueEstimator> Learner<E, PolicyWithTarget<P>, CriticWithTarget<V>>
+    for Maddpg<E>
 where
     P: Policy<Logits = Tensor>,
+    E::Action: Action<Logits = Tensor>,
 {
     type Buffer = MaddpgBuffer<E>;
     type Status = MaddpgStatus;
@@ -56,57 +60,52 @@ where
         let mut total_vl = 0.0f32;
         for agent_idx in 0..num_agents {
             let batch = self.buffer.sample(self.batch_size);
-            let (all_obs, all_actions, all_rewards, all_next_obs, all_terminals): (
-                Vec<_>,
-                Vec<_>,
-                Vec<_>,
-                Vec<_>,
-                Vec<_>,
-            ) = batch
-                .bufs
-                .iter()
-                .map(|buf| buf.lock().unwrap().unzip())
-                .multiunzip();
 
             let mut batch_obs = vec![];
-            for obs in all_obs {
-                let temp = Tensor::stack(
-                    &obs.into_iter().map(|o| o.as_flat_tensor()).collect_vec(),
-                    0,
-                )
-                .unwrap();
-                batch_obs.push(temp);
-            }
             let mut batch_actions = vec![];
-            for action in all_actions {
-                let temp =
-                    Tensor::stack(&action.into_iter().map(|a| a.as_tensor()).collect_vec(), 0)
-                        .unwrap();
-                batch_actions.push(temp);
-            }
             let mut batch_rewards = vec![];
-            for reward in all_rewards {
-                batch_rewards.push(Tensor::from_vec(reward, num_agents, &DEVICE).unwrap());
-            }
             let mut batch_next_obs = vec![];
-            for next_obs in all_next_obs {
-                let temp = Tensor::stack(
-                    &next_obs
-                        .into_iter()
-                        .map(|o| o.as_ref().unwrap().as_flat_tensor())
-                        .collect_vec(),
-                    0,
-                )
-                .unwrap();
-                batch_next_obs.push(temp);
-            }
             let mut batch_non_final_masks = vec![];
-            for terminal in all_terminals {
+            for exps in batch.iter() {
+                batch_obs.push(
+                    Tensor::stack(
+                        &exps.iter().map(|e| e.obs.as_flat_tensor()).collect_vec(),
+                        0,
+                    )
+                    .unwrap(),
+                );
+                batch_actions.push(
+                    Tensor::stack(
+                        &exps
+                            .iter()
+                            .map(|e| e.action.logits().unwrap().to_owned())
+                            .collect_vec(),
+                        0,
+                    )
+                    .unwrap(),
+                );
+                batch_rewards.push(
+                    Tensor::from_vec(
+                        exps.iter().map(|e| e.reward).collect_vec(),
+                        num_agents,
+                        &DEVICE,
+                    )
+                    .unwrap(),
+                );
+                batch_next_obs.push(
+                    Tensor::stack(
+                        &exps
+                            .iter()
+                            .map(|e| e.next_obs.as_flat_tensor())
+                            .collect_vec(),
+                        0,
+                    )
+                    .unwrap(),
+                );
                 batch_non_final_masks.push(
                     Tensor::from_vec(
-                        terminal
-                            .iter()
-                            .map(|t| if *t { 0.0f32 } else { 1.0f32 })
+                        exps.iter()
+                            .map(|e| if e.terminal { 0.0f32 } else { 1.0f32 })
                             .collect_vec(),
                         num_agents,
                         &DEVICE,
@@ -219,13 +218,13 @@ where
             total_vl += vl;
         }
 
-        // if self.steps_done % self.soft_update_interval == 0 && self.steps_done > 0 {
-        // println!("updating");
-        for i in 0..num_agents {
-            actors.get(i).unwrap().soft_update(self.tau);
+        if self.steps_done % self.soft_update_interval == 0 && self.steps_done > 0 {
+            // println!("updating");
+            for i in 0..num_agents {
+                actors.get(i).unwrap().soft_update(self.tau);
+            }
+            value.soft_update(self.tau);
         }
-        value.soft_update(self.tau);
-        // }
         self.steps_done += 1;
 
         self.status.policy_loss = total_al / num_agents as f32;

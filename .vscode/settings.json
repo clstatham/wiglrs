@@ -1,0 +1,4 @@
+{
+    "DockerRun.DisableDockerrc": true,
+    "rust-analyzer.showUnlinkedFileNotification": false
+}

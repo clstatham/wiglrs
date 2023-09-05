@@ -6,7 +6,8 @@ use crate::{
         models::{
             self,
             deterministic_mlp::{DeterministicMlpActor, DeterministicMlpCritic},
-            CopyWeights, CriticWithTarget, PolicyWithTarget,
+            linear_resnet::{LinResActor, LinResCritic},
+            CriticWithTarget, Policy, PolicyWithTarget, ValueEstimator,
         },
         AgentLearner, AgentPolicy, AgentValue, Policies, ValueEstimators,
     },
@@ -30,7 +31,8 @@ use super::{
         IdentityEmbedding, PhysicalBehaviors, PhysicalProperties, Property,
         RelativePhysicalProperties,
     },
-    Action, AgentId, DefaultFrameStack, Env, Observation, Params,
+    Action, AgentId, CurrentObservation, DefaultFrameStack, Env, NextObservation, Observation,
+    Params,
     {
         get_action, learn, send_reward, Agent, AgentBundle, Eyeballs, Health, HealthBarBundle,
         Kills, Name, NameTextBundle, Reward, Terminal,
@@ -194,30 +196,29 @@ impl Env for Tdm {
     }
 
     fn reward_system() -> SystemConfigs {
-        (get_reward, send_reward::<AgentPolicy, AgentValue>).chain()
+        (get_reward, send_reward).chain()
     }
 
     fn terminal_system() -> SystemConfigs {
-        get_terminal.chain()
+        (get_terminal, check_dead).chain()
     }
 
     fn update_system() -> SystemConfigs {
-        (
-            update,
-            store_sarts::<Tdm, AgentPolicy, AgentValue>,
-            check_dead,
-        )
-            .chain()
+        update.chain()
     }
 
     fn learn_system() -> SystemConfigs {
-        learn::<Tdm, AgentPolicy, AgentValue, AgentLearner<Tdm>>.chain()
+        (
+            store_sarts::<Tdm>,
+            learn::<Tdm, AgentPolicy, AgentValue, AgentLearner<Tdm>>,
+        )
+            .chain()
     }
 
     fn ui_system() -> SystemConfigs {
         use crate::ui::*;
         (
-            kdr::<Tdm, AgentPolicy, AgentValue, AgentLearner<Tdm>>,
+            kdr::<Tdm>,
             models::deterministic_mlp::action_space_ui::<Tdm>,
             log,
             running_reward,
@@ -253,24 +254,19 @@ fn setup(
         + *ENEMY_OBS_LEN * agents_per_team * (num_teams - 1);
     let mut agent_id = 0;
     for _ in 0..num_agents {
-        let policy = DeterministicMlpActor::new(
-            &[
-                obs_len * agent_frame_stack_len,
-                agent_hidden_dim,
-                agent_hidden_dim,
-                *ACTION_LEN,
-            ],
-            actor_lr,
-        );
-        let target_policy = DeterministicMlpActor::new(
-            &[
-                obs_len * agent_frame_stack_len,
-                agent_hidden_dim,
-                agent_hidden_dim,
-                *ACTION_LEN,
-            ],
-            actor_lr,
-        );
+        let policy_cons = || {
+            DeterministicMlpActor::new(
+                &[
+                    obs_len * agent_frame_stack_len,
+                    agent_hidden_dim,
+                    agent_hidden_dim,
+                    *ACTION_LEN,
+                ],
+                actor_lr,
+            )
+        };
+        let policy = policy_cons();
+        let target_policy = policy_cons();
         target_policy.hard_update(&policy);
         policies.0.push(PolicyWithTarget {
             policy,
@@ -278,24 +274,17 @@ fn setup(
         });
     }
 
-    let critic = DeterministicMlpCritic::new(
-        &[
+    let critic_cons = || {
+        LinResCritic::new(
             (*ACTION_LEN + obs_len * agent_frame_stack_len) * num_agents,
             agent_hidden_dim,
-            agent_hidden_dim,
-            1,
-        ],
-        critic_lr,
-    );
-    let target_critic = DeterministicMlpCritic::new(
-        &[
-            (*ACTION_LEN + obs_len * agent_frame_stack_len) * num_agents,
-            agent_hidden_dim,
-            agent_hidden_dim,
-            1,
-        ],
-        critic_lr,
-    );
+            critic_lr,
+        )
+        .unwrap()
+    };
+
+    let critic = critic_cons();
+    let target_critic = critic_cons();
     target_critic.hard_update(&critic);
     let value = CriticWithTarget {
         critic,
@@ -355,7 +344,7 @@ fn setup(
 fn observation(
     params: Res<Params>,
     cx: Res<RapierContext>,
-    mut fs: Query<(&mut FrameStack<Box<[f32]>>, &mut RmsNormalize), With<Agent>>,
+    mut fs: Query<(&CurrentObservation, &mut NextObservation, &mut RmsNormalize), With<Agent>>,
     queries: Query<
         (
             Entity,
@@ -427,16 +416,20 @@ fn observation(
             let obs = fs
                 .get_mut(agent)
                 .unwrap()
-                .1
+                .2
                 .forward_obs(&Tensor::new(&*my_state.as_slice(), &DEVICE).unwrap())
                 .unwrap()
                 .to_vec1()
                 .unwrap()
                 .into_boxed_slice();
-            fs.get_mut(agent).unwrap().0.push(
+            let (current, mut next, _) = fs.get_mut(agent).unwrap();
+            // prev.0 = current.0.clone();
+            let mut cur = current.0.clone();
+            cur.push(
                 obs,
                 Some(params.get_int("agent_frame_stack_len").unwrap() as usize),
             );
+            next.0 = Some(cur);
         },
     );
 }

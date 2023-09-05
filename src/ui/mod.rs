@@ -35,7 +35,7 @@ impl std::fmt::Display for LogText {
     }
 }
 
-pub fn kdr<E: Env, P: Policy, V: ValueEstimator, T: Learner<E, P, V>>(
+pub fn kdr<E: Env>(
     mut cxs: EguiContexts,
     agents: Query<Entity, With<Agent>>,
     kills: Query<&Kills, With<Agent>>,

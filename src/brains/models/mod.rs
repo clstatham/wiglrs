@@ -2,11 +2,12 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use bevy::prelude::Component;
 use candle_core::{backprop::GradStore, Result, Tensor};
+use candle_nn::VarMap;
 
 pub mod deterministic_mlp;
 pub mod linear_resnet;
 
-pub trait Policy: Component {
+pub trait Policy: Send + Sync + 'static {
     type Logits;
     type Status: Clone;
     fn action_logits(&self, obs: &Tensor) -> Result<Self::Logits>;
@@ -15,73 +16,75 @@ pub trait Policy: Component {
     fn entropy(&self, logits: &Self::Logits) -> Result<Tensor>;
     fn apply_gradients(&self, grads: &GradStore) -> Result<()>;
     fn status(&self) -> Option<Self::Status>;
+    fn varmap(&self) -> &VarMap;
+
+    fn soft_update(&self, other: &Self, tau: f32) {
+        for (varname, my_var) in self.varmap().data().lock().unwrap().iter() {
+            let other_var = &other.varmap().data().lock().unwrap()[varname];
+            let new_var = my_var
+                .affine(1.0 - tau as f64, 0.0)
+                .unwrap()
+                .add(&other_var.affine(tau as f64, 0.0).unwrap())
+                .unwrap();
+            my_var.set(&new_var).unwrap();
+        }
+    }
+
+    fn hard_update(&self, other: &Self) {
+        for (varname, my_var) in self.varmap().data().lock().unwrap().iter() {
+            my_var
+                .set(&other.varmap().data().lock().unwrap()[varname])
+                .unwrap();
+        }
+    }
 }
 
-pub trait ValueEstimator: Component {
+pub trait ValueEstimator: Send + Sync + 'static {
     fn estimate_value(&self, obs: &Tensor, action: Option<&Tensor>) -> Result<Tensor>;
     fn apply_gradients(&self, grads: &GradStore) -> Result<()>;
-}
+    fn varmap(&self) -> &VarMap;
 
-#[derive(Component)]
-pub struct CentralizedCritic<C: ValueEstimator> {
-    critic: Arc<RwLock<C>>,
-}
-
-impl<C: ValueEstimator> CentralizedCritic<C> {
-    pub fn new(critic: C) -> Self {
-        Self {
-            critic: Arc::new(RwLock::new(critic)),
+    fn soft_update(&self, other: &Self, tau: f32) {
+        for (varname, my_var) in self.varmap().data().lock().unwrap().iter() {
+            let other_var = &other.varmap().data().lock().unwrap()[varname];
+            let new_var = my_var
+                .affine(1.0 - tau as f64, 0.0)
+                .unwrap()
+                .add(&other_var.affine(tau as f64, 0.0).unwrap())
+                .unwrap();
+            my_var.set(&new_var).unwrap();
         }
     }
 
-    pub fn get_mut(&self) -> RwLockWriteGuard<'_, C> {
-        self.critic.write().unwrap()
-    }
-
-    pub fn get(&self) -> RwLockReadGuard<'_, C> {
-        self.critic.read().unwrap()
-    }
-}
-
-impl<C: ValueEstimator> Clone for CentralizedCritic<C> {
-    fn clone(&self) -> Self {
-        Self {
-            critic: self.critic.clone(),
+    fn hard_update(&self, other: &Self) {
+        for (varname, my_var) in self.varmap().data().lock().unwrap().iter() {
+            my_var
+                .set(&other.varmap().data().lock().unwrap()[varname])
+                .unwrap();
         }
     }
 }
 
-impl<C: ValueEstimator> ValueEstimator for CentralizedCritic<C> {
-    fn estimate_value(&self, obs: &Tensor, action: Option<&Tensor>) -> Result<Tensor> {
-        self.get().estimate_value(obs, action)
-    }
-
-    fn apply_gradients(&self, grads: &GradStore) -> Result<()> {
-        self.get().apply_gradients(grads)
-    }
-}
-
-pub trait CopyWeights {
-    fn soft_update(&self, other: &Self, tau: f32);
-    fn hard_update(&self, other: &Self);
-}
-
 #[derive(Component)]
-pub struct PolicyWithTarget<P: Policy + CopyWeights> {
+pub struct PolicyWithTarget<P: Policy> {
     pub policy: P,
     pub target_policy: P,
 }
 
-impl<P: Policy + CopyWeights> PolicyWithTarget<P> {
+impl<P: Policy> PolicyWithTarget<P> {
     pub fn soft_update(&self, tau: f32) {
         self.target_policy.soft_update(&self.policy, tau);
     }
 }
 
-impl<P: Policy + CopyWeights> Policy for PolicyWithTarget<P> {
+impl<P: Policy> Policy for PolicyWithTarget<P> {
     type Logits = P::Logits;
 
     type Status = P::Status;
+
+    fn varmap(&self) -> &VarMap {
+        unimplemented!()
+    }
 
     fn action_logits(&self, obs: &Tensor) -> Result<Self::Logits> {
         self.policy.action_logits(obs)
@@ -109,12 +112,16 @@ impl<P: Policy + CopyWeights> Policy for PolicyWithTarget<P> {
 }
 
 #[derive(Component)]
-pub struct CriticWithTarget<V: ValueEstimator + CopyWeights> {
+pub struct CriticWithTarget<V: ValueEstimator> {
     pub critic: V,
     pub target_critic: V,
 }
 
-impl<V: ValueEstimator + CopyWeights> ValueEstimator for CriticWithTarget<V> {
+impl<V: ValueEstimator> ValueEstimator for CriticWithTarget<V> {
+    fn varmap(&self) -> &VarMap {
+        unimplemented!()
+    }
+
     fn estimate_value(&self, obs: &Tensor, action: Option<&Tensor>) -> Result<Tensor> {
         self.critic.estimate_value(obs, action)
     }
@@ -124,7 +131,7 @@ impl<V: ValueEstimator + CopyWeights> ValueEstimator for CriticWithTarget<V> {
     }
 }
 
-impl<V: ValueEstimator + CopyWeights> CriticWithTarget<V> {
+impl<V: ValueEstimator> CriticWithTarget<V> {
     pub fn soft_update(&self, tau: f32) {
         self.target_critic.soft_update(&self.critic, tau);
     }

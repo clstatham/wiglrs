@@ -191,12 +191,12 @@ fn run_env<E: crate::envs::Env, M: crate::envs::maps::Map>(
     let learner: AgentLearner<E> = AgentLearner {
         gamma: 0.99,
         tau: 0.01,
-        // soft_update_interval: 100,
+        soft_update_interval: 1,
         steps_done: 0,
         batch_size: params.get_int("agent_training_batch_size").unwrap() as usize,
         buffer: MaddpgBuffer::new(
             params.get_int("num_agents").unwrap() as usize,
-            Some(params.get_int("agent_rb_max_len").unwrap() as usize),
+            params.get_int("agent_rb_max_len").unwrap() as usize,
         ),
         status: MaddpgStatus::default(),
     };

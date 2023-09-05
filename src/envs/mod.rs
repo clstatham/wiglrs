@@ -187,10 +187,10 @@ pub trait Env: Resource {
         app.add_systems(
             Update,
             (
+                Self::update_system(),
                 Self::action_system(),
                 Self::reward_system(),
                 Self::terminal_system(),
-                Self::update_system(),
                 Self::observation_system(),
                 Self::learn_system(),
             )
@@ -351,6 +351,12 @@ pub struct Deaths(pub usize);
 #[derive(Component)]
 pub struct Name(pub String);
 
+#[derive(Component)]
+pub struct NextObservation(pub Option<FrameStack<Box<[f32]>>>);
+
+#[derive(Component)]
+pub struct CurrentObservation(pub FrameStack<Box<[f32]>>);
+
 #[derive(Bundle)]
 pub struct AgentBundle<A: Action> {
     pub rb: RigidBody,
@@ -369,7 +375,8 @@ pub struct AgentBundle<A: Action> {
     pub name: Name,
     pub writer: TbWriter,
     pub action: A,
-    pub obs: FrameStack<Box<[f32]>>,
+    pub next_obs: NextObservation,
+    pub current_obs: CurrentObservation,
     pub obs_norm: RmsNormalize,
     pub reward: Reward,
     pub running_reward: RunningReturn,
@@ -391,17 +398,19 @@ impl<A: Action> AgentBundle<A> {
     ) -> Self {
         let mut writer = TbWriter::default();
         writer.init(Some(name.as_str()), timestamp);
+        let obs = FrameStack(
+            vec![
+                vec![0.0; obs_len].into_boxed_slice();
+                params.get_int("agent_frame_stack_len").unwrap() as usize
+            ]
+            .into(),
+        );
         Self {
             action: A::default(),
             writer,
             rng: EntropyComponent::from(rng),
-            obs: FrameStack(
-                vec![
-                    vec![0.0; obs_len].into_boxed_slice();
-                    params.get_int("agent_frame_stack_len").unwrap() as usize
-                ]
-                .into(),
-            ),
+            next_obs: NextObservation(Some(obs.clone())),
+            current_obs: CurrentObservation(obs),
             obs_norm: RmsNormalize::new(&[obs_len]).unwrap(),
             reward: Reward(0.0),
             running_reward: RunningReturn::new(
@@ -446,7 +455,7 @@ impl<A: Action> AgentBundle<A> {
 pub fn get_action<A, P: Policy>(
     params: Res<Params>,
     policies: Res<Policies<P>>,
-    mut obs_brains_actions: Query<(&FrameStack<Box<[f32]>>, &AgentId, &mut A), With<Agent>>,
+    mut obs_brains_actions: Query<(&CurrentObservation, &AgentId, &mut A), With<Agent>>,
     frame_count: Res<FrameCount>,
 ) where
     A: Action<Logits = P::Logits>,
@@ -455,7 +464,7 @@ pub fn get_action<A, P: Policy>(
         obs_brains_actions
             .par_iter_mut()
             .for_each_mut(|(fs, id, mut actions)| {
-                let obs = fs.as_tensor();
+                let obs = fs.0.as_tensor();
                 let (action, logits) = policies.0.get(id.0).unwrap().act(&obs).unwrap();
                 *actions = A::from_slice(
                     action.squeeze(0).unwrap().to_vec1().unwrap().as_slice(),
@@ -465,7 +474,7 @@ pub fn get_action<A, P: Policy>(
     }
 }
 
-pub fn send_reward<P: Policy, V: ValueEstimator>(
+pub fn send_reward(
     params: Res<Params>,
     agents: Query<Entity, With<Agent>>,
     frame_count: Res<FrameCount>,
@@ -512,6 +521,7 @@ pub fn update(
     deaths: Query<&Deaths, With<Agent>>,
     health: Query<&Health, With<Agent>>,
     agent_transform: Query<&Transform, With<Agent>>,
+    mut obs: Query<(&mut CurrentObservation, &mut NextObservation), With<Agent>>,
 ) {
     for (t_ent, mut t, mut text, text_comp) in name_text_t.iter_mut() {
         if let Ok(agent) = agent_transform.get(text_comp.entity_following) {
@@ -549,6 +559,10 @@ pub fn update(
             commands.entity(t_ent).despawn();
         }
     }
+
+    for (mut cur, mut next) in obs.iter_mut() {
+        cur.0 = next.0.take().unwrap();
+    }
 }
 
 pub fn check_dead(
@@ -562,11 +576,6 @@ pub fn check_dead(
     for agent_ent in agents.iter() {
         let mut my_health = health.get_mut(agent_ent).unwrap();
         if my_health.0 <= 0.0 {
-            // if let Ok(mut rb) = rbs.get_mut(agent_ent) {
-            //     let final_val = actions.get(agent_ent).unwrap().metadata().val;
-            //     rb.finish_trajectory(Some(final_val));
-            // }
-
             deaths.get_mut(agent_ent).unwrap().0 += 1;
             my_health.0 = params.get_float("agent_max_health").unwrap() as f32;
             let dist = Uniform::new(-250.0, 250.0);
